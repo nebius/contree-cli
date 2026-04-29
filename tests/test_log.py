@@ -128,7 +128,10 @@ class TestSetupLogging:
         try:
             root.handlers.clear()
             buf = StringIO()
-            with patch.object(sys, "stderr", buf):
+            with (
+                patch.object(sys, "stderr", buf),
+                patch("contree_cli.types.IS_A_TTY", False),
+            ):
                 setup_logging()
                 logging.info("test message")
             assert "[INFO] test message" in buf.getvalue()

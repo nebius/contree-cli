@@ -130,10 +130,11 @@ class TestTableFormatter:
         assert "30" in lines[1]
 
     def test_column_alignment(self, capsys):
-        fmt = TableFormatter()
-        fmt(name="ab", val="x")
-        fmt(name="abcdef", val="y")
-        fmt.flush()
+        with patch("contree_cli.output.STDOUT_IS_A_TTY", False):
+            fmt = TableFormatter()
+            fmt(name="ab", val="x")
+            fmt(name="abcdef", val="y")
+            fmt.flush()
         lines = capsys.readouterr().out.splitlines()
         # header and rows have consistent column widths
         assert len(lines) == 3
