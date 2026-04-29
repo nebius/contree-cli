@@ -2,6 +2,7 @@ import dataclasses
 import hashlib
 import logging
 import os
+import pathlib
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +28,12 @@ class MappedFile:
 
     @classmethod
     def parse(cls, spec: str) -> "MappedFile":
-        parts = spec.split(":")
-        if not parts or not parts[0]:
+        drive = pathlib.PurePath(spec).drive
+        parts = spec[len(drive) :].split(":")
+        if not parts or not (drive + parts[0]):
             raise ValueError(f"invalid file spec {spec!r}: host_path is required")
 
-        host_path = parts[0]
+        host_path = drive + parts[0]
         instance_path: str | None = None
         uid: int | None = None
         gid: int | None = None

@@ -570,6 +570,8 @@ def cmd_run(args: RunArgs) -> int | None:
         logger.debug("Interpreter mode: reading %s", script_path)
         with open(script_path, "rb") as f:
             script_data = f.read()
+        # Normalise CRLF → LF (Windows editors write \r\n)
+        script_data = script_data.replace(b"\r\n", b"\n")
         # Strip shebang line
         shebang_line, _, script_body = script_data.partition(b"\n")
         logger.debug("Shebang line: %s", shebang_line.decode(errors="replace"))

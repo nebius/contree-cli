@@ -1041,7 +1041,7 @@ def get_session_key(profile_name: str, override: str | None = None) -> str:
     try:
         tty = os.ttyname(sys.stdin.fileno())
         tty_part = tty.replace("/", "_")
-    except OSError:
+    except (OSError, AttributeError):
         tty_part = "notty"
     stable = uuid.uuid5(uuid.NAMESPACE_OID, f"{profile_name}_{ppid}_{tty_part}")
     suffix = stable.hex[:8]
