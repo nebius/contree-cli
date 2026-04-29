@@ -1,8 +1,9 @@
 import dataclasses
-import grp
 import hashlib
+import logging
 import os
-import pwd
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -93,26 +94,69 @@ class MappedFile:
         )
 
 
-def _resolve_uid(value: str) -> int:
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    try:
-        return pwd.getpwnam(value).pw_uid
-    except KeyError:
-        return 0
+try:
+    import grp
+    import pwd
 
+    def _resolve_uid(value: str) -> int:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+        try:
+            return pwd.getpwnam(value).pw_uid
+        except KeyError:
+            logger.warning("Unknown user %r, using uid 0", value)
+            return 0
 
-def _resolve_gid(value: str) -> int:
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    try:
-        return grp.getgrnam(value).gr_gid
-    except KeyError:
-        return 0
+    def _resolve_gid(value: str) -> int:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+        try:
+            return grp.getgrnam(value).gr_gid
+        except KeyError:
+            logger.warning("Unknown group %r, using gid 0", value)
+            return 0
+
+    MAPPING_RULES = (
+        "Attach file or directory (repeatable, dirs recurse). "
+        "Format: host[:inst_path][:uUID][:gGID][:mMODE]. "
+        "Tagged options (u/g/m) in any order; "
+        "uid/gid resolved locally from pwd/grp; "
+        "defaults from host stat."
+    )
+
+except ImportError:
+
+    def _resolve_uid(value: str) -> int:
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning(
+                "Cannot resolve user %r (no pwd module), using uid 0",
+                value,
+            )
+            return 0
+
+    def _resolve_gid(value: str) -> int:
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning(
+                "Cannot resolve group %r (no grp module), using gid 0",
+                value,
+            )
+            return 0
+
+    MAPPING_RULES = (
+        "Attach file or directory (repeatable, dirs recurse). "
+        "Format: host[:inst_path][:uUID][:gGID][:mMODE]. "
+        "Tagged options (u/g/m) in any order; "
+        "only numeric uid/gid supported on this platform; "
+        "uid/gid default to 0, mode from host stat."
+    )
 
 
 def _parse_mode(value: str) -> int:

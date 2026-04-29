@@ -1,4 +1,5 @@
 import os
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -148,6 +149,7 @@ class TestAllExplicit:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="pwd/grp unavailable on Windows")
 class TestNameResolution:
     def test_named_uid(self):
         pw_entry = type("pw", (), {"pw_uid": 501})()
@@ -246,3 +248,57 @@ class TestDataclass:
         a = MappedFile.parse("/a:/b:u0:g0:m644")
         b = MappedFile.parse("/a:/b:u0:g0:m755")
         assert a != b
+
+
+# ---------------------------------------------------------------------------
+# Windows: named uid/gid falls back to 0 with warning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only behaviour")
+class TestWindowsNameResolution:
+    def test_named_uid_falls_back_to_zero(self, caplog):
+        mf = MappedFile.parse("/a:/b:ualice:g0:m644")
+        assert mf.uid == 0
+        assert "Cannot resolve user" in caplog.text
+
+    def test_named_gid_falls_back_to_zero(self, caplog):
+        mf = MappedFile.parse("/a:/b:u0:gstaff:m644")
+        assert mf.gid == 0
+        assert "Cannot resolve group" in caplog.text
+
+    def test_numeric_uid_gid_works(self):
+        mf = MappedFile.parse("/a:/b:u42:g99:m644")
+        assert mf.uid == 42
+        assert mf.gid == 99
+
+
+# ---------------------------------------------------------------------------
+# MAPPING_RULES reflects platform
+# ---------------------------------------------------------------------------
+
+
+class TestMappingRules:
+    def test_mapping_rules_defined(self):
+        from contree_cli.mapped_file import MAPPING_RULES
+
+        assert isinstance(MAPPING_RULES, str)
+        assert "Format:" in MAPPING_RULES
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="pwd/grp available on POSIX",
+    )
+    def test_posix_mentions_pwd_grp(self):
+        from contree_cli.mapped_file import MAPPING_RULES
+
+        assert "pwd/grp" in MAPPING_RULES
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only text",
+    )
+    def test_windows_mentions_numeric_only(self):
+        from contree_cli.mapped_file import MAPPING_RULES
+
+        assert "only numeric" in MAPPING_RULES

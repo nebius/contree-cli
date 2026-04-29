@@ -63,7 +63,7 @@ from datetime import timedelta
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.client import ApiError, ContreeClient, decode_stream, resolve_image
-from contree_cli.mapped_file import MappedFile
+from contree_cli.mapped_file import MAPPING_RULES, MappedFile
 from contree_cli.output import (
     DefaultFormatter,
     OutputFormatter,
@@ -238,10 +238,7 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
         action="append",
         default=[],
         metavar="FILE",
-        help="Attach file or directory (repeatable, dirs recurse). "
-        "Format: host[:inst_path][:uUID][:gGID][:mMODE]. "
-        "Tagged options (u/g/m) in any order; "
-        "uid/gid resolved locally from pwd/grp; defaults from host stat.",
+        help=MAPPING_RULES,
     )
     p.add_argument(
         *FLAGS["file_excludes"],
