@@ -1,0 +1,18 @@
+@font-face {
+    font-family: "Fira Code";
+    src: local("FiraCode-Regular"),
+        url("FiraCode-Regular.woff2") format("woff2");
+    font-style: normal;
+    font-weight: 400;
+}
+@font-face {
+    font-family: "Fira Code";
+    src: local("FiraCode-Bold"),
+        url("FiraCode-Bold.woff2") format("woff2");
+    font-style: bold;
+    font-weight: 700;
+}
+
+code span.pre {
+    white-space: nowrap;
+}

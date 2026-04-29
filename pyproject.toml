@@ -1,0 +1,74 @@
+[project]
+name = "contree-cli"
+version = "0.4.4"
+description = "CLI client for the ConTree sandbox platform"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Dmitry Orlov", email = "mosquito@nebius.com"},
+]
+keywords = ["sandbox", "cli", "vm", "ai-agent", "contree"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Shells",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://contree.dev"
+Documentation = "https://docs.contree.dev/cli/"
+Repository = "https://github.com/nebius/contree-cli"
+Issues = "https://github.com/nebius/contree-cli/issues"
+Changelog = "https://github.com/nebius/contree-cli/releases"
+
+[build-system]
+requires = ["uv_build>=0.10.4,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "contree_cli"
+module-root = ""
+
+[project.scripts]
+contree = "contree_cli.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "mypy",
+    "ruff",
+    "pytest-cov>=7.0.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "furo",
+    "sphinx-design",
+    "myst-parser",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
