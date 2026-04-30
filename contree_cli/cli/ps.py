@@ -83,7 +83,7 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
         *FLAGS["status"],
         choices=tuple(itertools.chain.from_iterable(STATUS_CHOICES.items())),
         default=None,
-        help="Filter by status (default: active only, unless -a is used)",
+        help="Filter by status (default: EXECUTING only, unless -a is used)",
     )
     p.add_argument(
         *FLAGS["kind"],
