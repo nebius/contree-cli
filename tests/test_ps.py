@@ -182,6 +182,13 @@ class TestPsActiveFilter:
         _run_cmd(contree_client, ops, all=True)
         assert "status=" not in contree_client.request_paths[0]
 
+    def test_all_with_explicit_status(self, contree_client, capsys):
+        """--all combined with --status sends the status filter."""
+        ops = [_make_op(0, status="FAILED")]
+        _run_cmd(contree_client, ops, all=True, status="FAILED")
+        assert "status=FAILED" in contree_client.request_paths[0]
+        assert "op-0" in capsys.readouterr().out
+
     @pytest.mark.parametrize(
         "short,full",
         list(STATUS_CHOICES.items()),

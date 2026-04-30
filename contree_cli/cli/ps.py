@@ -40,7 +40,7 @@ class PsArgs(ArgumentsProtocol):
     quiet: bool = False
     all: bool = False
     show_max: int | None = None
-    status: str = "EXECUTING"
+    status: str | None = None
     kind: str | None = None
     since: datetime | None = None
     until: datetime | None = None
@@ -82,8 +82,8 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     p.add_argument(
         *FLAGS["status"],
         choices=tuple(itertools.chain.from_iterable(STATUS_CHOICES.items())),
-        default="EXECUTING",
-        help="Filter by status",
+        default=None,
+        help="Filter by status (default: active only, unless -a is used)",
     )
     p.add_argument(
         *FLAGS["kind"],
@@ -174,11 +174,13 @@ def cmd_ps(args: PsArgs) -> None:
     formatter: OutputFormatter = FORMATTER.get()
 
     status: str | None = None
-    if not args.all:
+    if args.status is not None:
         if len(args.status) == 1:
             status = STATUS_CHOICES.get(args.status, args.status)
         else:
             status = args.status
+    elif not args.all:
+        status = "EXECUTING"
 
     since: str | None = None
     if args.since is not None:
