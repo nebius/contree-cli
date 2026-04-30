@@ -236,6 +236,10 @@ class SessionStore:
         suffix: str = "",
         params: tuple[object, ...] = (),
     ) -> list[Session]:
+        # Not SQLAlchemy — plain sqlite3. The suffix is always a
+        # hardcoded string literal from calling code (WHERE/ORDER BY),
+        # never user input. All values go through ? placeholders.
+        # nosemgrep: sqlalchemy-execute-raw-query
         cur = self._conn.execute(
             """
             SELECT s.session_key, s.active_branch, s.cwd,
@@ -646,6 +650,9 @@ class SessionStore:
         ]
         if history_ids:
             placeholders = ",".join("?" * len(history_ids))
+            # Not SQLAlchemy — plain sqlite3. placeholders is just
+            # ",".join("?" * N), a safe parameterised IN clause.
+            # nosemgrep: sqlalchemy-execute-raw-query
             self._conn.execute(
                 f"DELETE FROM session_files WHERE history_id IN ({placeholders})",
                 history_ids,

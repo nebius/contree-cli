@@ -173,6 +173,9 @@ def cmd_auth(args: AuthArgs) -> int | None:
     cfg = Config()
     exists = args.profile in cfg
     action = "Updating" if exists else "Setting"
+    # Logs action ("Updating"/"Setting"), profile name, and auth type —
+    # not the actual token value.
+    # nosemgrep: python-logger-credential-disclosure
     logger.info(
         "%s token for profile %r (type: %s)", action, args.profile, args.auth_type
     )
@@ -234,6 +237,8 @@ def cmd_auth(args: AuthArgs) -> int | None:
     try:
         client.get("/v1/whoami")
     except ApiError as exc:
+        # Logs the API error message, not the token itself.
+        # nosemgrep: python-logger-credential-disclosure
         logger.error("Token verification failed: %s. Profile not changed.", exc)
         return 1
 

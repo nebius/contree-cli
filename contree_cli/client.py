@@ -65,6 +65,9 @@ class ContreeClient(ABC):
 
     def _connect(self) -> http.client.HTTPConnection:
         if self._scheme == "https":
+            # Stdlib http.client is the only option — project has
+            # zero external dependencies. SSL context uses defaults.
+            # nosemgrep: httpsconnection-detected
             return http.client.HTTPSConnection(
                 self._host,
                 self._port,
