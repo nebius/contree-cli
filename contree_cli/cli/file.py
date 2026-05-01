@@ -128,14 +128,14 @@ def _upload_and_record(
     except ApiError as exc:
         if exc.status != 404:
             raise
-        data = local_path.read_bytes()
-        resp = client.request(
-            "POST",
-            "/v1/files",
-            body=data,
-            headers={"Content-Type": "application/octet-stream"},
-        )
-        file_uuid = json.loads(resp.read())["uuid"]
+        with open(local_path, "rb") as fh:
+            resp = client.request(
+                "POST",
+                "/v1/files",
+                body=fh,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            file_uuid = json.loads(resp.read())["uuid"]
         logger.info("Uploaded %s (%s)", instance_path, file_uuid)
 
     history_id = store.set_image(

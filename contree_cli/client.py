@@ -10,6 +10,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from importlib.metadata import PackageNotFoundError, version
+from typing import IO, cast
 from urllib.parse import urlencode, urlsplit
 
 from contree_cli.config import AuthType, ConfigProfile
@@ -31,6 +32,65 @@ CLI_USER_AGENT = (
     f"Python/{'.'.join(map(str, sys.version_info))} "
     f"{platform.platform()} "
 )
+
+DEBUG_BODY_MAX_BYTES = 1024
+
+
+class BodyFormatter:
+    """Lazy %s-arg for logging HTTP bodies — formats only on emit."""
+
+    def __init__(
+        self,
+        body: bytes | str | IO[bytes] | None,
+        content_type: str = "",
+        binary_max_size: int = DEBUG_BODY_MAX_BYTES,
+    ) -> None:
+        self.body = body
+        self.binary_max_size = binary_max_size
+        self.content_type = content_type
+
+    def __str__(self) -> str:
+        match self.body:
+            case None:
+                return self.format_none()
+            case bytes() | bytearray() as data:
+                return self.dispatch_bytes(bytes(data))
+            case str() as text:
+                return self.dispatch_bytes(text.encode("utf-8", errors="replace"))
+            case _:
+                return self.format_stream()
+
+    def format_none(self) -> str:
+        return "<none>"
+
+    def format_stream(self) -> str:
+        return "<stream>"
+
+    def dispatch_bytes(self, data: bytes) -> str:
+        if not data:
+            return "<empty>"
+        if self.content_type and (
+            "json" in self.content_type or "text" in self.content_type
+        ):
+            return self.format_json(data)
+        if self.content_type:
+            return self.format_bytes(data)
+        return self.format_json(data)
+
+    def format_json(self, data: bytes) -> str:
+        truncated = data[: self.binary_max_size]
+        try:
+            text = truncated.decode("utf-8")
+        except UnicodeDecodeError:
+            return self.format_bytes(data)
+        if len(data) > self.binary_max_size:
+            return f"{text}... <truncated, {len(data)}B total>"
+        return text
+
+    def format_bytes(self, data: bytes) -> str:
+        if self.content_type:
+            return f"<binary {len(data)}B Content-Type={self.content_type!r}>"
+        return f"<binary {len(data)}B>"
 
 
 class ApiError(Exception):
@@ -80,7 +140,7 @@ class ContreeClient(ABC):
         method: str,
         path: str,
         *,
-        body: bytes | None = None,
+        body: bytes | IO[bytes] | None = None,
         headers: dict[str, str] | None = None,
     ) -> http.client.HTTPResponse:
         merged: dict[str, str] = {
@@ -96,6 +156,13 @@ class ContreeClient(ABC):
         last_error: ApiError | None = None
         attempts = len(RETRY_DELAYS) + 1
 
+        log.debug(
+            "%s %s body=%s",
+            method,
+            full_path,
+            BodyFormatter(body, content_type=merged.get("Content-Type", "")),
+        )
+
         for attempt in range(attempts):
             if last_error is not None:
                 delay = RETRY_DELAYS[attempt - 1]
@@ -106,12 +173,15 @@ class ContreeClient(ABC):
                 )
                 time.sleep(delay)
 
-            log.debug(
-                "%s %s body=%s",
-                method,
-                full_path,
-                f"{len(body)}B" if body is not None else "none",
-            )
+            if attempt > 0 and hasattr(body, "seek"):
+                stream = cast(IO[bytes], body)
+                if not stream.seekable():
+                    raise ApiError(
+                        0,
+                        "RetryNotSeekable",
+                        "Cannot retry: streaming body is not seekable",
+                    )
+                stream.seek(0)
             try:
                 conn = self._connect()
                 conn.request(method, full_path, body, merged)
@@ -137,6 +207,15 @@ class ContreeClient(ABC):
                 resp.status,
                 resp.reason,
                 len(resp_body),
+            )
+            log.debug(
+                "%s %s response body: %s",
+                method,
+                full_path,
+                BodyFormatter(
+                    resp_body,
+                    content_type=resp.getheader("Content-Type", "") or "",
+                ),
             )
             error = ApiError(resp.status, resp.reason, resp_body)
 

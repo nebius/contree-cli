@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +11,7 @@ from contree_cli.client import (
     CLI_USER_AGENT,
     RETRY_DELAYS,
     ApiError,
+    BodyFormatter,
     ContreeClient,
     ContreeJWTClient,
     resolve_image,
@@ -297,8 +299,165 @@ class ContreeTestClientABC:
 
 
 # ---------------------------------------------------------------------------
+# Streaming body
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingBody:
+    def test_passes_file_object_to_connection(self):
+        import io
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=201, body=b'{"uuid":"u1"}')
+        stream = io.BytesIO(b"a" * 1024)
+        c.request(
+            "POST",
+            "/v1/files",
+            body=stream,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        sent = c.get_request(-1).body
+        assert sent is stream
+
+    def test_retry_seeks_back_to_start(self):
+        import io
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=503, body=b"down")
+        c.respond(status=201, body=b'{"uuid":"u1"}')
+
+        seeks: list[int] = []
+
+        class TrackingStream(io.BytesIO):
+            def seek(self, pos, whence=0):  # type: ignore[override]
+                seeks.append(pos)
+                return super().seek(pos, whence)
+
+            def seekable(self) -> bool:  # type: ignore[override]
+                return True
+
+        stream = TrackingStream(b"payload")
+
+        with patch("contree_cli.client.time.sleep"):
+            c.request("POST", "/v1/files", body=stream)
+
+        assert seeks == [0]
+
+    def test_retry_unseekable_stream_raises(self):
+        import io
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=500, body=b"down")
+
+        class Unseekable(io.BytesIO):
+            def seekable(self) -> bool:  # type: ignore[override]
+                return False
+
+        with patch("contree_cli.client.time.sleep"), pytest.raises(ApiError) as ei:
+            c.request("POST", "/v1/files", body=Unseekable(b"x"))
+
+        assert ei.value.reason == "RetryNotSeekable"
+
+
+# ---------------------------------------------------------------------------
 # IAM client
 # ---------------------------------------------------------------------------
+
+
+class TestDebugLogging:
+    def _enable_debug(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG, logger="contree_cli.client")
+
+    def test_logs_request_body_when_debug(self, caplog):
+        self._enable_debug(caplog)
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=201, body=b'{"uuid":"x"}')
+        c.post_json("/v1/instances", {"image": "ubuntu", "command": "uname -a"})
+        msgs = "\n".join(r.getMessage() for r in caplog.records)
+        assert '"image": "ubuntu"' in msgs
+        assert '"command": "uname -a"' in msgs
+
+    def test_logs_error_response_body_when_debug(self, caplog):
+        self._enable_debug(caplog)
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=400, body=b'{"error":"bad payload"}')
+        with pytest.raises(ApiError):
+            c.post_json("/v1/instances", {"image": "ubuntu"})
+        msgs = "\n".join(r.getMessage() for r in caplog.records)
+        assert '"error":"bad payload"' in msgs
+
+    def test_no_body_logs_when_not_debug(self, caplog):
+        caplog.set_level(logging.INFO, logger="contree_cli.client")
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=200, body=b'{"a":1}')
+        c.post_json("/v1/instances", {"x": 1})
+        msgs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "request body" not in msgs
+
+    def test_octet_stream_request_body_not_dumped(self, caplog):
+        self._enable_debug(caplog)
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=201, body=b"{}")
+        binary = bytes(range(256))
+        c.request(
+            "POST",
+            "/v1/files",
+            body=binary,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        msgs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "<binary" in msgs
+        assert "Content-Type='application/octet-stream'" in msgs
+
+
+class TestBodyFormatter:
+    def test_none(self):
+        assert str(BodyFormatter(None)) == "<none>"
+
+    def test_empty(self):
+        assert str(BodyFormatter(b"")) == "<empty>"
+
+    def test_text_body(self):
+        assert str(BodyFormatter(b'{"hi":1}')) == '{"hi":1}'
+
+    def test_truncation(self):
+        body = b"a" * 5000
+        out = str(BodyFormatter(body, binary_max_size=100))
+        assert out.startswith("a" * 100)
+        assert "5000B total" in out
+
+    def test_binary_content_type(self):
+        out = str(
+            BodyFormatter(
+                b"\xff\xfe\x00",
+                content_type="application/octet-stream",
+            )
+        )
+        assert "<binary 3B" in out
+        assert "application/octet-stream" in out
+
+    def test_undecodable_bytes(self):
+        out = str(BodyFormatter(b"\xff\xfe\x00"))
+        assert out == "<binary 3B>"
+
+    def test_lazy_str_only_called_at_format(self):
+        """BodyFormatter must defer its work until __str__ is invoked."""
+        calls: list[int] = []
+
+        class Counting(BodyFormatter):
+            def __str__(self) -> str:
+                calls.append(1)
+                return super().__str__()
+
+        # Logging at a level above DEBUG must not call __str__.
+        logger = logging.getLogger("contree_cli.client")
+        prev = logger.level
+        logger.setLevel(logging.WARNING)
+        try:
+            logger.debug("body=%s", Counting(b"hello"))
+        finally:
+            logger.setLevel(prev)
+        assert calls == []
 
 
 class TestContreeIAMClient:

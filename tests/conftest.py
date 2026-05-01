@@ -35,17 +35,31 @@ class FakeResponse:
     status: int = 200
     reason: str = ""
     body: bytes = b"{}"
+    headers: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not self.reason:
             self.reason = "OK" if self.status < 300 else "Error"
+        if self.headers is None:
+            self.headers = {}
 
     def read(self, amt: int | None = None) -> bytes:
         return self.body
 
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        assert self.headers is not None
+        for key, value in self.headers.items():
+            if key.lower() == name.lower():
+                return value
+        return default
+
     @staticmethod
     def json(body: object, *, status: int = 200) -> FakeResponse:
-        return FakeResponse(status=status, body=json.dumps(body).encode())
+        return FakeResponse(
+            status=status,
+            body=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
 
 
 @dataclass

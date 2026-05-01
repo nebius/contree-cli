@@ -871,6 +871,69 @@ class TestShellMode:
         assert body["args"] == ["hello", "world"]
         assert body["shell"] is False
 
+    def test_non_shell_quotes_args_with_spaces(self, contree_client, session_store):
+        session_store.set_image(IMG_UUID, kind="test")
+        args = _default_args(
+            command_args=["python3", "-c", "print('hello world')"],
+            shell=False,
+        )
+        responses = [
+            _spawn_response(),
+            _op_response(status="SUCCESS", exit_code=0),
+        ]
+        _run_cmd(contree_client, args, responses, store=session_store)
+        spawn_req = contree_client.get_request(0)
+        body = json.loads(spawn_req.body)
+        assert body["command"] == "python3"
+        # Each arg with spaces / special chars must be shell-quoted so the
+        # remote side gets the same argv after sh-style parsing.
+        import shlex
+
+        assert [shlex.split(a)[0] for a in body["args"]] == [
+            "-c",
+            "print('hello world')",
+        ]
+
+    def test_shell_quotes_arg_with_spaces(self, contree_client, session_store):
+        session_store.set_image(IMG_UUID, kind="test")
+        args = _default_args(
+            command_args=["python3", "-c", "print('hello world')"],
+            shell=True,
+        )
+        responses = [
+            _spawn_response(),
+            _op_response(status="SUCCESS", exit_code=0),
+        ]
+        _run_cmd(contree_client, args, responses, store=session_store)
+        spawn_req = contree_client.get_request(0)
+        body = json.loads(spawn_req.body)
+        # shlex.join must round-trip back through shlex.split to the
+        # original argv when the remote shell parses the command.
+        import shlex
+
+        assert shlex.split(body["command"]) == [
+            "python3",
+            "-c",
+            "print('hello world')",
+        ]
+
+    def test_shell_does_not_overquote_simple_tokens(
+        self, contree_client, session_store
+    ):
+        session_store.set_image(IMG_UUID, kind="test")
+        args = _default_args(
+            command_args=["ls", "-la", "/etc"],
+            shell=True,
+        )
+        responses = [
+            _spawn_response(),
+            _op_response(status="SUCCESS", exit_code=0),
+        ]
+        _run_cmd(contree_client, args, responses, store=session_store)
+        spawn_req = contree_client.get_request(0)
+        body = json.loads(spawn_req.body)
+        assert body["command"] == "ls -la /etc"
+
 
 # ── Session update on success ────────────────────────────────────────────
 

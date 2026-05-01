@@ -55,6 +55,7 @@ import logging
 import os
 import re
 import select
+import shlex
 import sys
 import time
 import uuid
@@ -381,14 +382,13 @@ def _upload_file(
             raise
 
     with open(mf.host_path, "rb") as fh:
-        data = fh.read()
-    resp = client.request(
-        "POST",
-        "/v1/files",
-        body=data,
-        headers={"Content-Type": "application/octet-stream"},
-    )
-    file_uuid = str(json.loads(resp.read())["uuid"])
+        resp = client.request(
+            "POST",
+            "/v1/files",
+            body=fh,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        file_uuid = str(json.loads(resp.read())["uuid"])
     logger.debug("Uploaded %s (%s)", mf.host_path, file_uuid)
     store.cache[("", cache_kind)] = {"uuid": file_uuid, "uploaded_at": time.time()}
     return file_uuid
@@ -403,10 +403,10 @@ def _build_payload(
 ) -> dict[str, object]:
     """Build the JSON payload for POST /v1/instances."""
     if args.shell:
-        command = " ".join(args.command_args)
+        command = shlex.join(args.command_args)
     else:
         parts = args.command_args
-        command = parts[0] if parts else ""
+        command = shlex.quote(parts[0]) if parts else ""
 
     payload: dict[str, object] = {
         "image": image_uuid,
@@ -418,7 +418,7 @@ def _build_payload(
     }
 
     if not args.shell and len(args.command_args) > 1:
-        payload["args"] = args.command_args[1:]
+        payload["args"] = [shlex.quote(a) for a in args.command_args[1:]]
 
     if args.timeout is not None:
         payload["timeout"] = args.timeout

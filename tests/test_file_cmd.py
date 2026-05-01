@@ -32,6 +32,9 @@ class StreamResponse:
     def read(self, amt: int | None = None) -> bytes:
         return self._buf.read(amt)
 
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        return default
+
 
 def _api_response(body: bytes | dict, *, status: int = 200) -> StreamResponse:
     data = json.dumps(body).encode() if isinstance(body, dict) else body
