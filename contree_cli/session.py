@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path, PurePosixPath
 
+CONTREE_CONCURRENCY = int(os.getenv("CONTREE_CONCURRENCY", "8"))
+
 
 @dataclass(frozen=True)
 class Session:

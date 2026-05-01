@@ -53,6 +53,10 @@ class FakeResponse:
                 return value
         return default
 
+    def getheaders(self) -> list[tuple[str, str]]:
+        assert self.headers is not None
+        return list(self.headers.items())
+
     @staticmethod
     def json(body: object, *, status: int = 200) -> FakeResponse:
         return FakeResponse(

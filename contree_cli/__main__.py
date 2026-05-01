@@ -57,6 +57,7 @@ def main() -> None:
 
     session_key = get_session_key(profile.name, override=args.session_key)
     db_path = profile.session_db_path
+    log.debug("Running in session: %s", session_key)
 
     with SessionStore(db_path, session_key) as store:
         PROFILE.set(profile)

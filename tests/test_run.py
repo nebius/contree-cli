@@ -464,7 +464,8 @@ class TestFileUpload:
         ]
         with caplog.at_level(logging.INFO):
             _run_cmd(contree_client, args, responses, store=session_store)
-        assert "already uploaded" in caplog.text
+        assert "Uploaded file:" in caplog.text
+        assert "existing-uuid" in caplog.text
 
     def test_file_dedup_non_404_raises(self, contree_client, session_store, tmp_path):
         """Non-404 error from GET /v1/files propagates."""
@@ -558,6 +559,70 @@ class TestFileUpload:
         spawn_req = contree_client.get_request(1)
         spawn_body = json.loads(spawn_req.body)
         assert spawn_body["files"]["/app/cached-change.txt"]["uuid"] == "new-uuid"
+
+
+class TestParallelUpload:
+    def test_upload_files_parallel_aggregates(
+        self, contree_client, session_store, tmp_path, monkeypatch
+    ):
+        """upload_files dispatches via ThreadPool and collects all uuids."""
+        from contree_cli.cli import run as run_mod
+
+        files = []
+        for i in range(5):
+            p = tmp_path / f"f{i}.txt"
+            p.write_text(f"content-{i}")
+            files.append(
+                MappedFile(
+                    host_path=str(p),
+                    instance_path=f"/app/f{i}.txt",
+                    uid=0,
+                    gid=0,
+                    mode=0o644,
+                )
+            )
+
+        def fake_remote(client, mf):
+            return mf, f"uuid-for-{os.path.basename(mf.host_path)}"
+
+        monkeypatch.setattr(run_mod, "upload_one_remote", fake_remote)
+
+        result = run_mod.upload_files(contree_client, files, session_store)
+
+        assert {mf.host_path for mf in files} == set(result.keys())
+        for mf in files:
+            assert result[mf.host_path] == (
+                f"uuid-for-{os.path.basename(mf.host_path)}"
+            )
+
+    def test_upload_files_skips_cached(
+        self, contree_client, session_store, tmp_path, monkeypatch
+    ):
+        """Files already in the local cache must not hit the upload pool."""
+        from contree_cli.cli import run as run_mod
+
+        p = tmp_path / "cached.txt"
+        p.write_text("data")
+        mf = MappedFile(
+            host_path=str(p),
+            instance_path="/app/cached.txt",
+            uid=0,
+            gid=0,
+            mode=0o644,
+        )
+        run_mod.record_local_uuid(mf, "cached-uuid", session_store)
+
+        called = []
+
+        def fake_remote(client, mfx):
+            called.append(mfx.host_path)
+            return mfx, "should-not-be-used"
+
+        monkeypatch.setattr(run_mod, "upload_one_remote", fake_remote)
+
+        result = run_mod.upload_files(contree_client, [mf], session_store)
+        assert result == {mf.host_path: "cached-uuid"}
+        assert called == []
 
 
 # ── Spawn payload ────────────────────────────────────────────────────────

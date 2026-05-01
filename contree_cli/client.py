@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import json
 import logging
 import platform
@@ -91,6 +92,36 @@ class BodyFormatter:
         if self.content_type:
             return f"<binary {len(data)}B Content-Type={self.content_type!r}>"
         return f"<binary {len(data)}B>"
+
+
+class BufferedResponse:
+    """Replay an HTTPResponse from buffered bytes (for debug body logging)."""
+
+    def __init__(
+        self,
+        status: int,
+        reason: str,
+        headers: list[tuple[str, str]],
+        data: bytes,
+    ) -> None:
+        self.status = status
+        self.reason = reason
+        self.headers = headers
+        self.buf = io.BytesIO(data)
+
+    def read(self, amt: int | None = None) -> bytes:
+        if amt is None:
+            return self.buf.read()
+        return self.buf.read(amt)
+
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        for k, v in self.headers:
+            if k.lower() == name.lower():
+                return v
+        return default
+
+    def getheaders(self) -> list[tuple[str, str]]:
+        return list(self.headers)
 
 
 class ApiError(Exception):
@@ -197,6 +228,8 @@ class ContreeClient(ABC):
                     resp.status,
                     resp.reason,
                 )
+                if log.isEnabledFor(logging.DEBUG):
+                    return self.log_and_buffer(method, full_path, resp)
                 return resp
 
             resp_body = resp.read().decode("utf-8", errors="replace")
@@ -227,6 +260,40 @@ class ContreeClient(ABC):
 
         assert last_error is not None
         raise last_error
+
+    def log_and_buffer(
+        self,
+        method: str,
+        full_path: str,
+        resp: http.client.HTTPResponse,
+    ) -> http.client.HTTPResponse:
+        """Read & log a textual response body; pass binary streams through."""
+        content_type = resp.getheader("Content-Type", "") or ""
+        textual = not content_type or "json" in content_type or "text" in content_type
+        if not textual:
+            log.debug(
+                "%s %s response body: <stream Content-Type=%r>",
+                method,
+                full_path,
+                content_type,
+            )
+            return resp
+        data = resp.read()
+        log.debug(
+            "%s %s response body: %s",
+            method,
+            full_path,
+            BodyFormatter(data, content_type=content_type),
+        )
+        return cast(
+            http.client.HTTPResponse,
+            BufferedResponse(
+                status=resp.status,
+                reason=resp.reason,
+                headers=list(resp.getheaders()),
+                data=data,
+            ),
+        )
 
     # -- convenience methods --------------------------------------------------
 
