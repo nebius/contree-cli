@@ -34,8 +34,6 @@ CLI_USER_AGENT = (
     f"{platform.platform()} "
 )
 
-DEBUG_BODY_MAX_BYTES = 1024
-
 
 class BodyFormatter:
     """Lazy %s-arg for logging HTTP bodies — formats only on emit."""
@@ -44,7 +42,7 @@ class BodyFormatter:
         self,
         body: bytes | str | IO[bytes] | None,
         content_type: str = "",
-        binary_max_size: int = DEBUG_BODY_MAX_BYTES,
+        binary_max_size: int = 4096,
     ) -> None:
         self.body = body
         self.binary_max_size = binary_max_size

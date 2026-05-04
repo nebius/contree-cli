@@ -16,7 +16,7 @@ contree auth --profile=sandbox
 ```
 
 Each command prompts for a token securely (no echo), verifies it against
-the API, and writes it to `~/.config/contree-cli/config.ini`.
+the API, and writes it to `~/.config/contree/auth.ini`.
 
 The resulting config file looks like this:
 
@@ -134,7 +134,7 @@ remaining profile.
 ## Profiles and sessions
 
 Each profile has its own session database
-(`~/.config/contree-cli/sessions-{profile}.db`), so:
+(`~/.config/contree/sessions-{profile}.db`), so:
 
 - **Same profile, same terminal** — resumes the existing session
 - **Different profile, same terminal** — different session, different data
@@ -152,13 +152,14 @@ export CONTREE_SESSION=shared-session
 
 ## Data storage
 
-All data lives in `CONTREE_HOME` (default `~/.config/contree-cli`):
+All data lives in `CONTREE_HOME` (default `~/.config/contree`):
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `config.ini` | Profile credentials and settings |
-| `sessions-{profile}.db` | Per-profile sessions, history, branches, cache |
-| `skills.db` | Installed agent skill registry |
+| `auth.ini` | Profile credentials and settings (created with mode `0600`) |
+| `cli.ini` | Optional user defaults for the CLI (`[cli]` section: `log_level`, `format`, `editor`) |
+| `cli/sessions/{profile}.db` | Per-profile sessions, history, branches, cache |
+| `cli/skills.db` | Installed agent skill registry |
 
 Override with `$CONTREE_HOME`:
 
@@ -170,7 +171,7 @@ export CONTREE_HOME=/custom/path
 
 | Variable | Description |
 |----------|-------------|
-| `CONTREE_HOME` | Data directory (default `~/.config/contree-cli`) |
+| `CONTREE_HOME` | Data directory (default `~/.config/contree`) |
 | `CONTREE_TOKEN` | API bearer token (overrides config) |
 | `CONTREE_URL` | API base URL (overrides config) |
 | `CONTREE_PROJECT` | Project ID (overrides config) |

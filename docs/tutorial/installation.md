@@ -71,7 +71,7 @@ You will be prompted to enter:
 2. **Project ID** — your project identifier
 
 The CLI verifies the token with the API and writes credentials to
-`~/.config/contree-cli/config.ini`. If a profile already exists you will be
+`~/.config/contree/auth.ini`. If a profile already exists you will be
 prompted to confirm; use `-y` to skip the prompt.
 
 Resolution order for each field (first match wins):

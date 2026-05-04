@@ -208,12 +208,12 @@ and does not require manual session key export.
 
 ## Storage
 
-Session data is stored in a SQLite database at
-`~/.local/lib/contree-cli/sessions.db`. Override with
-`CONTREE_SESSION_DB`:
+Session data is stored in a per-profile SQLite database at
+`~/.config/contree/sessions-{profile}.db`. Override the data
+directory with `CONTREE_HOME`:
 
 ```bash
-export CONTREE_SESSION_DB=/tmp/my-sessions.db
+export CONTREE_HOME=/tmp/contree-data
 ```
 
 ---

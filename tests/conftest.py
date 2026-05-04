@@ -187,8 +187,8 @@ def iam_client() -> ContreeTestIAMClient:
 def config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect CONTREE_HOME / CONFIG_DIR / CONFIG_FILE to a temp directory."""
     home = tmp_path / ".contree"
-    cfg_dir = home / "contree-cli"
-    cfg_file = cfg_dir / "config.ini"
+    cfg_dir = home / "contree"
+    cfg_file = cfg_dir / "auth.ini"
     monkeypatch.setattr(config_mod, "CONTREE_HOME", home)
     monkeypatch.setattr(config_mod, "CONFIG_DIR", cfg_dir)
     monkeypatch.setattr(config_mod, "CONFIG_FILE", cfg_file)

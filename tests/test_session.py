@@ -427,11 +427,14 @@ class TestGetSessionKey:
 class TestGetDbPath:
     def test_default_profile(self):
         p = ConfigProfile(name="default", url="", token=None)
-        assert p.session_db_path.name == "sessions-default.db"
+        assert p.session_db_path.name == "default.db"
+        assert p.session_db_path.parent.name == "sessions"
+        assert p.session_db_path.parent.parent.name == "cli"
 
     def test_named_profile(self):
         p = ConfigProfile(name="staging", url="", token=None)
-        assert p.session_db_path.name == "sessions-staging.db"
+        assert p.session_db_path.name == "staging.db"
+        assert p.session_db_path.parent.name == "sessions"
 
 
 class TestPendingFiles:

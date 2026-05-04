@@ -1,8 +1,16 @@
 import configparser
+import os
+import stat
+import sys
 
 import pytest
 
-from contree_cli.config import AuthType, Config, ConfigProfile
+from contree_cli.config import (
+    AuthType,
+    CliSettings,
+    Config,
+    ConfigProfile,
+)
 
 # ---------------------------------------------------------------------------
 # save / load via Config
@@ -17,7 +25,7 @@ class TestSaveAndLoad:
             token="tok123",
             url="https://test.dev",
         )
-        assert (config_dir / "config.ini").exists()
+        assert (config_dir / "auth.ini").exists()
 
     def test_load_reads_saved_profile(self, config_dir):
         cfg = Config()
@@ -171,9 +179,9 @@ class TestProfileResolution:
             url="https://test.dev",
         )
         cp = configparser.ConfigParser()
-        cp.read(config_dir / "config.ini")
+        cp.read(config_dir / "auth.ini")
         cp.remove_option(Config.PROFILE_PREFIX + "default", "url")
-        with open(config_dir / "config.ini", "w") as f:
+        with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
         assert p.url == ""
@@ -188,9 +196,9 @@ class TestProfileResolution:
             auth_type=AuthType.IAM,
         )
         cp = configparser.ConfigParser()
-        cp.read(config_dir / "config.ini")
+        cp.read(config_dir / "auth.ini")
         cp.remove_option(Config.PROFILE_PREFIX + "default", "url")
-        with open(config_dir / "config.ini", "w") as f:
+        with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
         assert p.url == Config.DEFAULT_IAM_URL
@@ -242,9 +250,9 @@ class TestAuthType:
             url="https://old.dev",
         )
         cp = configparser.ConfigParser()
-        cp.read(config_dir / "config.ini")
+        cp.read(config_dir / "auth.ini")
         cp.remove_option(Config.PROFILE_PREFIX + "default", "type")
-        with open(config_dir / "config.ini", "w") as f:
+        with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
         assert p.auth_type == AuthType.JWT
@@ -352,3 +360,74 @@ class TestSwitchProfile:
         cfg = Config()
         with pytest.raises(ValueError, match="does not exist"):
             cfg.switch("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# auth.ini permissions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+class TestAuthFilePermissions:
+    def test_file_mode_is_0600(self, config_dir):
+        cfg = Config()
+        cfg["default"] = ConfigProfile(
+            name="default",
+            token="secret-token",
+            url="https://test.dev",
+        )
+        path = config_dir / "auth.ini"
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
+
+    def test_rewrite_keeps_0600(self, config_dir):
+        cfg = Config()
+        cfg["default"] = ConfigProfile(
+            name="default",
+            token="t1",
+            url="https://test.dev",
+        )
+        path = config_dir / "auth.ini"
+        os.chmod(path, 0o644)
+        cfg["default"] = ConfigProfile(
+            name="default",
+            token="t2",
+            url="https://test.dev",
+        )
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
+
+
+# ---------------------------------------------------------------------------
+# cli.ini parsing
+# ---------------------------------------------------------------------------
+
+
+class TestCliSettings:
+    def test_missing_file_yields_empty_defaults(self, tmp_path):
+        cli = CliSettings.load(tmp_path / "cli.ini")
+        assert cli.log_level is None
+        assert cli.output_format is None
+        assert cli.editor is None
+
+    def test_reads_known_keys(self, tmp_path):
+        path = tmp_path / "cli.ini"
+        path.write_text("[cli]\nlog_level = debug\nformat = json\neditor = nvim\n")
+        cli = CliSettings.load(path)
+        assert cli.log_level == "debug"
+        assert cli.output_format == "json"
+        assert cli.editor == "nvim"
+
+    def test_ignores_unknown_keys(self, tmp_path):
+        path = tmp_path / "cli.ini"
+        path.write_text("[cli]\nunknown = foo\nlog_level = info\n")
+        cli = CliSettings.load(path)
+        assert cli.log_level == "info"
+
+    def test_no_section_yields_empty(self, tmp_path):
+        path = tmp_path / "cli.ini"
+        path.write_text("[other]\nfoo = bar\n")
+        cli = CliSettings.load(path)
+        assert cli.log_level is None
+        assert cli.output_format is None
+        assert cli.editor is None

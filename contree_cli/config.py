@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import configparser
 import logging
 import os
+import stat
 from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
@@ -8,9 +11,34 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-CONTREE_HOME = Path(os.getenv("CONTREE_HOME", "~/.config/contree-cli")).expanduser()
+CONTREE_HOME = Path(os.getenv("CONTREE_HOME", "~/.config/contree")).expanduser()
 CONFIG_DIR = CONTREE_HOME
-CONFIG_FILE = CONTREE_HOME / "config.ini"
+CONFIG_FILE = CONTREE_HOME / "auth.ini"
+CLI_CONFIG_FILE = CONTREE_HOME / "cli.ini"
+
+
+@dataclass(frozen=True)
+class CliSettings:
+    """Optional user defaults from cli.ini ([cli] section)."""
+
+    log_level: str | None = None
+    output_format: str | None = None
+    editor: str | None = None
+
+    @classmethod
+    def load(cls, path: Path) -> CliSettings:
+        cp = configparser.ConfigParser()
+        if path.exists():
+            log.debug("Loading CLI defaults from %s", path)
+            cp.read(path)
+        section: configparser.SectionProxy | dict[str, str] = (
+            cp["cli"] if cp.has_section("cli") else {}
+        )
+        return cls(
+            log_level=section.get("log_level") or None,
+            output_format=section.get("format") or None,
+            editor=section.get("editor") or None,
+        )
 
 
 class AuthType(str, Enum):
@@ -39,7 +67,7 @@ class ConfigProfile:
 
     @property
     def session_db_path(self) -> Path:
-        return CONTREE_HOME / f"sessions-{self.name}.db"
+        return CONTREE_HOME / "cli" / "sessions" / f"{self.name}.db"
 
     def remove_session_db(self) -> None:
         db = self.session_db_path
@@ -59,6 +87,9 @@ class Config(MutableMapping[str, ConfigProfile]):
     PROFILE_PREFIX = "profile:"
 
     def __init__(self, path: Path | None = None) -> None:
+        from contree_cli.migrations import run_migrations
+
+        run_migrations(CONTREE_HOME)
         self.__path = path or CONFIG_FILE
         self.__profiles: dict[str, ConfigProfile] = {}
         self.__active: str = "default"
@@ -106,8 +137,16 @@ class Config(MutableMapping[str, ConfigProfile]):
             if profile.project is not None:
                 cp.set(section, "project", profile.project)
         self.__path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.__path, "w") as f:
+        # Create with 0o600 from the start so the token is never readable
+        # by other users — even between create() and chmod().
+        fd = os.open(
+            self.__path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w") as f:
             cp.write(f)
+        os.chmod(self.__path, stat.S_IRUSR | stat.S_IWUSR)
 
     # -- MutableMapping interface --------------------------------------------
 
