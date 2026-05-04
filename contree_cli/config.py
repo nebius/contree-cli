@@ -99,8 +99,12 @@ class Config(MutableMapping[str, ConfigProfile]):
 
     def _load(self) -> None:
         cp = configparser.ConfigParser()
-        log.debug("Loading config from %s", self.__path)
-        cp.read(self.__path)
+        # Read cli.ini first, then auth.ini — later files override earlier
+        # ones, so secrets in auth.ini take precedence over any non-secret
+        # profile fields a user keeps in cli.ini (url, project, type, …).
+        sources = [CLI_CONFIG_FILE, self.__path]
+        log.debug("Loading config from %s", sources)
+        cp.read(sources)
         self.__active = cp.defaults().get("profile", "default")
         self.__profiles.clear()
         for section in cp.sections():
