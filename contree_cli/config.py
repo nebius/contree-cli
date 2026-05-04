@@ -23,8 +23,8 @@ CLI_CONFIG_FILE = CONTREE_HOME / "cli.ini"
 SETTINGS = configparser.ConfigParser()
 SETTINGS.read([CLI_CONFIG_FILE, CONFIG_FILE])
 
-# Pre-resolved fallback editor when neither ``--editor`` flag nor ``$EDITOR``
-# is set. Priority: env > cli.ini > first PATH-resolvable of vim/nano/vi.
+# Default editor for ``contree file edit`` when ``--editor`` is not given.
+# Resolved once at import time. Priority: $EDITOR > cli.ini > vim > nano > vi.
 EDITOR = (
     os.environ.get("EDITOR")
     or SETTINGS.get("cli", "editor", fallback=None)
@@ -76,7 +76,7 @@ class Config(MutableMapping[str, ConfigProfile]):
     ``del cfg[name]``, ``name in cfg``, ``len(cfg)``, iteration.
     """
 
-    DEFAULT_IAM_URL = "https://api.studio.nebius.com/sandboxes"
+    DEFAULT_IAM_URL = "https://api.tokenfactory.nebius.com/sandboxes"
     PROFILE_PREFIX = "profile:"
 
     def __init__(self, path: Path | None = None) -> None:

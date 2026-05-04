@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import re
 import shlex
 import sys
@@ -391,15 +390,7 @@ class ContreeShell:
             print(f"Usage: {editor} <path>", file=sys.stderr)
             return
         resolved = self.resolve_path(args[0])
-        old_editor = os.environ.get("EDITOR")
-        os.environ["EDITOR"] = editor
-        try:
-            self.dispatch_contree(["file", "edit", resolved])
-        finally:
-            if old_editor is None:
-                os.environ.pop("EDITOR", None)
-            else:
-                os.environ["EDITOR"] = old_editor
+        self.dispatch_contree(["file", "edit", "--editor", editor, resolved])
 
     GLOB_CHARS = frozenset("*?[")
 

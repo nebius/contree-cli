@@ -95,7 +95,7 @@ through the ConTree REST API.
 
 Authentication:
   Bearer token + project ID. Default API URL:
-    https://api.studio.nebius.com/sandboxes/
+    https://api.tokenfactory.nebius.com/sandboxes/
 
   Use `contree auth --help` to configure persistent credentials.
 

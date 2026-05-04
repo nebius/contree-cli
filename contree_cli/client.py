@@ -361,7 +361,7 @@ class ContreeJWTClient(ContreeClient):
 class ContreeIAMClient(ContreeClient):
     """Client using IAM authentication with a project header."""
 
-    DEFAULT_URL = "https://api.studio.nebius.com/sandboxes"
+    DEFAULT_URL = "https://api.tokenfactory.nebius.com/sandboxes"
 
     def __init__(
         self,

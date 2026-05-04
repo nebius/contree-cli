@@ -79,7 +79,8 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     )
     edit_p.add_argument(
         *FLAGS["editor"],
-        help="Editor command (default: $EDITOR or vi)",
+        default=EDITOR,
+        help=f"Editor command (default: {EDITOR})",
     )
     edit_p.add_argument("path", help="Path inside image")
     edit_p.set_defaults(handler=cmd_file_edit, load_args=FileEditArgs)
@@ -178,14 +179,13 @@ def cmd_file_edit(args: FileEditArgs) -> int | None:
 
     # 2. Record original hash, open editor
     original_hash = _file_sha256(tmp_file)
-    editor = args.editor or EDITOR
-    logger.info("Opening %s in %s", tmp_file, editor)
+    logger.info("Opening %s in %s", tmp_file, args.editor)
     # $EDITOR may contain shell expressions (env vars, tilde, pipes),
     # e.g. "TERM=xterm vim" or "~/bin/editor". shlex.split would not
     # expand those, shell=True is required. The file path is quoted
     # via shlex.quote to prevent injection from the filename.
     # nosemgrep: subprocess-shell-true
-    rc = subprocess.call(f"{editor} {shlex.quote(str(tmp_file))}", shell=True)
+    rc = subprocess.call(f"{args.editor} {shlex.quote(str(tmp_file))}", shell=True)
     if rc != 0:
         logger.error("Editor exited with code %d", rc)
         return 1

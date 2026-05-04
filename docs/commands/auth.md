@@ -52,7 +52,7 @@ When you run `contree auth`, the CLI:
 ### Flags
 
 - `--token` — API token (prompted securely if omitted)
-- `--url` — API base URL (default: `https://api.studio.nebius.com/sandboxes`)
+- `--url` — API base URL (default: `https://api.tokenfactory.nebius.com/sandboxes`)
 - `--project` — Project ID (prompted if omitted)
 - `--profile` — Profile name (default: `default`)
 - `-y` / `--force` — Overwrite existing profile without confirmation

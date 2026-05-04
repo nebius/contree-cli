@@ -26,19 +26,19 @@ profile = default
 
 [profile:default]
 token = eyJ...
-url = https://api.studio.nebius.com/sandboxes
+url = https://api.tokenfactory.nebius.com/sandboxes
 type = iam
 project = project-id-default
 
 [profile:personal]
 token = eyJ...
-url = https://api.studio.nebius.com/sandboxes
+url = https://api.tokenfactory.nebius.com/sandboxes
 type = iam
 project = project-id-personal
 
 [profile:sandbox]
 token = eyJ...
-url = https://api.studio.nebius.com/sandboxes
+url = https://api.tokenfactory.nebius.com/sandboxes
 type = iam
 project = project-id-sandbox
 ```
@@ -111,7 +111,7 @@ contree images        # uses sandbox
 Pass `--token` and `--url` directly:
 
 ```bash
-contree --token=eyJ... --url=https://api.studio.nebius.com/sandboxes images
+contree --token=eyJ... --url=https://api.tokenfactory.nebius.com/sandboxes images
 ```
 
 :::{warning}
@@ -256,7 +256,7 @@ For token, URL, and project:
 1. CLI flag (`--token`, `--url`, `--project`)
 2. Environment variable (`CONTREE_TOKEN`, `CONTREE_URL`, `CONTREE_PROJECT`)
 3. Config file value from the active profile
-4. Built-in default URL: `https://api.studio.nebius.com/sandboxes`
+4. Built-in default URL: `https://api.tokenfactory.nebius.com/sandboxes`
 
 For profiles:
 

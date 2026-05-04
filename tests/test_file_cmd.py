@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from contextvars import copy_context
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,6 +52,9 @@ def _run_file_edit(
 ) -> tuple[int | None]:
     tc.fake.responses.extend(responses)
 
+    if not args.editor:
+        args = replace(args, editor="fake-editor")
+
     SESSION_STORE.set(store)
     ctx = copy_context()
 
@@ -63,10 +67,7 @@ def _run_file_edit(
             Path(parts[1]).write_bytes(editor_content)
         return 0
 
-    with (
-        patch("contree_cli.cli.file.subprocess.call", side_effect=fake_editor),
-        patch.dict("os.environ", {"EDITOR": "fake-editor"}),
-    ):
+    with patch("contree_cli.cli.file.subprocess.call", side_effect=fake_editor):
         rc = ctx.run(cmd_file_edit, args)
     return rc
 
@@ -197,14 +198,8 @@ class TestFileEditEditorFailure:
         SESSION_STORE.set(session_store)
         ctx = copy_context()
 
-        with (
-            patch(
-                "contree_cli.cli.file.subprocess.call",
-                return_value=1,
-            ),
-            patch.dict("os.environ", {"EDITOR": "fake-editor"}),
-        ):
-            rc = ctx.run(cmd_file_edit, args)
+        with patch("contree_cli.cli.file.subprocess.call", return_value=1):
+            rc = ctx.run(cmd_file_edit, replace(args, editor="fake-editor"))
         assert rc == 1
         assert session_store.pending_files() == []
 
@@ -236,10 +231,7 @@ class TestFileEditEditorFlag:
         SESSION_STORE.set(session_store)
         ctx = copy_context()
 
-        with (
-            patch("contree_cli.cli.file.subprocess.call", side_effect=fake_editor),
-            patch.dict("os.environ", {"EDITOR": "should-not-use"}),
-        ):
+        with patch("contree_cli.cli.file.subprocess.call", side_effect=fake_editor):
             rc = ctx.run(cmd_file_edit, args)
         assert rc is None
         assert called_with[0].startswith("nvim ")
