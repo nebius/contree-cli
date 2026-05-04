@@ -441,10 +441,14 @@ def _build_payload(
 ) -> dict[str, object]:
     """Build the JSON payload for POST /v1/instances."""
     if args.shell:
+        # In shell mode the API runs `sh -c <command>`, so we must
+        # rebuild the original argv into a shell-safe expression.
         command = shlex.join(args.command_args)
     else:
+        # In non-shell mode the API exec's command + args directly,
+        # JSON list elements preserve boundaries, no quoting needed.
         parts = args.command_args
-        command = shlex.quote(parts[0]) if parts else ""
+        command = parts[0] if parts else ""
 
     payload: dict[str, object] = {
         "image": image_uuid,
@@ -456,7 +460,7 @@ def _build_payload(
     }
 
     if not args.shell and len(args.command_args) > 1:
-        payload["args"] = [shlex.quote(a) for a in args.command_args[1:]]
+        payload["args"] = args.command_args[1:]
 
     if args.timeout is not None:
         payload["timeout"] = args.timeout

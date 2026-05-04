@@ -19,7 +19,6 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import shlex
 import subprocess
 import tempfile
@@ -28,6 +27,7 @@ from pathlib import Path
 
 from contree_cli import CLIENT, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.client import ApiError, ContreeClient, resolve_image, stream_response
+from contree_cli.config import EDITOR
 from contree_cli.session import SessionStore
 from contree_cli.types import FLAGS
 
@@ -178,11 +178,11 @@ def cmd_file_edit(args: FileEditArgs) -> int | None:
 
     # 2. Record original hash, open editor
     original_hash = _file_sha256(tmp_file)
-    editor = args.editor or os.environ.get("EDITOR", "vi")
+    editor = args.editor or EDITOR
     logger.info("Opening %s in %s", tmp_file, editor)
     # $EDITOR may contain shell expressions (env vars, tilde, pipes),
     # e.g. "TERM=xterm vim" or "~/bin/editor". shlex.split would not
-    # expand those — shell=True is required. The file path is quoted
+    # expand those, shell=True is required. The file path is quoted
     # via shlex.quote to prevent injection from the filename.
     # nosemgrep: subprocess-shell-true
     rc = subprocess.call(f"{editor} {shlex.quote(str(tmp_file))}", shell=True)

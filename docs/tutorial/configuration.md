@@ -157,7 +157,7 @@ All data lives in `CONTREE_HOME` (default `~/.config/contree`):
 | Path | Purpose |
 |------|---------|
 | `auth.ini` | Profile credentials and settings (created with mode `0600`) |
-| `cli.ini` | Optional user defaults for the CLI (`[cli]` section: `log_level`, `format`, `editor`) |
+| `cli.ini` | Optional user-editable defaults for the CLI |
 | `cli/sessions/{profile}.db` | Per-profile sessions, history, branches, cache |
 | `cli/skills.db` | Installed agent skill registry |
 
@@ -166,6 +166,77 @@ Override with `$CONTREE_HOME`:
 ```bash
 export CONTREE_HOME=/custom/path
 ```
+
+### `cli.ini`
+
+`cli.ini` is meant for hand-editing. Create it yourself; the CLI never
+writes to it. Two kinds of sections are supported:
+
+#### `[cli]` section: per-flag defaults
+
+Keys here become argparse defaults. Use the argparse `dest` name (not
+the flag name):
+
+| Key | Maps to flag | Notes |
+|-----|--------------|-------|
+| `log_level` | `--log-level` | One of `debug`, `info`, `warning`, `error`, `critical` |
+| `output_format` | `-f` / `--format` | One of the formatter names (`default`, `json`, `json-pretty`, `csv`, `tsv`, `table`) |
+| `editor` | `--editor` (file edit) | Fallback when neither `--editor` nor `$EDITOR` is set; if absent the CLI searches `vim` then `nano` on `PATH` and falls back to `vi` |
+
+Example:
+
+```ini
+[cli]
+log_level = debug
+output_format = json
+editor = nvim
+```
+
+Precedence: CLI flag > environment variable > `cli.ini` > built-in
+default. A `cli.ini` setting always loses to an explicit flag.
+
+#### `[profile:NAME]` sections: CLI-scoped profiles
+
+`cli.ini` accepts the same `[profile:NAME]` sections as `auth.ini` and
+supports the same fields:
+
+| Key | Required | Notes |
+|-----|----------|-------|
+| `url` | yes for JWT, optional for IAM | API base URL |
+| `type` | optional | `jwt` (default) or `iam` |
+| `project` | IAM only | Project ID |
+| `token` | optional | API bearer token |
+
+The two files are merged at load time and `auth.ini` wins on conflict.
+
+What `cli.ini` is for: profiles (or any field, including `token`) you
+want only the `contree` CLI to see. The CLI merges `cli.ini` with
+`auth.ini`. Other contree-related tooling that talks to the API
+directly (the SDK, the MCP server) reads only `auth.ini`. Use
+`cli.ini` when you need a profile that should be invisible to those
+direct-API consumers, or to keep `auth.ini` minimal and shared.
+
+Example, CLI-only profile alongside the shared one:
+
+```ini
+# ~/.config/contree/auth.ini  (read by CLI + SDK + MCP, mode 0600)
+[DEFAULT]
+profile = default
+
+[profile:default]
+url = https://contree.dev
+token = eyJhbGciOi...
+```
+
+```ini
+# ~/.config/contree/cli.ini  (read only by the CLI)
+[profile:cli-sandbox]
+url = https://staging.contree.dev
+token = eyJhbGciOi...different
+```
+
+The active profile is still selected by the `profile` key in
+`[DEFAULT]` of `auth.ini` (or by `--profile` / `$CONTREE_PROFILE`).
 
 ## Environment variables
 

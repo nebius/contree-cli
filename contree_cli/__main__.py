@@ -1,4 +1,3 @@
-import argparse
 import contextvars
 import logging
 import sys
@@ -9,7 +8,7 @@ import contree_cli.config as config_mod
 from contree_cli import CLIENT, FORMATTER, PROFILE, SESSION_STORE, ArgumentsProtocol
 from contree_cli.arguments import parser
 from contree_cli.client import ApiError, client_from_profile
-from contree_cli.config import CLI_CONFIG_FILE, CliSettings, Config
+from contree_cli.config import SETTINGS, Config
 from contree_cli.log import setup_logging
 from contree_cli.output import FORMATTERS
 from contree_cli.session import SessionStore, get_session_key
@@ -17,35 +16,13 @@ from contree_cli.session import SessionStore, get_session_key
 log = logging.getLogger(__name__)
 
 
-def apply_defaults(p: argparse.ArgumentParser, **defaults: object) -> None:
-    """Apply defaults to *p* and every nested subparser.
-
-    argparse subparsers maintain their own default tables and will
-    override main-parser defaults for arguments they declare (e.g.
-    ``--editor`` on ``file edit``), so we have to walk into them.
-    """
-    p.set_defaults(**defaults)
-    for action in p._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            for sub in action.choices.values():
-                apply_defaults(sub, **defaults)
-
-
 def main() -> None:
     if len(sys.argv) == 1:
         parser.print_help()
         exit(0)
 
-    cli_defaults = CliSettings.load(CLI_CONFIG_FILE)
-    overrides: dict[str, object] = {}
-    if cli_defaults.log_level:
-        overrides["log_level"] = cli_defaults.log_level
-    if cli_defaults.output_format:
-        overrides["output_format"] = cli_defaults.output_format
-    if cli_defaults.editor:
-        overrides["editor"] = cli_defaults.editor
-    if overrides:
-        apply_defaults(parser, **overrides)
+    if SETTINGS.has_section("cli"):
+        parser.set_defaults(**SETTINGS["cli"])
 
     args = parser.parse_args()
     setup_logging(level=getattr(logging, args.log_level.upper(), logging.INFO))

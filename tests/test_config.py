@@ -7,7 +7,6 @@ import pytest
 
 from contree_cli.config import (
     AuthType,
-    CliSettings,
     Config,
     ConfigProfile,
 )
@@ -396,41 +395,6 @@ class TestAuthFilePermissions:
         )
         mode = stat.S_IMODE(os.stat(path).st_mode)
         assert mode == 0o600
-
-
-# ---------------------------------------------------------------------------
-# cli.ini parsing
-# ---------------------------------------------------------------------------
-
-
-class TestCliSettings:
-    def test_missing_file_yields_empty_defaults(self, tmp_path):
-        cli = CliSettings.load(tmp_path / "cli.ini")
-        assert cli.log_level is None
-        assert cli.output_format is None
-        assert cli.editor is None
-
-    def test_reads_known_keys(self, tmp_path):
-        path = tmp_path / "cli.ini"
-        path.write_text("[cli]\nlog_level = debug\nformat = json\neditor = nvim\n")
-        cli = CliSettings.load(path)
-        assert cli.log_level == "debug"
-        assert cli.output_format == "json"
-        assert cli.editor == "nvim"
-
-    def test_ignores_unknown_keys(self, tmp_path):
-        path = tmp_path / "cli.ini"
-        path.write_text("[cli]\nunknown = foo\nlog_level = info\n")
-        cli = CliSettings.load(path)
-        assert cli.log_level == "info"
-
-    def test_no_section_yields_empty(self, tmp_path):
-        path = tmp_path / "cli.ini"
-        path.write_text("[other]\nfoo = bar\n")
-        cli = CliSettings.load(path)
-        assert cli.log_level is None
-        assert cli.output_format is None
-        assert cli.editor is None
 
 
 # ---------------------------------------------------------------------------

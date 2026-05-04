@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 import logging
 import os
+import shutil
 import stat
 from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
@@ -16,29 +17,21 @@ CONFIG_DIR = CONTREE_HOME
 CONFIG_FILE = CONTREE_HOME / "auth.ini"
 CLI_CONFIG_FILE = CONTREE_HOME / "cli.ini"
 
+# Parsed at import time. Paths are fixed by CONTREE_HOME (env), so the
+# ``[cli]`` section is available before argparse runs and can supply
+# defaults that beat hardcoded ones but still lose to flags.
+SETTINGS = configparser.ConfigParser()
+SETTINGS.read([CLI_CONFIG_FILE, CONFIG_FILE])
 
-@dataclass(frozen=True)
-class CliSettings:
-    """Optional user defaults from cli.ini ([cli] section)."""
-
-    log_level: str | None = None
-    output_format: str | None = None
-    editor: str | None = None
-
-    @classmethod
-    def load(cls, path: Path) -> CliSettings:
-        cp = configparser.ConfigParser()
-        if path.exists():
-            log.debug("Loading CLI defaults from %s", path)
-            cp.read(path)
-        section: configparser.SectionProxy | dict[str, str] = (
-            cp["cli"] if cp.has_section("cli") else {}
-        )
-        return cls(
-            log_level=section.get("log_level") or None,
-            output_format=section.get("format") or None,
-            editor=section.get("editor") or None,
-        )
+# Pre-resolved fallback editor when neither ``--editor`` flag nor ``$EDITOR``
+# is set. Priority: env > cli.ini > first PATH-resolvable of vim/nano/vi.
+EDITOR = (
+    os.environ.get("EDITOR")
+    or SETTINGS.get("cli", "editor", fallback=None)
+    or shutil.which("vim")
+    or shutil.which("nano")
+    or "vi"
+)
 
 
 class AuthType(str, Enum):

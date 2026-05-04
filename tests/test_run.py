@@ -936,7 +936,12 @@ class TestShellMode:
         assert body["args"] == ["hello", "world"]
         assert body["shell"] is False
 
-    def test_non_shell_quotes_args_with_spaces(self, contree_client, session_store):
+    def test_non_shell_passes_args_raw(self, contree_client, session_store):
+        """Non-shell mode: command + args go to direct exec, no shell quoting.
+
+        The API exec's argv directly, so adding shell quotes would put
+        literal quote characters into the program's argv.
+        """
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(
             command_args=["python3", "-c", "print('hello world')"],
@@ -950,14 +955,7 @@ class TestShellMode:
         spawn_req = contree_client.get_request(0)
         body = json.loads(spawn_req.body)
         assert body["command"] == "python3"
-        # Each arg with spaces / special chars must be shell-quoted so the
-        # remote side gets the same argv after sh-style parsing.
-        import shlex
-
-        assert [shlex.split(a)[0] for a in body["args"]] == [
-            "-c",
-            "print('hello world')",
-        ]
+        assert body["args"] == ["-c", "print('hello world')"]
 
     def test_shell_quotes_arg_with_spaces(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
