@@ -50,6 +50,15 @@ def _run_file_edit(
     store: SessionStore,
     editor_content: bytes | None = None,
 ) -> tuple[int | None]:
+    """Drive ``cmd_file_edit`` with mocked editor + HTTP responses.
+
+    The editor mock writes ``editor_content`` directly to the file
+    inside the temp dir created by ``cmd_file_edit``. This sidesteps
+    shell-string parsing, which has subtle differences on Windows
+    when paths contain backslashes.
+    """
+    import tempfile
+
     tc.fake.responses.extend(responses)
 
     if not args.editor:
@@ -58,16 +67,27 @@ def _run_file_edit(
     SESSION_STORE.set(store)
     ctx = copy_context()
 
-    def fake_editor(cmd: str, *, shell: bool = True) -> int:
-        # cmd is a shell string like "fake-editor '/tmp/...'"
-        import shlex
+    captured_dir: list[str] = []
+    real_mkdtemp = tempfile.mkdtemp
 
-        parts = shlex.split(cmd)
-        if editor_content is not None:
-            Path(parts[1]).write_bytes(editor_content)
+    def capturing_mkdtemp(*a, **kw):
+        d = real_mkdtemp(*a, **kw)
+        captured_dir.append(d)
+        return d
+
+    def fake_editor(cmd: str, *, shell: bool = True) -> int:
+        if editor_content is not None and captured_dir:
+            for f in Path(captured_dir[-1]).iterdir():
+                f.write_bytes(editor_content)
         return 0
 
-    with patch("contree_cli.cli.file.subprocess.call", side_effect=fake_editor):
+    with (
+        patch(
+            "contree_cli.cli.file.tempfile.mkdtemp",
+            side_effect=capturing_mkdtemp,
+        ),
+        patch("contree_cli.cli.file.subprocess.call", side_effect=fake_editor),
+    ):
         rc = ctx.run(cmd_file_edit, args)
     return rc
 
