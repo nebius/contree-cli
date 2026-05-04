@@ -28,7 +28,6 @@ from pathlib import Path
 
 from contree_cli import CLIENT, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.client import ApiError, ContreeClient, resolve_image, stream_response
-from contree_cli.config import CLI_CONFIG_FILE, CliSettings
 from contree_cli.session import SessionStore
 from contree_cli.types import FLAGS
 
@@ -179,8 +178,7 @@ def cmd_file_edit(args: FileEditArgs) -> int | None:
 
     # 2. Record original hash, open editor
     original_hash = _file_sha256(tmp_file)
-    cli_defaults = CliSettings.load(CLI_CONFIG_FILE)
-    editor = args.editor or os.environ.get("EDITOR") or cli_defaults.editor or "vi"
+    editor = args.editor or os.environ.get("EDITOR", "vi")
     logger.info("Opening %s in %s", tmp_file, editor)
     # $EDITOR may contain shell expressions (env vars, tilde, pipes),
     # e.g. "TERM=xterm vim" or "~/bin/editor". shlex.split would not

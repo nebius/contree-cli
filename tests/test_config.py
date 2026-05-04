@@ -431,3 +431,49 @@ class TestCliSettings:
         assert cli.log_level is None
         assert cli.output_format is None
         assert cli.editor is None
+
+
+# ---------------------------------------------------------------------------
+# auth.ini + cli.ini are read together; auth.ini wins on conflict
+# ---------------------------------------------------------------------------
+
+
+class TestProfileMergeAcrossFiles:
+    def test_profile_fields_merge_from_cli_and_auth(self, config_dir, monkeypatch):
+        import contree_cli.config as config_mod
+
+        cli_path = config_dir / "cli.ini"
+        cli_path.parent.mkdir(parents=True, exist_ok=True)
+        cli_path.write_text(
+            "[profile:default]\nurl = https://from-cli.dev\nproject = aiproject-cli\n"
+        )
+        monkeypatch.setattr(config_mod, "CLI_CONFIG_FILE", cli_path)
+
+        auth_path = config_dir / "auth.ini"
+        auth_path.write_text(
+            "[DEFAULT]\nprofile = default\n[profile:default]\ntoken = secret-tok\n"
+        )
+
+        p = Config().resolve()
+        assert p.token == "secret-tok"
+        assert p.url == "https://from-cli.dev"
+        assert p.project == "aiproject-cli"
+
+    def test_auth_overrides_cli_on_conflict(self, config_dir, monkeypatch):
+        import contree_cli.config as config_mod
+
+        cli_path = config_dir / "cli.ini"
+        cli_path.parent.mkdir(parents=True, exist_ok=True)
+        cli_path.write_text("[profile:default]\nurl = https://from-cli.dev\n")
+        monkeypatch.setattr(config_mod, "CLI_CONFIG_FILE", cli_path)
+
+        auth_path = config_dir / "auth.ini"
+        auth_path.write_text(
+            "[DEFAULT]\nprofile = default\n"
+            "[profile:default]\n"
+            "url = https://from-auth.dev\n"
+            "token = tok\n"
+        )
+
+        p = Config().resolve()
+        assert p.url == "https://from-auth.dev"
