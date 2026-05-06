@@ -152,7 +152,8 @@ export CONTREE_SESSION=shared-session
 
 ## Data storage
 
-All data lives in `CONTREE_HOME` (default `~/.config/contree`):
+All data lives in `CONTREE_HOME` (default `$XDG_CONFIG_HOME/contree`,
+falling back to `~/.config/contree` when `XDG_CONFIG_HOME` is unset):
 
 | Path | Purpose |
 |------|---------|
@@ -242,7 +243,8 @@ The active profile is still selected by the `profile` key in
 
 | Variable | Description |
 |----------|-------------|
-| `CONTREE_HOME` | Data directory (default `~/.config/contree`) |
+| `CONTREE_HOME` | Data directory (default `$XDG_CONFIG_HOME/contree`, or `~/.config/contree`) |
+| `XDG_CONFIG_HOME` | XDG base config dir, used to derive the default `CONTREE_HOME` |
 | `CONTREE_TOKEN` | API bearer token (overrides config) |
 | `CONTREE_URL` | API base URL (overrides config) |
 | `CONTREE_PROJECT` | Project ID (overrides config) |

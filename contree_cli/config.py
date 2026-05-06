@@ -10,9 +10,17 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from .migrations import run_migrations
+
 log = logging.getLogger(__name__)
 
-CONTREE_HOME = Path(os.getenv("CONTREE_HOME", "~/.config/contree")).expanduser()
+
+def get_default_path(env: str, default: str | Path) -> Path:
+    return Path(os.getenv(env) or default).expanduser()
+
+
+XDG_CONFIG_HOME = get_default_path("XDG_CONFIG_HOME", "~/.config")
+CONTREE_HOME = get_default_path("CONTREE_HOME", XDG_CONFIG_HOME / "contree")
 CONFIG_DIR = CONTREE_HOME
 CONFIG_FILE = CONTREE_HOME / "auth.ini"
 CLI_CONFIG_FILE = CONTREE_HOME / "cli.ini"
@@ -80,8 +88,6 @@ class Config(MutableMapping[str, ConfigProfile]):
     PROFILE_PREFIX = "profile:"
 
     def __init__(self, path: Path | None = None) -> None:
-        from contree_cli.migrations import run_migrations
-
         run_migrations(CONTREE_HOME)
         self.__path = path or CONFIG_FILE
         self.__profiles: dict[str, ConfigProfile] = {}

@@ -5,10 +5,12 @@ import sys
 
 import pytest
 
+import contree_cli.config as config_mod
 from contree_cli.config import (
     AuthType,
     Config,
     ConfigProfile,
+    get_default_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -404,8 +406,6 @@ class TestAuthFilePermissions:
 
 class TestProfileMergeAcrossFiles:
     def test_profile_fields_merge_from_cli_and_auth(self, config_dir, monkeypatch):
-        import contree_cli.config as config_mod
-
         cli_path = config_dir / "cli.ini"
         cli_path.parent.mkdir(parents=True, exist_ok=True)
         cli_path.write_text(
@@ -424,8 +424,6 @@ class TestProfileMergeAcrossFiles:
         assert p.project == "aiproject-cli"
 
     def test_auth_overrides_cli_on_conflict(self, config_dir, monkeypatch):
-        import contree_cli.config as config_mod
-
         cli_path = config_dir / "cli.ini"
         cli_path.parent.mkdir(parents=True, exist_ok=True)
         cli_path.write_text("[profile:default]\nurl = https://from-cli.dev\n")
@@ -441,3 +439,32 @@ class TestProfileMergeAcrossFiles:
 
         p = Config().resolve()
         assert p.url == "https://from-auth.dev"
+
+
+# ---------------------------------------------------------------------------
+# default CONTREE_HOME respects XDG_CONFIG_HOME
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultContreeHome:
+    def test_uses_xdg_config_home_when_set(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CONTREE_HOME", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        xdg = get_default_path("XDG_CONFIG_HOME", "~/.config")
+        home = get_default_path("CONTREE_HOME", xdg / "contree")
+        assert home == tmp_path / "xdg" / "contree"
+
+    def test_falls_back_to_dot_config_when_xdg_unset(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CONTREE_HOME", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        xdg = get_default_path("XDG_CONFIG_HOME", "~/.config")
+        home = get_default_path("CONTREE_HOME", xdg / "contree")
+        assert home == tmp_path / ".config" / "contree"
+
+    def test_contree_home_overrides_xdg(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CONTREE_HOME", str(tmp_path / "explicit"))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        xdg = get_default_path("XDG_CONFIG_HOME", "~/.config")
+        home = get_default_path("CONTREE_HOME", xdg / "contree")
+        assert home == tmp_path / "explicit"

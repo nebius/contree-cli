@@ -207,14 +207,17 @@ More: contree auth --help
 Configuration
 =============
 
-Data directory: ~/.config/contree-cli/ (override: $CONTREE_HOME)
+Data directory: $XDG_CONFIG_HOME/contree/ (or ~/.config/contree/);
+override with $CONTREE_HOME.
 
-  config.ini              profile credentials
-  sessions-{profile}.db   per-profile sessions
-  skills.db               agent skill registry
+  auth.ini                    profile credentials (mode 0600)
+  cli.ini                     optional CLI defaults
+  cli/sessions/{profile}.db   per-profile sessions
+  cli/skills.db               agent skill registry
 
 Environment variables:
   CONTREE_HOME       data directory
+  XDG_CONFIG_HOME    XDG base config dir, used to derive default CONTREE_HOME
   CONTREE_TOKEN      API token (overrides config)
   CONTREE_URL        API URL (overrides config)
   CONTREE_PROJECT    project ID (overrides config)
