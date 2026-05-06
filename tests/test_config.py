@@ -458,6 +458,7 @@ class TestDefaultContreeHome:
         monkeypatch.delenv("CONTREE_HOME", raising=False)
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         xdg = get_default_path("XDG_CONFIG_HOME", "~/.config")
         home = get_default_path("CONTREE_HOME", xdg / "contree")
         assert home == tmp_path / ".config" / "contree"
