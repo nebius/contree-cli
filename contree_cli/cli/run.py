@@ -49,17 +49,20 @@ from __future__ import annotations
 import argparse
 import base64
 import fnmatch
+import functools
 import io
 import json
 import logging
 import os
 import re
 import select
+import shlex
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import timedelta
+from multiprocessing.pool import ThreadPool
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.client import ApiError, ContreeClient, decode_stream, resolve_image
@@ -68,7 +71,7 @@ from contree_cli.output import (
     DefaultFormatter,
     OutputFormatter,
 )
-from contree_cli.session import SessionStore
+from contree_cli.session import CONTREE_CONCURRENCY, SessionStore
 from contree_cli.types import FLAGS
 
 logger = logging.getLogger(__name__)
@@ -351,47 +354,82 @@ def _local_file_cache_kind(host_path: str) -> str:
     return f"local_file:{digest}"
 
 
-MAX_CACHE_AGE = 90 * 24 * 3600  # 90 days — server retention is 6 months
+MAX_CACHE_AGE = 90 * 24 * 3600  # 90 days - server retention is 6 months
 
 
-def _upload_file(
-    client: ContreeClient,
-    mf: MappedFile,
-    store: SessionStore,
-) -> str:
-    """Upload a host file and return its UUID, reusing if already present."""
+def cached_local_uuid(mf: MappedFile, store: SessionStore) -> str | None:
+    """Return a cached UUID for *mf* if one was uploaded within MAX_CACHE_AGE."""
     cache_kind = _local_file_cache_kind(mf.host_path)
     cached = store.cache.get(("", cache_kind))
     if isinstance(cached, dict) and cached.get("uuid"):
         age = time.time() - cached.get("uploaded_at", 0)
         if age < MAX_CACHE_AGE:
             logger.debug(
-                "File %s reused from local cache (%s)", mf.host_path, cached["uuid"]
+                "File %s reused from local cache (%s)",
+                mf.host_path,
+                cached["uuid"],
             )
             return str(cached["uuid"])
+    return None
 
+
+def record_local_uuid(mf: MappedFile, file_uuid: str, store: SessionStore) -> None:
+    """Persist a host_path → file_uuid mapping in the local cache."""
+    cache_kind = _local_file_cache_kind(mf.host_path)
+    store.cache[("", cache_kind)] = {
+        "uuid": file_uuid,
+        "uploaded_at": time.time(),
+    }
+
+
+def upload_one_remote(client: ContreeClient, mf: MappedFile) -> tuple[MappedFile, str]:
+    """HTTP-only upload (sha256 dedup + POST /v1/files). Thread-safe."""
     try:
         resp = client.get("/v1/files", params={"sha256": mf.sha256()})
         file_uuid = str(json.loads(resp.read())["uuid"])
-        logger.info("File %s already uploaded (%s)", mf.host_path, file_uuid)
-        store.cache[("", cache_kind)] = {"uuid": file_uuid, "uploaded_at": time.time()}
-        return file_uuid
+        logger.info("Uploaded file: %s -> %s", mf.host_path, file_uuid)
+        return mf, file_uuid
     except ApiError as exc:
         if exc.status != 404:
             raise
 
     with open(mf.host_path, "rb") as fh:
-        data = fh.read()
-    resp = client.request(
-        "POST",
-        "/v1/files",
-        body=data,
-        headers={"Content-Type": "application/octet-stream"},
-    )
-    file_uuid = str(json.loads(resp.read())["uuid"])
+        resp = client.request(
+            "POST",
+            "/v1/files",
+            body=fh,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        file_uuid = str(json.loads(resp.read())["uuid"])
     logger.debug("Uploaded %s (%s)", mf.host_path, file_uuid)
-    store.cache[("", cache_kind)] = {"uuid": file_uuid, "uploaded_at": time.time()}
-    return file_uuid
+    return mf, file_uuid
+
+
+def upload_files(
+    client: ContreeClient,
+    files: list[MappedFile],
+    store: SessionStore,
+) -> dict[str, str]:
+    """Upload host files in parallel, returning host_path → file_uuid."""
+    uploaded: dict[str, str] = {}
+    pending: list[MappedFile] = []
+    for mf in files:
+        cached = cached_local_uuid(mf, store)
+        if cached:
+            uploaded[mf.host_path] = cached
+        else:
+            pending.append(mf)
+
+    if not pending:
+        return uploaded
+
+    workers = min(CONTREE_CONCURRENCY, len(pending))
+    upload = functools.partial(upload_one_remote, client)
+    with ThreadPool(workers) as pool:
+        for mf, file_uuid in pool.imap_unordered(upload, pending):
+            uploaded[mf.host_path] = file_uuid
+            record_local_uuid(mf, file_uuid, store)
+    return uploaded
 
 
 def _build_payload(
@@ -403,8 +441,12 @@ def _build_payload(
 ) -> dict[str, object]:
     """Build the JSON payload for POST /v1/instances."""
     if args.shell:
-        command = " ".join(args.command_args)
+        # In shell mode the API runs `sh -c <command>`, so we must
+        # rebuild the original argv into a shell-safe expression.
+        command = shlex.join(args.command_args)
     else:
+        # In non-shell mode the API exec's command + args directly,
+        # JSON list elements preserve boundaries, no quoting needed.
         parts = args.command_args
         command = parts[0] if parts else ""
 
@@ -534,9 +576,7 @@ def cmd_run(args: RunArgs) -> int | None:
         print(str(exc), file=sys.stderr)
         return 1
 
-    uploaded: dict[str, str] = {}
-    for mf in expanded_files:
-        uploaded[mf.host_path] = _upload_file(client, mf, store)
+    uploaded = upload_files(client, expanded_files, store)
 
     # 2b. Include pending files from session store
     pending = store.pending_files()
@@ -669,6 +709,14 @@ def cmd_run(args: RunArgs) -> int | None:
 
     # 6. Cache terminal operation result
     store.cache[(op_uuid, "operation")] = op
+
+    if op["status"] != "SUCCESS":
+        logger.fatal(
+            "Operation %s ended with status %s%s",
+            op_uuid,
+            op["status"],
+            f": {op['error']}" if op.get("error") else "",
+        )
 
     # 7. Display result
     _display_operation(op, formatter)

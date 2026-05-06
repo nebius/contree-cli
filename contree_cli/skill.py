@@ -64,7 +64,7 @@ def default_claude_home() -> Path:
 
 @contextmanager
 def connect_registry() -> Iterator[sqlite3.Connection]:
-    db_path = config_mod.CONTREE_HOME / "skills.db"
+    db_path = config_mod.CONTREE_HOME / "cli" / "skills.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=5.0)
     conn.row_factory = sqlite3.Row

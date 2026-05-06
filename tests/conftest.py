@@ -35,17 +35,35 @@ class FakeResponse:
     status: int = 200
     reason: str = ""
     body: bytes = b"{}"
+    headers: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not self.reason:
             self.reason = "OK" if self.status < 300 else "Error"
+        if self.headers is None:
+            self.headers = {}
 
     def read(self, amt: int | None = None) -> bytes:
         return self.body
 
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        assert self.headers is not None
+        for key, value in self.headers.items():
+            if key.lower() == name.lower():
+                return value
+        return default
+
+    def getheaders(self) -> list[tuple[str, str]]:
+        assert self.headers is not None
+        return list(self.headers.items())
+
     @staticmethod
     def json(body: object, *, status: int = 200) -> FakeResponse:
-        return FakeResponse(status=status, body=json.dumps(body).encode())
+        return FakeResponse(
+            status=status,
+            body=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
 
 
 @dataclass
@@ -169,8 +187,8 @@ def iam_client() -> ContreeTestIAMClient:
 def config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect CONTREE_HOME / CONFIG_DIR / CONFIG_FILE to a temp directory."""
     home = tmp_path / ".contree"
-    cfg_dir = home / "contree-cli"
-    cfg_file = cfg_dir / "config.ini"
+    cfg_dir = home / "contree"
+    cfg_file = cfg_dir / "auth.ini"
     monkeypatch.setattr(config_mod, "CONTREE_HOME", home)
     monkeypatch.setattr(config_mod, "CONFIG_DIR", cfg_dir)
     monkeypatch.setattr(config_mod, "CONFIG_FILE", cfg_file)

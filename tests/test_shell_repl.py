@@ -333,46 +333,21 @@ class TestEditorAliases:
             shell.execute("vi /tmp/script.sh")
         mock.assert_called_once_with("vi", ["/tmp/script.sh"])
 
-    def test_dispatch_edit_sets_editor_env(self):
-        """dispatch_edit should set EDITOR to the specified editor."""
-        shell = _make_shell()
-        captured_editor = {}
-
-        def fake_dispatch(tokens):
-            import os
-
-            captured_editor["value"] = os.environ.get("EDITOR")
-
-        with patch.object(shell, "dispatch_contree", side_effect=fake_dispatch):
-            shell.dispatch_edit("nano", ["/etc/hosts"])
-
-        assert captured_editor["value"] == "nano"
-
-    def test_dispatch_edit_restores_editor_env(self):
-        """EDITOR should be restored after _dispatch_edit."""
-        import os
-
-        shell = _make_shell()
-        old = os.environ.get("EDITOR")
-
-        with patch.object(shell, "dispatch_contree"):
-            shell.dispatch_edit("nano", ["/etc/hosts"])
-
-        assert os.environ.get("EDITOR") == old
-
-    def test_dispatch_edit_passes_file_edit_tokens(self):
-        """dispatch_edit should call _dispatch_contree with file edit tokens."""
+    def test_dispatch_edit_passes_editor_flag(self):
+        """dispatch_edit should pass --editor instead of mutating env."""
         shell = _make_shell()
         with patch.object(shell, "dispatch_contree") as mock:
-            shell.dispatch_edit("vim", ["/app/main.py"])
-        mock.assert_called_once_with(["file", "edit", "/app/main.py"])
+            shell.dispatch_edit("nano", ["/etc/hosts"])
+        mock.assert_called_once_with(["file", "edit", "--editor", "nano", "/etc/hosts"])
 
     def test_vim_relative_path_resolved(self):
         """'vim .bashrc' after 'cd /root' should resolve the path."""
         shell = _make_shell()
         with _mock_session("/root"), patch.object(shell, "dispatch_contree") as mock:
             shell.dispatch_edit("vim", [".bashrc"])
-        mock.assert_called_once_with(["file", "edit", "/root/.bashrc"])
+        mock.assert_called_once_with(
+            ["file", "edit", "--editor", "vim", "/root/.bashrc"]
+        )
 
     def test_dispatch_edit_no_path_prints_usage(self, capsys):
         """Editor without a path should print usage."""
@@ -943,37 +918,16 @@ class TestDispatchRunExceptionLogging:
         # Should not raise
 
 
-class TestDispatchEditEditorRestore:
-    def test_editor_restored_when_previously_unset(self):
-        """When EDITOR was not set, it should be removed after dispatch."""
+class TestDispatchEditDoesNotMutateEnv:
+    def test_env_untouched(self):
+        """dispatch_edit forwards --editor as a flag, never mutates os.environ."""
         import os
 
         shell = _make_shell()
-        old = os.environ.pop("EDITOR", None)
-        try:
-            with patch.object(shell, "dispatch_contree"):
-                shell.dispatch_edit("nano", ["/etc/hosts"])
-            assert "EDITOR" not in os.environ
-        finally:
-            if old is not None:
-                os.environ["EDITOR"] = old
-
-    def test_editor_restored_when_previously_set(self):
-        """When EDITOR was set, it should be restored after dispatch."""
-        import os
-
-        shell = _make_shell()
-        old = os.environ.get("EDITOR")
-        os.environ["EDITOR"] = "emacs"
-        try:
-            with patch.object(shell, "dispatch_contree"):
-                shell.dispatch_edit("nano", ["/etc/hosts"])
-            assert os.environ["EDITOR"] == "emacs"
-        finally:
-            if old is not None:
-                os.environ["EDITOR"] = old
-            else:
-                os.environ.pop("EDITOR", None)
+        before = dict(os.environ)
+        with patch.object(shell, "dispatch_contree"):
+            shell.dispatch_edit("nano", ["/etc/hosts"])
+        assert dict(os.environ) == before
 
 
 class TestNvimAlias:

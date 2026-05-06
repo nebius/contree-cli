@@ -8,7 +8,7 @@ import contree_cli.config as config_mod
 from contree_cli import CLIENT, FORMATTER, PROFILE, SESSION_STORE, ArgumentsProtocol
 from contree_cli.arguments import parser
 from contree_cli.client import ApiError, client_from_profile
-from contree_cli.config import Config
+from contree_cli.config import SETTINGS, Config
 from contree_cli.log import setup_logging
 from contree_cli.output import FORMATTERS
 from contree_cli.session import SessionStore, get_session_key
@@ -20,6 +20,9 @@ def main() -> None:
     if len(sys.argv) == 1:
         parser.print_help()
         exit(0)
+
+    if SETTINGS.has_section("cli"):
+        parser.set_defaults(**SETTINGS["cli"])
 
     args = parser.parse_args()
     setup_logging(level=getattr(logging, args.log_level.upper(), logging.INFO))
@@ -38,14 +41,19 @@ def main() -> None:
     if args.project:
         profile = replace(profile, project=args.project)
 
-    # auth creates its own client and can work with nonexistent profiles
-    if args.command not in ("auth",):
-        if profile.name not in cfg:
-            log.error(
-                "Profile %r does not exist. Run `contree auth` first.",
-                profile.name,
-            )
-            exit(1)
+    # Local-only commands don't need a client or a configured profile:
+    # auth bootstraps its own; agent/man/skill operate purely on local files.
+    LOCAL_COMMANDS = ("auth", "agent", "man", "skill")
+    needs_client = args.command not in LOCAL_COMMANDS
+
+    if needs_client and profile.name not in cfg:
+        log.error(
+            "Profile %r does not exist. Run `contree auth` first.",
+            profile.name,
+        )
+        exit(1)
+
+    if needs_client:
         try:
             client = client_from_profile(profile)
         except ValueError as exc:
@@ -57,6 +65,7 @@ def main() -> None:
 
     session_key = get_session_key(profile.name, override=args.session_key)
     db_path = profile.session_db_path
+    log.debug("Running in session: %s", session_key)
 
     with SessionStore(db_path, session_key) as store:
         PROFILE.set(profile)

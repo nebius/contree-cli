@@ -1,8 +1,17 @@
 import configparser
+import os
+import stat
+import sys
 
 import pytest
 
-from contree_cli.config import AuthType, Config, ConfigProfile
+import contree_cli.config as config_mod
+from contree_cli.config import (
+    AuthType,
+    Config,
+    ConfigProfile,
+    get_default_path,
+)
 
 # ---------------------------------------------------------------------------
 # save / load via Config
@@ -17,7 +26,7 @@ class TestSaveAndLoad:
             token="tok123",
             url="https://test.dev",
         )
-        assert (config_dir / "config.ini").exists()
+        assert (config_dir / "auth.ini").exists()
 
     def test_load_reads_saved_profile(self, config_dir):
         cfg = Config()
@@ -171,9 +180,9 @@ class TestProfileResolution:
             url="https://test.dev",
         )
         cp = configparser.ConfigParser()
-        cp.read(config_dir / "config.ini")
+        cp.read(config_dir / "auth.ini")
         cp.remove_option(Config.PROFILE_PREFIX + "default", "url")
-        with open(config_dir / "config.ini", "w") as f:
+        with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
         assert p.url == ""
@@ -188,9 +197,9 @@ class TestProfileResolution:
             auth_type=AuthType.IAM,
         )
         cp = configparser.ConfigParser()
-        cp.read(config_dir / "config.ini")
+        cp.read(config_dir / "auth.ini")
         cp.remove_option(Config.PROFILE_PREFIX + "default", "url")
-        with open(config_dir / "config.ini", "w") as f:
+        with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
         assert p.url == Config.DEFAULT_IAM_URL
@@ -242,9 +251,9 @@ class TestAuthType:
             url="https://old.dev",
         )
         cp = configparser.ConfigParser()
-        cp.read(config_dir / "config.ini")
+        cp.read(config_dir / "auth.ini")
         cp.remove_option(Config.PROFILE_PREFIX + "default", "type")
-        with open(config_dir / "config.ini", "w") as f:
+        with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
         assert p.auth_type == AuthType.JWT
@@ -352,3 +361,111 @@ class TestSwitchProfile:
         cfg = Config()
         with pytest.raises(ValueError, match="does not exist"):
             cfg.switch("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# auth.ini permissions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+class TestAuthFilePermissions:
+    def test_file_mode_is_0600(self, config_dir):
+        cfg = Config()
+        cfg["default"] = ConfigProfile(
+            name="default",
+            token="secret-token",
+            url="https://test.dev",
+        )
+        path = config_dir / "auth.ini"
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
+
+    def test_rewrite_keeps_0600(self, config_dir):
+        cfg = Config()
+        cfg["default"] = ConfigProfile(
+            name="default",
+            token="t1",
+            url="https://test.dev",
+        )
+        path = config_dir / "auth.ini"
+        os.chmod(path, 0o644)
+        cfg["default"] = ConfigProfile(
+            name="default",
+            token="t2",
+            url="https://test.dev",
+        )
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
+
+
+# ---------------------------------------------------------------------------
+# auth.ini + cli.ini are read together; auth.ini wins on conflict
+# ---------------------------------------------------------------------------
+
+
+class TestProfileMergeAcrossFiles:
+    def test_profile_fields_merge_from_cli_and_auth(self, config_dir, monkeypatch):
+        cli_path = config_dir / "cli.ini"
+        cli_path.parent.mkdir(parents=True, exist_ok=True)
+        cli_path.write_text(
+            "[profile:default]\nurl = https://from-cli.dev\nproject = aiproject-cli\n"
+        )
+        monkeypatch.setattr(config_mod, "CLI_CONFIG_FILE", cli_path)
+
+        auth_path = config_dir / "auth.ini"
+        auth_path.write_text(
+            "[DEFAULT]\nprofile = default\n[profile:default]\ntoken = secret-tok\n"
+        )
+
+        p = Config().resolve()
+        assert p.token == "secret-tok"
+        assert p.url == "https://from-cli.dev"
+        assert p.project == "aiproject-cli"
+
+    def test_auth_overrides_cli_on_conflict(self, config_dir, monkeypatch):
+        cli_path = config_dir / "cli.ini"
+        cli_path.parent.mkdir(parents=True, exist_ok=True)
+        cli_path.write_text("[profile:default]\nurl = https://from-cli.dev\n")
+        monkeypatch.setattr(config_mod, "CLI_CONFIG_FILE", cli_path)
+
+        auth_path = config_dir / "auth.ini"
+        auth_path.write_text(
+            "[DEFAULT]\nprofile = default\n"
+            "[profile:default]\n"
+            "url = https://from-auth.dev\n"
+            "token = tok\n"
+        )
+
+        p = Config().resolve()
+        assert p.url == "https://from-auth.dev"
+
+
+# ---------------------------------------------------------------------------
+# default CONTREE_HOME respects XDG_CONFIG_HOME
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultContreeHome:
+    def test_uses_xdg_config_home_when_set(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CONTREE_HOME", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        xdg = get_default_path("XDG_CONFIG_HOME", "~/.config")
+        home = get_default_path("CONTREE_HOME", xdg / "contree")
+        assert home == tmp_path / "xdg" / "contree"
+
+    def test_falls_back_to_dot_config_when_xdg_unset(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CONTREE_HOME", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        xdg = get_default_path("XDG_CONFIG_HOME", "~/.config")
+        home = get_default_path("CONTREE_HOME", xdg / "contree")
+        assert home == tmp_path / ".config" / "contree"
+
+    def test_contree_home_overrides_xdg(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CONTREE_HOME", str(tmp_path / "explicit"))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        xdg = get_default_path("XDG_CONFIG_HOME", "~/.config")
+        home = get_default_path("CONTREE_HOME", xdg / "contree")
+        assert home == tmp_path / "explicit"

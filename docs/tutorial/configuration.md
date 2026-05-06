@@ -16,7 +16,7 @@ contree auth --profile=sandbox
 ```
 
 Each command prompts for a token securely (no echo), verifies it against
-the API, and writes it to `~/.config/contree-cli/config.ini`.
+the API, and writes it to `~/.config/contree/auth.ini`.
 
 The resulting config file looks like this:
 
@@ -26,19 +26,19 @@ profile = default
 
 [profile:default]
 token = eyJ...
-url = https://api.studio.nebius.com/sandboxes
+url = https://api.tokenfactory.nebius.com/sandboxes
 type = iam
 project = project-id-default
 
 [profile:personal]
 token = eyJ...
-url = https://api.studio.nebius.com/sandboxes
+url = https://api.tokenfactory.nebius.com/sandboxes
 type = iam
 project = project-id-personal
 
 [profile:sandbox]
 token = eyJ...
-url = https://api.studio.nebius.com/sandboxes
+url = https://api.tokenfactory.nebius.com/sandboxes
 type = iam
 project = project-id-sandbox
 ```
@@ -111,7 +111,7 @@ contree images        # uses sandbox
 Pass `--token` and `--url` directly:
 
 ```bash
-contree --token=eyJ... --url=https://api.studio.nebius.com/sandboxes images
+contree --token=eyJ... --url=https://api.tokenfactory.nebius.com/sandboxes images
 ```
 
 :::{warning}
@@ -134,7 +134,7 @@ remaining profile.
 ## Profiles and sessions
 
 Each profile has its own session database
-(`~/.config/contree-cli/sessions-{profile}.db`), so:
+(`~/.config/contree/sessions-{profile}.db`), so:
 
 - **Same profile, same terminal** — resumes the existing session
 - **Different profile, same terminal** — different session, different data
@@ -152,13 +152,15 @@ export CONTREE_SESSION=shared-session
 
 ## Data storage
 
-All data lives in `CONTREE_HOME` (default `~/.config/contree-cli`):
+All data lives in `CONTREE_HOME` (default `$XDG_CONFIG_HOME/contree`,
+falling back to `~/.config/contree` when `XDG_CONFIG_HOME` is unset):
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `config.ini` | Profile credentials and settings |
-| `sessions-{profile}.db` | Per-profile sessions, history, branches, cache |
-| `skills.db` | Installed agent skill registry |
+| `auth.ini` | Profile credentials and settings (created with mode `0600`) |
+| `cli.ini` | Optional user-editable defaults for the CLI |
+| `cli/sessions/{profile}.db` | Per-profile sessions, history, branches, cache |
+| `cli/skills.db` | Installed agent skill registry |
 
 Override with `$CONTREE_HOME`:
 
@@ -166,11 +168,83 @@ Override with `$CONTREE_HOME`:
 export CONTREE_HOME=/custom/path
 ```
 
+### `cli.ini`
+
+`cli.ini` is meant for hand-editing. Create it yourself; the CLI never
+writes to it. Two kinds of sections are supported:
+
+#### `[cli]` section: per-flag defaults
+
+Keys here become argparse defaults. Use the argparse `dest` name (not
+the flag name):
+
+| Key | Maps to flag | Notes |
+|-----|--------------|-------|
+| `log_level` | `--log-level` | One of `debug`, `info`, `warning`, `error`, `critical` |
+| `output_format` | `-f` / `--format` | One of the formatter names (`default`, `json`, `json-pretty`, `csv`, `tsv`, `table`) |
+| `editor` | `--editor` (file edit) | Fallback when neither `--editor` nor `$EDITOR` is set; if absent the CLI searches `vim` then `nano` on `PATH` and falls back to `vi` |
+
+Example:
+
+```ini
+[cli]
+log_level = debug
+output_format = json
+editor = nvim
+```
+
+Precedence: CLI flag > environment variable > `cli.ini` > built-in
+default. A `cli.ini` setting always loses to an explicit flag.
+
+#### `[profile:NAME]` sections: CLI-scoped profiles
+
+`cli.ini` accepts the same `[profile:NAME]` sections as `auth.ini` and
+supports the same fields:
+
+| Key | Required | Notes |
+|-----|----------|-------|
+| `url` | yes for JWT, optional for IAM | API base URL |
+| `type` | optional | `jwt` (default) or `iam` |
+| `project` | IAM only | Project ID |
+| `token` | optional | API bearer token |
+
+The two files are merged at load time and `auth.ini` wins on conflict.
+
+What `cli.ini` is for: profiles (or any field, including `token`) you
+want only the `contree` CLI to see. The CLI merges `cli.ini` with
+`auth.ini`. Other contree-related tooling that talks to the API
+directly (the SDK, the MCP server) reads only `auth.ini`. Use
+`cli.ini` when you need a profile that should be invisible to those
+direct-API consumers, or to keep `auth.ini` minimal and shared.
+
+Example, CLI-only profile alongside the shared one:
+
+```ini
+# ~/.config/contree/auth.ini  (read by CLI + SDK + MCP, mode 0600)
+[DEFAULT]
+profile = default
+
+[profile:default]
+url = https://contree.dev
+token = eyJhbGciOi...
+```
+
+```ini
+# ~/.config/contree/cli.ini  (read only by the CLI)
+[profile:cli-sandbox]
+url = https://staging.contree.dev
+token = eyJhbGciOi...different
+```
+
+The active profile is still selected by the `profile` key in
+`[DEFAULT]` of `auth.ini` (or by `--profile` / `$CONTREE_PROFILE`).
+
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `CONTREE_HOME` | Data directory (default `~/.config/contree-cli`) |
+| `CONTREE_HOME` | Data directory (default `$XDG_CONFIG_HOME/contree`, or `~/.config/contree`) |
+| `XDG_CONFIG_HOME` | XDG base config dir, used to derive the default `CONTREE_HOME` |
 | `CONTREE_TOKEN` | API bearer token (overrides config) |
 | `CONTREE_URL` | API base URL (overrides config) |
 | `CONTREE_PROJECT` | Project ID (overrides config) |
@@ -184,7 +258,7 @@ For token, URL, and project:
 1. CLI flag (`--token`, `--url`, `--project`)
 2. Environment variable (`CONTREE_TOKEN`, `CONTREE_URL`, `CONTREE_PROJECT`)
 3. Config file value from the active profile
-4. Built-in default URL: `https://api.studio.nebius.com/sandboxes`
+4. Built-in default URL: `https://api.tokenfactory.nebius.com/sandboxes`
 
 For profiles:
 

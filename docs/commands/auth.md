@@ -45,14 +45,14 @@ When you run `contree auth`, the CLI:
    shell history)
 2. Prompts for the **project ID**
 3. Verifies the token with the API (`GET /v1/whoami`)
-4. Writes credentials to `~/.config/contree-cli/config.ini`
+4. Writes credentials to `~/.config/contree/auth.ini`
 5. If the profile already exists, prompts for confirmation (use `-y`
    to skip)
 
 ### Flags
 
 - `--token` — API token (prompted securely if omitted)
-- `--url` — API base URL (default: `https://api.studio.nebius.com/sandboxes`)
+- `--url` — API base URL (default: `https://api.tokenfactory.nebius.com/sandboxes`)
 - `--project` — Project ID (prompted if omitted)
 - `--profile` — Profile name (default: `default`)
 - `-y` / `--force` — Overwrite existing profile without confirmation

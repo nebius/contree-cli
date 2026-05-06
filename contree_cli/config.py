@@ -1,16 +1,45 @@
+from __future__ import annotations
+
 import configparser
 import logging
 import os
+import shutil
+import stat
 from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from .migrations import run_migrations
+
 log = logging.getLogger(__name__)
 
-CONTREE_HOME = Path(os.getenv("CONTREE_HOME", "~/.config/contree-cli")).expanduser()
+
+def get_default_path(env: str, default: str | Path) -> Path:
+    return Path(os.getenv(env) or default).expanduser()
+
+
+XDG_CONFIG_HOME = get_default_path("XDG_CONFIG_HOME", "~/.config")
+CONTREE_HOME = get_default_path("CONTREE_HOME", XDG_CONFIG_HOME / "contree")
 CONFIG_DIR = CONTREE_HOME
-CONFIG_FILE = CONTREE_HOME / "config.ini"
+CONFIG_FILE = CONTREE_HOME / "auth.ini"
+CLI_CONFIG_FILE = CONTREE_HOME / "cli.ini"
+
+# Parsed at import time. Paths are fixed by CONTREE_HOME (env), so the
+# ``[cli]`` section is available before argparse runs and can supply
+# defaults that beat hardcoded ones but still lose to flags.
+SETTINGS = configparser.ConfigParser()
+SETTINGS.read([CLI_CONFIG_FILE, CONFIG_FILE])
+
+# Default editor for ``contree file edit`` when ``--editor`` is not given.
+# Resolved once at import time. Priority: $EDITOR > cli.ini > vim > nano > vi.
+EDITOR = (
+    os.environ.get("EDITOR")
+    or SETTINGS.get("cli", "editor", fallback=None)
+    or shutil.which("vim")
+    or shutil.which("nano")
+    or "vi"
+)
 
 
 class AuthType(str, Enum):
@@ -39,7 +68,7 @@ class ConfigProfile:
 
     @property
     def session_db_path(self) -> Path:
-        return CONTREE_HOME / f"sessions-{self.name}.db"
+        return CONTREE_HOME / "cli" / "sessions" / f"{self.name}.db"
 
     def remove_session_db(self) -> None:
         db = self.session_db_path
@@ -55,10 +84,11 @@ class Config(MutableMapping[str, ConfigProfile]):
     ``del cfg[name]``, ``name in cfg``, ``len(cfg)``, iteration.
     """
 
-    DEFAULT_IAM_URL = "https://api.studio.nebius.com/sandboxes"
+    DEFAULT_IAM_URL = "https://api.tokenfactory.nebius.com/sandboxes"
     PROFILE_PREFIX = "profile:"
 
     def __init__(self, path: Path | None = None) -> None:
+        run_migrations(CONTREE_HOME)
         self.__path = path or CONFIG_FILE
         self.__profiles: dict[str, ConfigProfile] = {}
         self.__active: str = "default"
@@ -68,8 +98,12 @@ class Config(MutableMapping[str, ConfigProfile]):
 
     def _load(self) -> None:
         cp = configparser.ConfigParser()
-        log.debug("Loading config from %s", self.__path)
-        cp.read(self.__path)
+        # Read cli.ini first, then auth.ini — later files override earlier
+        # ones, so secrets in auth.ini take precedence over any non-secret
+        # profile fields a user keeps in cli.ini (url, project, type, …).
+        sources = [CLI_CONFIG_FILE, self.__path]
+        log.debug("Loading config from %s", sources)
+        cp.read(sources)
         self.__active = cp.defaults().get("profile", "default")
         self.__profiles.clear()
         for section in cp.sections():
@@ -106,8 +140,16 @@ class Config(MutableMapping[str, ConfigProfile]):
             if profile.project is not None:
                 cp.set(section, "project", profile.project)
         self.__path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.__path, "w") as f:
+        # Create with 0o600 from the start so the token is never readable
+        # by other users — even between create() and chmod().
+        fd = os.open(
+            self.__path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w") as f:
             cp.write(f)
+        os.chmod(self.__path, stat.S_IRUSR | stat.S_IWUSR)
 
     # -- MutableMapping interface --------------------------------------------
 

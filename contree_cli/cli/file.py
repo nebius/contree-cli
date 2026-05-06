@@ -19,7 +19,6 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import shlex
 import subprocess
 import tempfile
@@ -28,6 +27,7 @@ from pathlib import Path
 
 from contree_cli import CLIENT, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.client import ApiError, ContreeClient, resolve_image, stream_response
+from contree_cli.config import EDITOR
 from contree_cli.session import SessionStore
 from contree_cli.types import FLAGS
 
@@ -79,7 +79,8 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     )
     edit_p.add_argument(
         *FLAGS["editor"],
-        help="Editor command (default: $EDITOR or vi)",
+        default=EDITOR,
+        help=f"Editor command (default: {EDITOR})",
     )
     edit_p.add_argument("path", help="Path inside image")
     edit_p.set_defaults(handler=cmd_file_edit, load_args=FileEditArgs)
@@ -128,14 +129,14 @@ def _upload_and_record(
     except ApiError as exc:
         if exc.status != 404:
             raise
-        data = local_path.read_bytes()
-        resp = client.request(
-            "POST",
-            "/v1/files",
-            body=data,
-            headers={"Content-Type": "application/octet-stream"},
-        )
-        file_uuid = json.loads(resp.read())["uuid"]
+        with open(local_path, "rb") as fh:
+            resp = client.request(
+                "POST",
+                "/v1/files",
+                body=fh,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            file_uuid = json.loads(resp.read())["uuid"]
         logger.info("Uploaded %s (%s)", instance_path, file_uuid)
 
     history_id = store.set_image(
@@ -178,14 +179,13 @@ def cmd_file_edit(args: FileEditArgs) -> int | None:
 
     # 2. Record original hash, open editor
     original_hash = _file_sha256(tmp_file)
-    editor = args.editor or os.environ.get("EDITOR", "vi")
-    logger.info("Opening %s in %s", tmp_file, editor)
+    logger.info("Opening %s in %s", tmp_file, args.editor)
     # $EDITOR may contain shell expressions (env vars, tilde, pipes),
     # e.g. "TERM=xterm vim" or "~/bin/editor". shlex.split would not
-    # expand those — shell=True is required. The file path is quoted
+    # expand those, shell=True is required. The file path is quoted
     # via shlex.quote to prevent injection from the filename.
     # nosemgrep: subprocess-shell-true
-    rc = subprocess.call(f"{editor} {shlex.quote(str(tmp_file))}", shell=True)
+    rc = subprocess.call(f"{args.editor} {shlex.quote(str(tmp_file))}", shell=True)
     if rc != 0:
         logger.error("Editor exited with code %d", rc)
         return 1
