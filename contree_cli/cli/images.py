@@ -25,11 +25,12 @@ from contree_cli.types import (
     isoformat_datetime,
     parse_datetime,
     parse_interval,
+    positive_int,
 )
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 100
+DEFAULT_PAGE_SIZE = 100
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 DOCKER_HUB = "docker.io"
 
@@ -77,6 +78,8 @@ class ImagesArgs(ArgumentsProtocol):
     all_images: bool = False
     since: datetime | None = None
     until: datetime | None = None
+    page: int = 1
+    size: int = DEFAULT_PAGE_SIZE
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> ImagesArgs:
@@ -86,6 +89,8 @@ class ImagesArgs(ArgumentsProtocol):
             all_images=getattr(ns, "all_images", False),
             since=getattr(ns, "since", None),
             until=getattr(ns, "until", None),
+            page=getattr(ns, "page", 1),
+            size=getattr(ns, "size", DEFAULT_PAGE_SIZE),
         )
 
 
@@ -189,6 +194,18 @@ def _add_list_args(p: argparse.ArgumentParser) -> None:
         type=parse_interval,
         help="Show images before. " + str(parse_interval.__doc__),
     )
+    p.add_argument(
+        *FLAGS["page"],
+        type=positive_int,
+        default=1,
+        help="Page number, 1-based (default: %(default)s)",
+    )
+    p.add_argument(
+        *FLAGS["size"],
+        type=positive_int,
+        default=DEFAULT_PAGE_SIZE,
+        help="Page size (default: %(default)s)",
+    )
 
 
 def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
@@ -249,36 +266,30 @@ def cmd_images(args: ImagesArgs) -> None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
 
-    base_params: dict[str, str] = {"limit": str(PAGE_SIZE)}
+    params: dict[str, str] = {
+        "limit": str(args.size),
+        "offset": str((args.page - 1) * args.size),
+    }
     if args.prefix is not None:
-        base_params["tag"] = args.prefix
+        params["tag"] = args.prefix
     if args.uuid is not None:
-        base_params["uuid"] = args.uuid
+        params["uuid"] = args.uuid
     if not args.all_images:
-        base_params["tagged"] = "1"
+        params["tagged"] = "1"
     if args.since is not None:
-        base_params["since"] = isoformat_datetime(args.since)
+        params["since"] = isoformat_datetime(args.since)
     if args.until is not None:
-        base_params["until"] = isoformat_datetime(args.until)
+        params["until"] = isoformat_datetime(args.until)
 
-    offset = 0
-    while True:
-        params = {**base_params, "offset": str(offset)}
-        resp = client.get("/v1/images", params=params)
-        data = json.loads(resp.read())
-        images = data["images"]
-        if not images:
-            break
-        for image in images:
-            created_at = parse_datetime(image["created_at"])
-            formatter(
-                uuid=image["uuid"],
-                created_at=created_at,
-                tag=image.get("tag") or "",
-            )
-        if len(images) < PAGE_SIZE:
-            break
-        offset += len(images)
+    resp = client.get("/v1/images", params=params)
+    data = json.loads(resp.read())
+    for image in data["images"]:
+        created_at = parse_datetime(image["created_at"])
+        formatter(
+            uuid=image["uuid"],
+            created_at=created_at,
+            tag=image.get("tag") or "",
+        )
 
 
 def _parse_explicit_tag(ref: str) -> tuple[str, str | None]:

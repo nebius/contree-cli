@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from contree_cli.types import FLAGS, parse_datetime, parse_interval
+from contree_cli.types import FLAGS, parse_datetime, parse_interval, positive_int
 
 REF = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -233,6 +233,21 @@ class TestParseDatetime:
         # fromisoformat on 3.11+ treats naive as local; just verify no crash
         dt = parse_datetime("2025-06-15T10:30:00")
         assert dt.tzinfo is not None
+
+
+class TestPositiveInt:
+    @pytest.mark.parametrize("value", ["0", "-1", "-100"])
+    def test_rejects_non_positive(self, value: str) -> None:
+        with pytest.raises(argparse.ArgumentTypeError):
+            positive_int(value)
+
+    @pytest.mark.parametrize("value, expected", [("1", 1), ("100", 100), ("9999", 9999)])
+    def test_accepts_positive(self, value: str, expected: int) -> None:
+        assert positive_int(value) == expected
+
+    def test_rejects_non_integer(self) -> None:
+        with pytest.raises(ValueError):
+            positive_int("abc")
 
 
 class TestFlags:

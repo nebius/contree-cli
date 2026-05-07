@@ -9,7 +9,7 @@ from conftest import ContreeTestClient
 
 from contree_cli import CLIENT, FORMATTER
 from contree_cli.cli.images import (
-    PAGE_SIZE,
+    DEFAULT_PAGE_SIZE,
     ImagesArgs,
     ImportArgs,
     _derive_tag,
@@ -29,7 +29,7 @@ def _run_cmd(tc: ContreeTestClient, images, *, formatter=None, **kwargs):
 
 
 def _run_cmd_pages(tc: ContreeTestClient, pages, *, formatter=None, **kwargs):
-    """Run cmd_images with multiple pages of responses."""
+    """Run cmd_images with one response per call."""
     for page in pages:
         tc.respond_json({"images": page})
 
@@ -130,43 +130,39 @@ def _make_image(i: int) -> dict:
 
 
 class TestImagesPagination:
-    def test_single_page_partial(self, contree_client, capsys):
-        """A page smaller than PAGE_SIZE means no further requests."""
-        images = [_make_image(i) for i in range(5)]
-        _run_cmd(contree_client, images)
+    def test_single_request(self, contree_client):
+        _run_cmd(contree_client, [_make_image(0), _make_image(1)])
         assert contree_client.request_count == 1
 
-    def test_two_full_pages(self, contree_client, capsys):
-        """Two full pages + an empty third page."""
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        page2 = [_make_image(i) for i in range(PAGE_SIZE, PAGE_SIZE + 3)]
-        _run_cmd_pages(contree_client, [page1, page2])
-        assert contree_client.request_count == 2
-        out = capsys.readouterr().out
-        assert f"uuid-{PAGE_SIZE + 2}" in out
-
-    def test_offset_increments(self, contree_client):
-        """Each page request increments offset by PAGE_SIZE."""
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        page2 = []
-        _run_cmd_pages(contree_client, [page1, page2])
-        paths = contree_client.request_paths
-        assert "offset=0" in paths[0]
-        assert f"offset={PAGE_SIZE}" in paths[1]
-
-    def test_empty_first_page(self, contree_client, capsys):
-        """No output and only one request when first page is empty."""
+    def test_default_page_size_in_query(self, contree_client):
         _run_cmd(contree_client, [])
-        assert contree_client.request_count == 1
+        assert f"limit={DEFAULT_PAGE_SIZE}" in contree_client.request_paths[0]
+
+    def test_default_offset_is_zero(self, contree_client):
+        _run_cmd(contree_client, [])
+        assert "offset=0" in contree_client.request_paths[0]
+
+    def test_explicit_size(self, contree_client):
+        _run_cmd(contree_client, [], size=25)
+        assert "limit=25" in contree_client.request_paths[0]
+
+    def test_page_two_offsets_by_size(self, contree_client):
+        _run_cmd(contree_client, [], page=2, size=25)
+        assert "offset=25" in contree_client.request_paths[0]
+
+    def test_page_three_default_size(self, contree_client):
+        _run_cmd(contree_client, [], page=3)
+        assert f"offset={DEFAULT_PAGE_SIZE * 2}" in contree_client.request_paths[0]
+
+    def test_page_one_is_zero_offset(self, contree_client):
+        _run_cmd(contree_client, [], page=1, size=50)
+        assert "offset=0" in contree_client.request_paths[0]
+
+    def test_empty_response(self, contree_client, capsys):
+        _run_cmd(contree_client, [])
         assert capsys.readouterr().out == ""
 
-    def test_all_images_emitted(self, contree_client, capsys):
-        """All images across pages appear in output."""
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        page2 = [_make_image(i) for i in range(PAGE_SIZE, PAGE_SIZE + 5)]
-        _run_cmd_pages(contree_client, [page1, page2])
-        out = capsys.readouterr().out
-        assert out.count("uuid-") == PAGE_SIZE + 5
+
 
 
 class TestImagesCreatedAtFormats:

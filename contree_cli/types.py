@@ -39,6 +39,8 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "since": ("--since",),
         "until": ("--until",),
         "timeout": ("-t", "--timeout"),
+        "page": ("--page",),
+        "size": ("-n", "--size"),
         "profile": ("-p", "--profile"),
         "offline": ("-O", "--offline"),
         "status": ("--status",),
@@ -155,6 +157,14 @@ else:
 
 def isoformat_datetime(dt: datetime) -> str:
     return dt.astimezone(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def positive_int(value: str) -> int:
+    """argparse ``type=`` validator: accept ints >= 1."""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
 
 
 _INTERVAL_RE = re.compile(r"([+-]?\d+)([smhdMy]?)")
