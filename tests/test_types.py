@@ -241,7 +241,9 @@ class TestPositiveInt:
         with pytest.raises(argparse.ArgumentTypeError):
             positive_int(value)
 
-    @pytest.mark.parametrize("value, expected", [("1", 1), ("100", 100), ("9999", 9999)])
+    @pytest.mark.parametrize(
+        "value, expected", [("1", 1), ("100", 100), ("9999", 9999)]
+    )
     def test_accepts_positive(self, value: str, expected: int) -> None:
         assert positive_int(value) == expected
 

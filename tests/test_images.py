@@ -163,8 +163,6 @@ class TestImagesPagination:
         assert capsys.readouterr().out == ""
 
 
-
-
 class TestImagesCreatedAtFormats:
     """Verify created_at parsing with various ISO 8601 formats from the API."""
 
