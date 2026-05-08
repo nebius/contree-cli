@@ -1,4 +1,5 @@
 import argparse
+import json
 from contextlib import contextmanager
 from contextvars import copy_context
 from unittest.mock import patch
@@ -46,26 +47,24 @@ def _make_iam_args(**kwargs) -> AuthArgs:
     return AuthArgs(**defaults)
 
 
-def _whoami_body(*, permissions: dict[str, bool] | None = None) -> bytes:
+def whoami_body(*, permissions: dict[str, bool] | None = None) -> bytes:
     body = {
         "token_uuid": "00000000-0000-0000-0000-000000000000",
         "token_expiration": None,
         "permissions": {"list": True} if permissions is None else permissions,
         "operations_stat": {},
     }
-    import json as _json
-
-    return _json.dumps(body).encode()
+    return json.dumps(body).encode()
 
 
 @contextmanager
-def _mock_whoami(status=200, *, body: bytes | None = None):
+def mock_whoami(status=200, *, body: bytes | None = None):
     """Patch client_from_profile to return a fresh ContreeTestClient per call."""
     last_client: list[ContreeTestClient] = []
 
     def factory(profile, timeout=None):  # type: ignore[no-untyped-def]
         tc = ContreeTestClient()
-        tc.respond(status=status, body=body if body is not None else _whoami_body())
+        tc.respond(status=status, body=body if body is not None else whoami_body())
         last_client.clear()
         last_client.append(tc)
         return tc
@@ -103,7 +102,7 @@ class TestAuthSave:
             url="https://my.dev",
             profile="default",
         )
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(args)
         p = Config().resolve()
         assert p.token == "my_token"
@@ -112,16 +111,16 @@ class TestAuthSave:
         assert "auth accepted, profile 'default' saved to ->" in caplog.text
 
     def test_logs_updating_for_existing_profile(self, config_dir, caplog):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="old"))
         caplog.clear()
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(_make_auth_args(token="new", force=True))
         assert "Updating token for profile 'default'" in caplog.text
 
     def test_save_defaults_profile_and_url(self, config_dir):
         args = _make_auth_args(token="tok")
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(args)
         p = Config().resolve()
         assert p.token == "tok"
@@ -129,7 +128,7 @@ class TestAuthSave:
 
     def test_save_named_profile(self, config_dir, caplog):
         args = _make_auth_args(token="tok", profile="staging")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(args)
         cfg = Config()
         cfg.switch("staging")
@@ -139,13 +138,13 @@ class TestAuthSave:
         assert "auth accepted, profile 'staging' saved to ->" in caplog.text
 
     def test_save_jwt_stores_type(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok"))
         p = Config().resolve()
         assert p.auth_type == AuthType.JWT
 
     def test_save_iam_stores_type_and_project(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_iam_args(token="tok"))
         p = Config().resolve()
         assert p.auth_type == AuthType.IAM
@@ -173,7 +172,7 @@ class TestAuthPrompt:
                 "contree_cli.cli.auth.getpass.getpass",
                 return_value="prompted_token",
             ),
-            _mock_whoami(),
+            mock_whoami(),
         ):
             cmd_auth(args)
         p = Config().resolve()
@@ -193,14 +192,14 @@ class TestAuthPrompt:
 class TestAuthVerify:
     def test_bad_token_rejected(self, config_dir, caplog):
         args = _make_auth_args(token="bad")
-        with caplog.at_level("ERROR"), _mock_whoami(status=401):
+        with caplog.at_level("ERROR"), mock_whoami(status=401):
             rc = cmd_auth(args)
         assert rc == 1
         assert "Profile not changed" in caplog.text
 
     def test_bad_token_does_not_save(self, config_dir):
         args = _make_auth_args(token="bad")
-        with _mock_whoami(status=401):
+        with mock_whoami(status=401):
             cmd_auth(args)
         p = Config().resolve()
         assert p.token is None
@@ -209,7 +208,7 @@ class TestAuthVerify:
         args = _make_auth_args(token="tok")
         with (
             caplog.at_level("WARNING"),
-            _mock_whoami(body=_whoami_body(permissions={"list": False})),
+            mock_whoami(body=whoami_body(permissions={"list": False})),
         ):
             rc = cmd_auth(args)
         assert rc is None
@@ -221,7 +220,7 @@ class TestAuthVerify:
         args = _make_iam_args(token="tok", project="aiproject-restricted")
         with (
             caplog.at_level("WARNING"),
-            _mock_whoami(body=_whoami_body(permissions={"list": False})),
+            mock_whoami(body=whoami_body(permissions={"list": False})),
         ):
             cmd_auth(args)
         assert "aiproject-restricted" in caplog.text
@@ -229,7 +228,7 @@ class TestAuthVerify:
     def test_missing_permissions_field_warns(self, config_dir, caplog):
         args = _make_auth_args(token="tok")
         body = b'{"token_uuid":"x","token_expiration":null,"operations_stat":{}}'
-        with caplog.at_level("WARNING"), _mock_whoami(body=body):
+        with caplog.at_level("WARNING"), mock_whoami(body=body):
             rc = cmd_auth(args)
         assert rc is None
         assert "sandboxes are disabled" in caplog.text
@@ -237,20 +236,20 @@ class TestAuthVerify:
 
     def test_unparseable_whoami_rejected(self, config_dir, caplog):
         args = _make_auth_args(token="tok")
-        with caplog.at_level("ERROR"), _mock_whoami(body=b"not-json"):
+        with caplog.at_level("ERROR"), mock_whoami(body=b"not-json"):
             rc = cmd_auth(args)
         assert rc == 1
         assert Config().resolve().token is None
 
     def test_success_logs_saved(self, config_dir, caplog):
         args = _make_auth_args(token="good")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(args)
         assert "auth accepted" in caplog.text
 
     def test_whoami_called(self, config_dir):
         args = _make_auth_args(token="tok")
-        with _mock_whoami() as clients:
+        with mock_whoami() as clients:
             cmd_auth(args)
         tc = clients[0]
         assert tc.request_count == 1
@@ -265,7 +264,7 @@ class TestAuthVerify:
 class TestNebius:
     def test_nebius_api_key_used_as_token(self, config_dir, caplog, monkeypatch):
         monkeypatch.setenv("NEBIUS_API_KEY", "nebius-tok")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(
                 AuthArgs(
                     url="https://test.dev",
@@ -278,7 +277,7 @@ class TestNebius:
 
     def test_nebius_ai_project_used(self, config_dir, caplog, monkeypatch):
         monkeypatch.setenv("NEBIUS_AI_PROJECT", "aiproject-neb")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(
                 AuthArgs(
                     token="tok",
@@ -293,7 +292,7 @@ class TestNebius:
     def test_both_nebius_vars_skip_all_prompts(self, config_dir, caplog, monkeypatch):
         monkeypatch.setenv("NEBIUS_API_KEY", "neb-tok")
         monkeypatch.setenv("NEBIUS_AI_PROJECT", "aiproject-auto")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(AuthArgs(auth_type=AuthType.IAM, url="https://iam.test"))
         p = Config().resolve()
         assert p.token == "neb-tok"
@@ -305,7 +304,7 @@ class TestContreeEnvFallbacks:
         self, config_dir, caplog, monkeypatch
     ):
         monkeypatch.setenv("CONTREE_TOKEN", "ctok")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(AuthArgs(url="https://test.dev", auth_type=AuthType.JWT))
         p = Config().resolve()
         assert p.token == "ctok"
@@ -316,7 +315,7 @@ class TestContreeEnvFallbacks:
     ):
         monkeypatch.setenv("CONTREE_TOKEN", "ctok")
         monkeypatch.setenv("NEBIUS_API_KEY", "ntok")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(AuthArgs(url="https://test.dev", auth_type=AuthType.JWT))
         p = Config().resolve()
         assert p.token == "ctok"
@@ -324,7 +323,7 @@ class TestContreeEnvFallbacks:
     def test_contree_url_used_when_url_omitted(self, config_dir, caplog, monkeypatch):
         monkeypatch.setenv("CONTREE_URL", "https://env-url.dev")
         monkeypatch.setenv("NEBIUS_API_KEY", "tok")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(AuthArgs(auth_type=AuthType.JWT))
         p = Config().resolve()
         assert p.url == "https://env-url.dev"
@@ -333,7 +332,7 @@ class TestContreeEnvFallbacks:
         self, config_dir, caplog, monkeypatch
     ):
         monkeypatch.setenv("CONTREE_PROJECT", "aiproject-c")
-        with caplog.at_level("INFO"), _mock_whoami():
+        with caplog.at_level("INFO"), mock_whoami():
             cmd_auth(
                 AuthArgs(
                     token="tok",
@@ -347,7 +346,7 @@ class TestContreeEnvFallbacks:
 
     def test_explicit_token_flag_beats_env(self, config_dir, monkeypatch):
         monkeypatch.setenv("CONTREE_TOKEN", "from-env")
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(
                 AuthArgs(
                     token="from-flag",
@@ -366,7 +365,7 @@ class TestContreeEnvFallbacks:
 
 class TestAuthSwitch:
     def test_switch_profile(self, config_dir, caplog):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok1", profile="default"))
             cmd_auth(_make_auth_args(token="tok2", profile="staging"))
 
@@ -386,7 +385,7 @@ class TestAuthSwitch:
 
 class TestAuthProfiles:
     def test_profiles_show_status(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok-ok", profile="ok"))
             cmd_auth(_make_auth_args(token="tok-timeout", profile="timeout"))
             cmd_auth(_make_auth_args(token="tok-error", profile="error"))
@@ -404,7 +403,7 @@ class TestAuthProfiles:
         def fake_factory(profile, timeout=None):  # type: ignore[no-untyped-def]
             tc = ContreeTestClient(token=profile.token)
             if profile.token == "tok-ok":
-                tc.respond(status=200, body=_whoami_body())
+                tc.respond(status=200, body=whoami_body())
             elif profile.token == "tok-timeout":
 
                 def timeout_get(path, params=None):  # type: ignore[no-untyped-def]
@@ -434,7 +433,7 @@ class TestAuthProfiles:
 
     def test_profiles_inactive_status(self, config_dir):
         """Profile whose token lacks `list` permission is reported as inactive."""
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok", profile="restricted"))
 
         rows: list[dict[str, object]] = []
@@ -450,7 +449,7 @@ class TestAuthProfiles:
             tc = ContreeTestClient(token=profile.token)
             tc.respond(
                 status=200,
-                body=_whoami_body(permissions={"list": False, "spawn": True}),
+                body=whoami_body(permissions={"list": False, "spawn": True}),
             )
             return tc
 
@@ -466,7 +465,7 @@ class TestAuthProfiles:
         assert by_name["restricted"]["status"] == "inactive"
 
     def test_profiles_offline_skips_probe(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok", profile="offline-test"))
         Config().switch("offline-test")
 
@@ -488,7 +487,7 @@ class TestAuthProfiles:
 
     def test_env_profile_marks_active(self, config_dir, monkeypatch):
         """CONTREE_PROFILE env var overrides active marker in listing."""
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="t1", profile="default"))
             cmd_auth(_make_auth_args(token="t2", profile="e2e"))
 
@@ -513,7 +512,7 @@ class TestAuthProfiles:
 
     def test_env_profile_nonexistent_warns(self, config_dir, monkeypatch, caplog):
         """CONTREE_PROFILE pointing to missing profile logs a warning."""
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok", profile="default"))
 
         monkeypatch.setenv("CONTREE_PROFILE", "ghost")
@@ -543,7 +542,7 @@ class TestAuthProfiles:
 
 class TestAuthOverwrite:
     def test_overwrite_aborted(self, config_dir, capsys):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="old"))
         with patch("builtins.input", return_value="n"):
             rc = cmd_auth(_make_auth_args(token="new"))
@@ -553,7 +552,7 @@ class TestAuthOverwrite:
         assert p.token == "old"
 
     def test_overwrite_confirmed(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="old"))
             with patch("builtins.input", return_value="y"):
                 rc = cmd_auth(_make_auth_args(token="new"))
@@ -562,7 +561,7 @@ class TestAuthOverwrite:
         assert p.token == "new"
 
     def test_overwrite_force(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="old"))
             rc = cmd_auth(_make_auth_args(token="new", force=True))
         assert rc is None
@@ -570,7 +569,7 @@ class TestAuthOverwrite:
         assert p.token == "new"
 
     def test_overwrite_empty_input_aborts(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="old"))
             with patch("builtins.input", return_value=""):
                 rc = cmd_auth(_make_auth_args(token="new"))
@@ -579,7 +578,7 @@ class TestAuthOverwrite:
 
 class TestAuthRemove:
     def test_remove_deletes_profile(self, config_dir, caplog):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok", profile="staging"))
         rc = cmd_remove(RemoveArgs(profile_name="staging", force=True))
         assert rc is None
@@ -592,7 +591,7 @@ class TestAuthRemove:
         assert "does not exist" in caplog.text
 
     def test_remove_active_switches_to_remaining(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="t1", profile="first"))
             cmd_auth(_make_auth_args(token="t2", profile="second"))
         cfg = Config()
@@ -602,7 +601,7 @@ class TestAuthRemove:
         assert p.name != "first"
 
     def test_remove_aborted(self, config_dir, capsys):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok", profile="keep"))
         with patch("builtins.input", return_value="n"):
             rc = cmd_remove(RemoveArgs(profile_name="keep"))
@@ -610,7 +609,7 @@ class TestAuthRemove:
         assert "keep" in Config()
 
     def test_remove_confirmed(self, config_dir):
-        with _mock_whoami():
+        with mock_whoami():
             cmd_auth(_make_auth_args(token="tok", profile="gone"))
         with patch("builtins.input", return_value="y"):
             rc = cmd_remove(RemoveArgs(profile_name="gone"))

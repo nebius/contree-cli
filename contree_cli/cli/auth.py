@@ -175,7 +175,7 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     return cmd_auth, AuthArgs
 
 
-def _env_fallback(names: tuple[str, ...], *, what: str) -> str | None:
+def env_fallback(names: tuple[str, ...], *, what: str) -> str | None:
     for name in names:
         value = os.environ.get(name)
         if value:
@@ -211,7 +211,7 @@ def cmd_auth(args: AuthArgs) -> int | None:
             return 1
 
     # Token: --token > CONTREE_TOKEN > NEBIUS_API_KEY > interactive prompt
-    token = args.token or _env_fallback(
+    token = args.token or env_fallback(
         ("CONTREE_TOKEN", "NEBIUS_API_KEY"),
         what="token",
     )
@@ -219,7 +219,7 @@ def cmd_auth(args: AuthArgs) -> int | None:
         token = getpass.getpass("Token: ")
 
     # URL: --url > CONTREE_URL > type-specific default > interactive prompt
-    url = args.url or _env_fallback(("CONTREE_URL",), what="URL")
+    url = args.url or env_fallback(("CONTREE_URL",), what="URL")
     if url is None:
         if args.auth_type == AuthType.IAM:
             url = Config.DEFAULT_IAM_URL
@@ -232,7 +232,7 @@ def cmd_auth(args: AuthArgs) -> int | None:
     # Project (IAM only): --project > CONTREE_PROJECT > NEBIUS_AI_PROJECT > prompt
     project: str | None = None
     if args.auth_type == AuthType.IAM:
-        project = args.project or _env_fallback(
+        project = args.project or env_fallback(
             ("CONTREE_PROJECT", "NEBIUS_AI_PROJECT"),
             what="project",
         )

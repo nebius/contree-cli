@@ -119,7 +119,7 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     return cmd_ps, PsArgs
 
 
-def _emit_op(formatter: OutputFormatter, op: dict[str, Any], *, quiet: bool) -> None:
+def emit_op(formatter: OutputFormatter, op: dict[str, Any], *, quiet: bool) -> None:
     row = dict(
         uuid=op["uuid"],
         status=op["status"],
@@ -179,7 +179,7 @@ def cmd_ps(args: PsArgs) -> None:
             if limit is not None and emitted >= limit:
                 hit_limit = True
                 break
-            _emit_op(formatter, op, quiet=args.quiet)
+            emit_op(formatter, op, quiet=args.quiet)
             emitted += 1
         if hit_limit:
             break
