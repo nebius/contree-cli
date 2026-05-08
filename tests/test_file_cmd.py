@@ -36,6 +36,9 @@ class StreamResponse:
     def getheader(self, name: str, default: str | None = None) -> str | None:
         return default
 
+    def getheaders(self) -> list[tuple[str, str]]:
+        return []
+
 
 def _api_response(body: bytes | dict, *, status: int = 200) -> StreamResponse:
     data = json.dumps(body).encode() if isinstance(body, dict) else body

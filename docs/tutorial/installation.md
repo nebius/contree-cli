@@ -74,15 +74,18 @@ The CLI verifies the token with the API and writes credentials to
 `~/.config/contree/auth.ini`. If a profile already exists you will be
 prompted to confirm; use `-y` to skip the prompt.
 
-Resolution order for each field (first match wins):
+Resolution order for each field during `contree auth` (first match wins):
 
-1. CLI flag (`--token`, `--project`)
-2. Environment variable (`NEBIUS_API_KEY`, `NEBIUS_AI_PROJECT`)
+1. CLI flag (`--token`, `--url`, `--project`)
+2. Environment variables, in order:
+   - token: `CONTREE_TOKEN`, then `NEBIUS_API_KEY`
+   - URL: `CONTREE_URL`
+   - project: `CONTREE_PROJECT`, then `NEBIUS_AI_PROJECT`
 3. Interactive prompt
 
-So if `NEBIUS_API_KEY` and `NEBIUS_AI_PROJECT` are already in your
-environment and no flags are passed, `contree auth` picks them up
-automatically — no interactive prompts needed:
+So if these variables are already in your environment and no flags
+are passed, `contree auth` picks them up automatically, no interactive
+prompts needed:
 
 ```bash
 export NEBIUS_API_KEY=eyJ...
@@ -125,18 +128,22 @@ contree images    # uses personal
 
 ### Token from environment
 
-Set `CONTREE_TOKEN` to provide the token without a config file:
+`CONTREE_TOKEN` and `NEBIUS_API_KEY` are read **only** by `contree auth`
+during profile registration; runtime commands always read credentials
+from the saved profile. To bootstrap a profile entirely from environment
+variables, run `auth` non-interactively:
 
 ```bash
 export CONTREE_TOKEN=eyJ...
+export CONTREE_URL=https://api.tokenfactory.nebius.com/sandboxes
+contree auth -y --type jwt          # one-shot setup, no prompts
 contree images
 ```
 
-Environment variables always take precedence over the config file.
-
 ### Inline token
 
-Pass `--token` to any command to override both config and env:
+Pass `--token` to any command to override the saved profile for a single
+invocation:
 
 ```bash
 contree --token=eyJ... images

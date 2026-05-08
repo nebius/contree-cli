@@ -241,24 +241,36 @@ The active profile is still selected by the `profile` key in
 
 ## Environment variables
 
+Read at runtime by any command:
+
 | Variable | Description |
 |----------|-------------|
 | `CONTREE_HOME` | Data directory (default `$XDG_CONFIG_HOME/contree`, or `~/.config/contree`) |
 | `XDG_CONFIG_HOME` | XDG base config dir, used to derive the default `CONTREE_HOME` |
-| `CONTREE_TOKEN` | API bearer token (overrides config) |
-| `CONTREE_URL` | API base URL (overrides config) |
-| `CONTREE_PROJECT` | Project ID (overrides config) |
-| `CONTREE_PROFILE` | Active profile name (overrides config) |
+| `CONTREE_PROFILE` | Active profile name (selects which profile commands use) |
 | `CONTREE_SESSION` | Explicit session key (overrides auto-generated) |
+
+Read only by `contree auth` (registration-time fallbacks for omitted flags):
+
+| Variable | Used for |
+|----------|----------|
+| `CONTREE_TOKEN` / `NEBIUS_API_KEY` | `--token` |
+| `CONTREE_URL` | `--url` |
+| `CONTREE_PROJECT` / `NEBIUS_AI_PROJECT` | `--project` |
 
 ## Resolution precedence
 
-For token, URL, and project:
+For token, URL, and project at runtime:
 
-1. CLI flag (`--token`, `--url`, `--project`)
-2. Environment variable (`CONTREE_TOKEN`, `CONTREE_URL`, `CONTREE_PROJECT`)
-3. Config file value from the active profile
-4. Built-in default URL: `https://api.tokenfactory.nebius.com/sandboxes`
+1. CLI flag (`--token`, `--url`, `--project`) — overrides profile for the
+   current invocation only
+2. Saved profile field
+3. Built-in default URL for IAM: `https://api.tokenfactory.nebius.com/sandboxes`
+
+Environment variables are not consulted at runtime; to refresh credentials
+from environment variables, run `contree auth` (which reads
+`CONTREE_TOKEN` / `NEBIUS_API_KEY`, `CONTREE_URL`, and `CONTREE_PROJECT` /
+`NEBIUS_AI_PROJECT` as fallbacks for the corresponding flags).
 
 For profiles:
 

@@ -72,9 +72,9 @@ contree --help
 contree auth
 ```
 
-You'll be prompted to enter your API token and project ID. The CLI verifies the token and saves credentials to `~/.config/contree-cli/config.ini`.
+You'll be prompted to enter your API token and project ID. The CLI verifies the token and saves credentials to `~/.config/contree/auth.ini` (override the data directory via `CONTREE_HOME`).
 
-If `NEBIUS_API_KEY` and `NEBIUS_AI_PROJECT` environment variables are set and no CLI flags are passed, they are picked up automatically instead of prompting.
+If `--token`/`--url`/`--project` flags are omitted, `contree auth` reads `CONTREE_TOKEN` (or `NEBIUS_API_KEY`), `CONTREE_URL`, and `CONTREE_PROJECT` (or `NEBIUS_AI_PROJECT`) from the environment instead of prompting. These variables are read only during registration; runtime commands use the saved profile only.
 
 ### 2. Install agent skills (optional)
 
@@ -285,17 +285,24 @@ contree auth switch staging           # switch active profile
 
 ### Environment variables
 
+Read at runtime (any command):
+
 | Variable | Purpose |
 |---|---|
-| `CONTREE_HOME` | Data directory (default `~/.config/contree-cli`) |
-| `CONTREE_TOKEN` | API bearer token (overrides config) |
-| `CONTREE_URL` | API base URL (overrides config) |
-| `CONTREE_PROJECT` | Project ID (overrides config) |
-| `CONTREE_PROFILE` | Active profile name |
+| `CONTREE_HOME` | Data directory (default `$XDG_CONFIG_HOME/contree`, or `~/.config/contree`) |
+| `CONTREE_PROFILE` | Active profile name (selects which profile commands use) |
 | `CONTREE_SESSION` | Explicit session key (for multi-terminal workflows) |
 | `CONTREE_SESSION_DB` | Path to session SQLite database |
 
-Environment variables take precedence over the config file. `--token` and `--url` flags override everything.
+Read only by `contree auth` (registration-time fallbacks for omitted flags):
+
+| Variable | Used for |
+|---|---|
+| `CONTREE_TOKEN` / `NEBIUS_API_KEY` | `--token` |
+| `CONTREE_URL` | `--url` |
+| `CONTREE_PROJECT` / `NEBIUS_AI_PROJECT` | `--project` |
+
+Credentials come strictly from the saved profile at runtime. `--token`, `--url`, `--project` CLI flags override profile fields for a single invocation.
 
 ## Zero Dependencies
 

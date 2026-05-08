@@ -135,10 +135,28 @@ class TestPsPagination:
     def test_offset_increments(self, contree_client):
         page1 = [_make_op(i) for i in range(PAGE_SIZE)]
         page2 = []
-        _run_cmd_pages(contree_client, [page1, page2])
+        _run_cmd_pages(contree_client, [page1, page2], show_max=None)
         paths = contree_client.request_paths
         assert "offset=0" in paths[0]
         assert f"offset={PAGE_SIZE}" in paths[1]
+
+    def test_progress_logged_per_full_page(self, contree_client, caplog):
+        """Each completed full page emits a progress line at INFO level."""
+        import logging
+
+        page1 = [_make_op(i) for i in range(PAGE_SIZE)]
+        page2 = [_make_op(i) for i in range(PAGE_SIZE, PAGE_SIZE + 3)]
+        with caplog.at_level(logging.INFO, logger="contree_cli.cli.ps"):
+            _run_cmd_pages(
+                contree_client,
+                [page1, page2],
+                show_max=None,
+            )
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            f"Fetched {PAGE_SIZE} operations so far" in m and "Ctrl+C" in m
+            for m in msgs
+        )
 
 
 class TestPsActiveFilter:
@@ -206,17 +224,29 @@ class TestPsActiveFilter:
 
 class TestPsShowMax:
     def test_show_max_truncates_output(self, contree_client, capsys):
-        ops = [_make_op(i) for i in range(5)]
-        _run_cmd(contree_client, ops, show_max=3, all=True)
+        """show_max caps emitted ops; probe runs after for more."""
+        page = [_make_op(i) for i in range(5)]
+        _run_cmd_pages(
+            contree_client,
+            [page, [_make_op(99)]],  # main + probe
+            show_max=3,
+            all=True,
+        )
         out = capsys.readouterr().out
         assert "op-0" in out
         assert "op-1" in out
-        assert "op-2" not in out
+        assert "op-2" in out
+        assert "op-3" not in out
 
     def test_show_max_logs_warning(self, contree_client, caplog):
-        ops = [_make_op(i) for i in range(5)]
-        _run_cmd(contree_client, ops, show_max=3, all=True)
-        assert "show_max limit of 3" in caplog.text
+        page = [_make_op(i) for i in range(5)]
+        _run_cmd_pages(
+            contree_client,
+            [page, [_make_op(99)]],  # probe finds more
+            show_max=3,
+            all=True,
+        )
+        assert "Output truncated at --show-max=3" in caplog.text
 
     def test_show_max_none_shows_all(self, contree_client, capsys):
         ops = [_make_op(i) for i in range(5)]
@@ -239,13 +269,18 @@ class TestPsShowMax:
     ):
         ops = [_make_op(i) for i in range(3)]
         _run_cmd(contree_client, ops, show_max=100, all=True)
-        assert "show_max" not in caplog.text
+        assert "Output truncated" not in caplog.text
 
     def test_show_max_stops_pagination(self, contree_client, capsys):
-        """show_max stops iteration mid-page, no extra page fetch."""
+        """show_max stops mid-page; one probe request follows."""
         ops = [_make_op(i) for i in range(10)]
-        _run_cmd(contree_client, ops, show_max=3, all=True)
-        assert contree_client.request_count == 1
+        _run_cmd_pages(
+            contree_client,
+            [ops, [_make_op(99)]],  # main + probe
+            show_max=3,
+            all=True,
+        )
+        assert contree_client.request_count == 2
 
     def test_show_max_across_pages(self, contree_client, capsys):
         """show_max truncates across page boundaries."""
@@ -253,20 +288,67 @@ class TestPsShowMax:
         page2 = [_make_op(i) for i in range(PAGE_SIZE, PAGE_SIZE + 5)]
         _run_cmd_pages(
             contree_client,
-            [page1, page2],
+            [page1, page2, [_make_op(99)]],  # main pages + probe
             show_max=PAGE_SIZE + 2,
             all=True,
         )
         out = capsys.readouterr().out
-        assert f"op-{PAGE_SIZE}" in out
+        assert f"op-{PAGE_SIZE + 1}" in out
         assert f"op-{PAGE_SIZE + 2}" not in out
 
-    def test_show_max_one_shows_nothing(self, contree_client, capsys):
-        """show_max=1 yields 0 ops (counter starts at 1, 1>=1 is true)."""
-        ops = [_make_op(0)]
-        _run_cmd(contree_client, ops, show_max=1, all=True)
+    def test_show_max_one_shows_one(self, contree_client, capsys):
+        """show_max=1 emits exactly one op (no off-by-one)."""
+        ops = [_make_op(0), _make_op(1)]
+        _run_cmd_pages(
+            contree_client,
+            [ops, [_make_op(99)]],  # main + probe
+            show_max=1,
+            all=True,
+        )
         out = capsys.readouterr().out
-        assert "op-0" not in out
+        assert "op-0" in out
+        assert "op-1" not in out
+
+    def test_show_max_probe_uses_skip_of_one(self, contree_client):
+        """Probe is a single-record request after the cap."""
+        page = [_make_op(i) for i in range(5)]
+        _run_cmd_pages(
+            contree_client,
+            [page, []],
+            show_max=3,
+            all=True,
+        )
+        probe_path = contree_client.request_paths[1]
+        assert "limit=1" in probe_path
+        assert "offset=3" in probe_path
+
+    def test_show_max_no_warning_when_probe_empty(self, contree_client, caplog):
+        """Empty probe means we hit show_max but there's nothing more."""
+        page = [_make_op(i) for i in range(3)]
+        _run_cmd_pages(
+            contree_client,
+            [page, []],  # probe empty
+            show_max=3,
+            all=True,
+        )
+        assert "Output truncated" not in caplog.text
+
+    def test_show_max_warning_after_table_flush(self, contree_client, caplog, capsys):
+        """TableFormatter buffer is flushed before the warning is logged."""
+        import logging
+
+        page = [_make_op(i) for i in range(5)]
+        for response in (page, [_make_op(99)]):
+            contree_client.respond_json(response)
+
+        FORMATTER.set(TableFormatter())
+        ctx = copy_context()
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.ps"):
+            ctx.run(cmd_ps, PsArgs(show_max=3, all=True))
+
+        out = capsys.readouterr().out
+        assert "op-0" in out
+        assert "op-2" in out
 
 
 class TestPsCreatedAtFormats:

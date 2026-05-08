@@ -94,6 +94,10 @@ class Config(MutableMapping[str, ConfigProfile]):
         self.__active: str = "default"
         self._load()
 
+    @property
+    def path(self) -> Path:
+        return self.__path
+
     # -- persistence ---------------------------------------------------------
 
     def _load(self) -> None:
@@ -191,32 +195,23 @@ class Config(MutableMapping[str, ConfigProfile]):
         self._save()
 
     def resolve(self, profile_override: str | None = None) -> ConfigProfile:
-        """Resolve the active profile with env-var overrides.
+        """Resolve the active profile by name.
 
         Priority: *profile_override* > ``CONTREE_PROFILE`` > config default.
-        Per-field: ``CONTREE_TOKEN`` / ``CONTREE_URL`` / ``CONTREE_PROJECT``
-        override the stored values.
+        Credentials come strictly from the saved profile; runtime
+        commands do not read tokens, URLs, or project IDs from the
+        environment. To register/refresh credentials from env vars use
+        ``contree auth``.
         """
         name = profile_override or os.environ.get("CONTREE_PROFILE") or self.__active
-        env_token = os.environ.get("CONTREE_TOKEN")
-        env_url = os.environ.get("CONTREE_URL")
-        env_project = os.environ.get("CONTREE_PROJECT")
-
         if name in self.__profiles:
-            p = self.__profiles[name]
-            return ConfigProfile(
-                name=name,
-                token=env_token or p.token,
-                url=env_url or p.url,
-                auth_type=p.auth_type,
-                project=env_project or p.project,
-            )
+            return self.__profiles[name]
         return ConfigProfile(
             name=name,
-            token=env_token,
-            url=env_url or "",
+            token=None,
+            url="",
             auth_type=AuthType.JWT,
-            project=env_project,
+            project=None,
         )
 
     def switch(self, name: str) -> None:

@@ -62,6 +62,7 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "uuid": ("-i", "--uuid"),
         "username": ("--username",),
         "password": ("--password",),
+        "limit": ("--limit",),
         # use
         "new": ("-N", "--new"),
         # session
@@ -87,6 +88,17 @@ class ArgumentsFormatter(argparse.RawDescriptionHelpFormatter):
         ):
             help_text += " (default: %(default)s)"
         return help_text
+
+
+def positive_int(value: str) -> int:
+    """argparse type for flags that must be at least 1."""
+    try:
+        n = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
 
 
 def get_command_docs(setup_fn: SetupFn) -> tuple[str | None, str | None]:

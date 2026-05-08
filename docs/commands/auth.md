@@ -59,17 +59,23 @@ When you run `contree auth`, the CLI:
 
 ### Environment variable shortcuts
 
-When CLI flags (`--token`, `--project`) are not passed, `contree auth`
-checks these environment variables before falling back to an interactive
-prompt:
+When CLI flags (`--token`, `--url`, `--project`) are not passed,
+`contree auth` checks these environment variables before falling back
+to an interactive prompt:
 
 | Variable | Fallback for | Priority |
 |----------|-------------|----------|
-| `NEBIUS_API_KEY` | `--token` | flag > env > prompt |
-| `NEBIUS_AI_PROJECT` | `--project` | flag > env > prompt |
+| `CONTREE_TOKEN` | `--token` | flag > `CONTREE_TOKEN` > `NEBIUS_API_KEY` > prompt |
+| `NEBIUS_API_KEY` | `--token` | (see above) |
+| `CONTREE_URL` | `--url` | flag > env > type-specific default > prompt |
+| `CONTREE_PROJECT` | `--project` | flag > `CONTREE_PROJECT` > `NEBIUS_AI_PROJECT` > prompt |
+| `NEBIUS_AI_PROJECT` | `--project` | (see above) |
 
-If both variables are set, `contree auth` runs fully non-interactively
-(no prompts):
+These variables are read **only** during `contree auth`. Other commands
+ignore them and read credentials strictly from the saved profile.
+
+If the relevant variables are set, `contree auth` runs fully
+non-interactively (no prompts):
 
 ```bash
 export NEBIUS_API_KEY=eyJ...
@@ -84,7 +90,9 @@ with a 2-second timeout and adds a `status` column.
 
 Possible values:
 
-- `ok` -- probe succeeded
+- `ok` -- probe succeeded and the token has the `list` permission
+- `inactive` -- probe succeeded but the token lacks the `list`
+  permission, meaning sandboxes are disabled on this project
 - `timeout` -- probe did not complete within 2 seconds
 - `error` -- probe failed for another reason, such as a bad token or
   another network/API error
@@ -121,15 +129,22 @@ secure prompt instead.
 
 ## Alternative authentication
 
-You can also authenticate without the config file:
+Runtime commands always read credentials from the saved profile.
+To authenticate without an interactive `auth` flow, either:
 
 ```bash
-# Environment variable (avoid in shared environments)
+# 1. Bootstrap the profile non-interactively from environment vars
 export CONTREE_TOKEN=eyJ...
+export CONTREE_URL=https://api.tokenfactory.nebius.com/sandboxes
+contree auth -y --type jwt
+contree images
 
-# Inline flag (per-command, visible in process listings)
+# 2. Or pass the token inline per-command (visible in process listings)
 contree --token=eyJ... images
 ```
+
+Setting `CONTREE_TOKEN` alone (without first running `contree auth`)
+will not authenticate runtime commands.
 
 ## See also
 

@@ -328,17 +328,22 @@ Per-command -p is useful for cross-project operations:
   contree -p project-a images --prefix=base
   contree -p project-b images import tag:base:latest
 
-Data directory: ~/.config/contree-cli/
-  config.ini              profile credentials
-  sessions-{profile}.db   per-profile sessions, history, cache
-  skills.db               installed agent skill registry
+Data directory: $XDG_CONFIG_HOME/contree/ (or ~/.config/contree/)
+  auth.ini                       profile credentials (mode 0600)
+  cli.ini                        optional CLI defaults
+  cli/sessions/{profile}.db      per-profile sessions, history, cache
+  cli/skills.db                  installed agent skill registry
+  cli/version_check.json         cached PyPI update-check state
 
 Environment variables:
   CONTREE_HOME       data directory override
-  CONTREE_TOKEN      API token (overrides config)
-  CONTREE_URL        API URL (overrides config)
-  CONTREE_PROFILE    active profile (overrides config)
+  CONTREE_PROFILE    active profile (selects which profile commands use)
   CONTREE_SESSION    explicit session key
+
+Read only by `contree auth` (registration-time fallbacks):
+  CONTREE_TOKEN / NEBIUS_API_KEY        token when --token is omitted
+  CONTREE_URL                           URL when --url is omitted
+  CONTREE_PROJECT / NEBIUS_AI_PROJECT   project ID when --project is omitted
 
 More: contree auth --help
 

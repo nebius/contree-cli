@@ -198,9 +198,11 @@ Profiles
 
 Each profile has its own session database.
 
-Auth fallback: if `NEBIUS_API_KEY` and `NEBIUS_AI_PROJECT` are set
-in the environment and no `--token`/`--project` flags are passed,
-`contree auth` picks them up automatically (no interactive prompts).
+Auth fallback: when `--token`/`--url`/`--project` flags are omitted,
+`contree auth` reads `CONTREE_TOKEN` (or `NEBIUS_API_KEY`),
+`CONTREE_URL`, and `CONTREE_PROJECT` (or `NEBIUS_AI_PROJECT`) from
+the environment. These are used only during registration; runtime
+commands read credentials strictly from the saved profile.
 
 More: contree auth --help
 
@@ -218,11 +220,13 @@ override with $CONTREE_HOME.
 Environment variables:
   CONTREE_HOME       data directory
   XDG_CONFIG_HOME    XDG base config dir, used to derive default CONTREE_HOME
-  CONTREE_TOKEN      API token (overrides config)
-  CONTREE_URL        API URL (overrides config)
-  CONTREE_PROJECT    project ID (overrides config)
-  CONTREE_PROFILE    active profile
+  CONTREE_PROFILE    active profile (selects which profile commands use)
   CONTREE_SESSION    explicit session key
+
+Registration-time fallbacks (read only by `contree auth`):
+  CONTREE_TOKEN / NEBIUS_API_KEY        token when --token is omitted
+  CONTREE_URL                           URL when --url is omitted
+  CONTREE_PROJECT / NEBIUS_AI_PROJECT   project ID when --project is omitted
 
 More: contree --help
 

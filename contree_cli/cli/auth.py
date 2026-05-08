@@ -8,9 +8,13 @@ Supports two auth types:
   iam (default) — bearer token + project ID, default URL provided
   jwt (legacy)  — bearer token only, URL must be specified
 
-Nebius environment variable shortcuts:
-  NEBIUS_API_KEY     used as token fallback during registration
-  NEBIUS_AI_PROJECT  used as project fallback during IAM registration
+Environment variable fallbacks during registration:
+  CONTREE_TOKEN / NEBIUS_API_KEY     used when --token is omitted
+  CONTREE_URL                        used when --url is omitted
+  CONTREE_PROJECT / NEBIUS_AI_PROJECT used when --project is omitted (IAM)
+
+Other commands ignore these variables; only ``contree auth`` reads
+them. ``CONTREE_PROFILE`` selects the profile for any command.
 
 Subcommands:
   profiles    List saved profiles (* marks active)
@@ -22,6 +26,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -35,6 +40,7 @@ from contree_cli.types import FLAGS
 logger = logging.getLogger(__name__)
 PROFILE_CHECK_TIMEOUT = 2.0
 PROFILE_CHECK_CONCURRENCY = 4
+REQUIRED_PERMISSION = "list"
 
 EPILOG = """\
 for coding agents:
@@ -169,6 +175,24 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     return cmd_auth, AuthArgs
 
 
+def env_fallback(names: tuple[str, ...], *, what: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            logger.info("Using %s from %s", what, name)
+            return value
+    return None
+
+
+def check_permission(payload: object, permission: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    perms = payload.get("permissions")
+    if not isinstance(perms, dict):
+        return False
+    return bool(perms.get(permission))
+
+
 def cmd_auth(args: AuthArgs) -> int | None:
     cfg = Config()
     exists = args.profile in cfg
@@ -188,18 +212,16 @@ def cmd_auth(args: AuthArgs) -> int | None:
             print("Aborted.")
             return 1
 
-    # Token: --token > NEBIUS_API_KEY > interactive prompt
-    token = args.token
+    # Token: --token > CONTREE_TOKEN > NEBIUS_API_KEY > interactive prompt
+    token = args.token or env_fallback(
+        ("CONTREE_TOKEN", "NEBIUS_API_KEY"),
+        what="token",
+    )
     if token is None:
-        nebius_key = os.environ.get("NEBIUS_API_KEY")
-        if nebius_key:
-            logger.info("Using token from NEBIUS_API_KEY")
-            token = nebius_key
-        else:
-            token = getpass.getpass("Token: ")
+        token = getpass.getpass("Token: ")
 
-    # URL: --url > type-specific default > interactive prompt
-    url = args.url
+    # URL: --url > CONTREE_URL > type-specific default > interactive prompt
+    url = args.url or env_fallback(("CONTREE_URL",), what="URL")
     if url is None:
         if args.auth_type == AuthType.IAM:
             url = Config.DEFAULT_IAM_URL
@@ -209,17 +231,15 @@ def cmd_auth(args: AuthArgs) -> int | None:
                 logger.error("URL is required for JWT auth")
                 return 1
 
-    # Project (IAM only): --project > NEBIUS_AI_PROJECT > interactive prompt
+    # Project (IAM only): --project > CONTREE_PROJECT > NEBIUS_AI_PROJECT > prompt
     project: str | None = None
     if args.auth_type == AuthType.IAM:
-        project = args.project
+        project = args.project or env_fallback(
+            ("CONTREE_PROJECT", "NEBIUS_AI_PROJECT"),
+            what="project",
+        )
         if project is None:
-            nebius_project = os.environ.get("NEBIUS_AI_PROJECT")
-            if nebius_project:
-                logger.info("Using project from NEBIUS_AI_PROJECT")
-                project = nebius_project
-            else:
-                project = input("Project ID: ").strip()
+            project = input("Project ID: ").strip()
     profile = ConfigProfile(
         name=args.profile,
         token=token,
@@ -235,15 +255,33 @@ def cmd_auth(args: AuthArgs) -> int | None:
         return 1
 
     try:
-        client.get("/v1/whoami")
+        resp = client.get("/v1/whoami")
+        whoami = json.loads(resp.read() or b"{}")
     except ApiError as exc:
         # Logs the API error message, not the token itself.
         # nosemgrep: python-logger-credential-disclosure
         logger.error("Token verification failed: %s. Profile not changed.", exc)
         return 1
+    except ValueError as exc:
+        logger.error("Could not parse /v1/whoami response: %s", exc)
+        return 1
+
+    if not check_permission(whoami, REQUIRED_PERMISSION):
+        project_label = profile.project or profile.url
+        logger.warning(
+            "Warning: token is valid but sandboxes are disabled on %s"
+            " (no %r permission). The profile will be saved but no commands"
+            " will work until the service is enabled.",
+            project_label,
+            REQUIRED_PERMISSION,
+        )
 
     cfg[args.profile] = profile
-    logger.info("Token verified and saved to profile %r", args.profile)
+    logger.info(
+        "auth accepted, profile %r saved to -> %s",
+        args.profile,
+        cfg.path,
+    )
     return None
 
 
@@ -284,11 +322,17 @@ def cmd_list(args: ProfilesArgs) -> None:
 
         try:
             resp = client.get("/v1/whoami")
-            resp.read()
+            payload = resp.read()
         except TimeoutError:
             return profile, "timeout"
         except Exception:
             return profile, "error"
+        try:
+            whoami = json.loads(payload or b"{}")
+        except ValueError:
+            return profile, "error"
+        if not check_permission(whoami, REQUIRED_PERMISSION):
+            return profile, "inactive"
         return profile, "ok"
 
     formatter = FORMATTER.get()

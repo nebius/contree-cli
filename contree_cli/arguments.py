@@ -71,20 +71,19 @@ mutating commands (change remote or local session state):
   contree use IMAGE | run -- CMD | file edit PATH | file cp SRC DEST
   contree tag UUID TAG | kill UUID | cd PATH | session checkout BRANCH
 
-environment variables (advanced overrides; most users can ignore):
-  CONTREE_TOKEN      API bearer token (overrides config file)
-  CONTREE_URL        API base URL (overrides config file)
-  CONTREE_PROJECT    Project ID for IAM auth (overrides config file)
-  CONTREE_PROFILE    Active config profile (overrides config file)
-  CONTREE_SESSION    Explicit session name (for multi-terminal workflows).
-                    If unset, contree auto-generates <cwd>+<8hex> (derived from
-                    profile+ppid+tty); export your own for stable reuse.
-                    You can also pass -S/--session instead of exporting env.
-  CONTREE_SESSION_DB Path to session SQLite database
+environment variables:
+  CONTREE_PROFILE          Active config profile (selects which profile to use)
+  CONTREE_SESSION          Explicit session name (for multi-terminal workflows).
+                           If unset, contree auto-generates <cwd>+<8hex> (derived
+                           from profile+ppid+tty); export your own for stable
+                           reuse. You can also pass -S/--session instead.
+  CONTREE_SESSION_DB       Path to session SQLite database
+  CONTREE_NO_UPDATE_CHECK  Set to any value to disable PyPI update checks
 
-nebius shortcuts (used by `contree auth` as fallback when flags are omitted):
-  NEBIUS_API_KEY     Fallback token for auth registration
-  NEBIUS_AI_PROJECT  Fallback project ID for IAM auth registration
+registration-time fallbacks (only read by `contree auth`, not at runtime):
+  CONTREE_TOKEN / NEBIUS_API_KEY        Token used when --token is omitted
+  CONTREE_URL                           URL used when --url is omitted
+  CONTREE_PROJECT / NEBIUS_AI_PROJECT   Project ID used when --project is omitted
 """
 
 DESCRIPTION = """\
@@ -121,7 +120,7 @@ parser.add_argument(
 parser.add_argument(
     *FLAGS["token"],
     default=None,
-    help="API token (overrides config and env)",
+    help="API token (overrides profile for this invocation)",
 )
 
 
@@ -133,12 +132,12 @@ parser.add_argument(
     *FLAGS["url"],
     default=None,
     type=_strip_trailing_slashes,
-    help="API base URL (overrides config and env)",
+    help="API base URL (overrides profile for this invocation)",
 )
 parser.add_argument(
     *FLAGS["project"],
     default=None,
-    help="Project ID (overrides config and env)",
+    help="Project ID (overrides profile for this invocation)",
 )
 parser.add_argument(
     *FLAGS["config"],
