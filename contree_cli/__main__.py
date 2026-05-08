@@ -40,7 +40,7 @@ def main() -> None:
             "A new version of contree-cli is available: %s (installed: %s)."
             " Upgrade with `uv tool install -U contree-cli` or"
             " `pip install -U contree-cli`.",
-            checker.latest_version,
+            checker.state.latest_version,
             checker.current_version,
         )
 

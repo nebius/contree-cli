@@ -3,9 +3,8 @@
 State file at ``$CONTREE_HOME/cli/version_check.json``::
 
     {
-      "last_check": 1762555200.0,
-      "latest_version": "0.5.0",
-      "current_version": "0.4.2"
+      "last_check": 1762555200,
+      "latest_version": "0.5.0"
     }
 
 ``last_check`` is a Unix epoch timestamp; storing seconds keeps the
@@ -24,6 +23,7 @@ import re
 import time
 import urllib.request
 from contextlib import suppress
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
 
@@ -31,13 +31,30 @@ from contree_cli import config
 from contree_cli.client import CLI_USER_AGENT, cli_version
 
 
+@dataclass(frozen=True)
+class UpdateState:
+    last_check: int = 0
+    latest_version: str = ""
+
+    @classmethod
+    def from_file(cls, path: Path) -> UpdateState:
+        try:
+            with path.open() as f:
+                data = json.load(f)
+            return cls(
+                last_check=int(data["last_check"]),
+                latest_version=str(data["latest_version"]),
+            )
+        except Exception:
+            return cls()
+
+    def to_file(self, path: Path) -> None:
+        with suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(asdict(self), indent=1))
+
+
 class UpdateChecker:
-    """Encapsulates the state file + PyPI probe + outdated-version warning.
-
-    All side effects (filesystem, network, logging) are guarded so that a
-    failure in update-checking can never break the user's command.
-    """
-
     PYPI_URL = "https://pypi.org/pypi/contree-cli/json"
     CHECK_INTERVAL = timedelta(days=1)
     NETWORK_TIMEOUT = 2.0
@@ -55,29 +72,10 @@ class UpdateChecker:
     ) -> None:
         self.state_path = state_path
         self.current_version = current_version
-        self.latest_version: str | None = None
-
-    def read_state(self) -> dict[str, object]:
-        """Load the cache file. Any schema violation -> empty dict.
-
-        A wrong-typed field (e.g. ``last_check`` saved as an ISO string
-        by an older release) makes the whole entry untrustworthy; the
-        next refresh just rewrites it.
-        """
-        try:
-            with self.state_path.open() as f:
-                data = json.load(f)
-            assert isinstance(data, dict)
-            assert isinstance(data.get("last_check", 0), (int, float))
-            assert isinstance(data.get("latest_version", ""), str)
-        except Exception:
-            return {}
-        return data
-
-    def write_state(self, state: dict[str, object]) -> None:
-        with suppress(OSError):
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(json.dumps(state, indent=1))
+        # ``state`` holds whatever we know about PyPI's latest version.
+        # Default sentinel ("", last_check=0) means "no cache yet" —
+        # is_latest() treats it as up-to-date so callers don't warn.
+        self.state: UpdateState = UpdateState()
 
     def parse_version(self, value: str) -> tuple[tuple[int, int], ...]:
         """Parse ``value`` into a sortable tuple of ``(number, rank)``.
@@ -121,30 +119,22 @@ class UpdateChecker:
     def enabled(self) -> bool:
         return self.OPT_OUT_ENV not in os.environ and self.current_version != "editable"
 
-    def is_cache_fresh(self, state: dict[str, object]) -> bool:
-        """True if ``state['last_check']`` is within ``CHECK_INTERVAL``."""
-        last_check = state.get("last_check")
-        if not isinstance(last_check, (int, float)):
-            return False
-        return time.time() - last_check < self.CHECK_INTERVAL.total_seconds()
+    def is_cache_fresh(self, state: UpdateState) -> bool:
+        """True if ``state.last_check`` is within ``CHECK_INTERVAL``."""
+        return time.time() - state.last_check < self.CHECK_INTERVAL.total_seconds()
 
     def refresh(self) -> None:
-        """Read the cache once, refetch from PyPI if stale.
+        """Load the cache, refetch from PyPI if stale, persist new state.
 
-        Populates ``self.latest_version`` with whatever we know after
-        this call (cached value, freshly fetched value, or ``None``).
-        :meth:`is_latest` then decides whether to log based purely on
+        Populates ``self.state`` with whatever we know after this call.
+        :meth:`is_latest` then decides whether to warn based purely on
         in-memory state — no further file IO.
         """
         if not self.enabled:
             return
 
-        state = self.read_state()
-        cached = state.get("latest_version")
-        if isinstance(cached, str):
-            self.latest_version = cached
-
-        if self.is_cache_fresh(state):
+        self.state = UpdateState.from_file(self.state_path)
+        if self.is_cache_fresh(self.state):
             return
 
         latest = self.fetch_latest_version()
@@ -152,26 +142,24 @@ class UpdateChecker:
             # Network failed; keep whatever was cached.
             return
 
-        self.latest_version = latest
-        self.write_state(
-            {
-                "last_check": time.time(),
-                "latest_version": latest,
-                "current_version": self.current_version,
-            }
+        self.state = UpdateState(
+            last_check=int(time.time()),
+            latest_version=latest,
         )
+        self.state.to_file(self.state_path)
 
     def is_latest(self) -> bool:
         """Return True if the installed version is at or ahead of the cached
         ``latest_version``.
 
-        Returns True when checks are disabled or ``latest_version`` is
-        unknown so callers default to "no warning" in those cases. Pure
-        decision based on in-memory state populated by :meth:`refresh`;
-        never touches the network or filesystem.
+        Returns True when checks are disabled or the cached
+        ``latest_version`` is the empty sentinel — callers default to
+        "no warning" in those cases. Pure decision based on in-memory
+        state populated by :meth:`refresh`; never touches the network
+        or filesystem.
         """
-        if not self.enabled or self.latest_version is None:
+        if not self.enabled or not self.state.latest_version:
             return True
         return self.parse_version(self.current_version) >= self.parse_version(
-            self.latest_version,
+            self.state.latest_version,
         )

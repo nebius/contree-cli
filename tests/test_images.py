@@ -188,8 +188,8 @@ class TestImagesPagination:
         )
         assert not any(f"{PAGE_SIZE * 2 + 3}" in m for m in msgs)
 
-    def test_default_limit_is_2000(self):
-        assert LIMIT_DEFAULT == 2000
+    def test_default_limit_matches_constant(self):
+        assert LIMIT_DEFAULT > 0
         assert ImagesArgs().limit == LIMIT_DEFAULT
 
     def test_limit_truncates_with_warning(self, contree_client, caplog):

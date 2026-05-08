@@ -30,8 +30,8 @@ from contree_cli.types import (
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 500
-LIMIT_DEFAULT = 2000
+PAGE_SIZE = 1000
+LIMIT_DEFAULT = 3000
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 DOCKER_HUB = "docker.io"
 

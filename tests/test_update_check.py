@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from contree_cli.update_check import UpdateChecker
+from contree_cli.update_check import UpdateChecker, UpdateState
 
 
 def read_json(path):
@@ -81,27 +81,58 @@ class TestEnabled:
 
 
 class TestIsCacheFresh:
-    def test_returns_false_for_empty_state(self):
-        checker = UpdateChecker(state_path="/dev/null", current_version="0")
-        assert checker.is_cache_fresh({}) is False
-
-    def test_returns_false_for_missing_last_check(self):
-        checker = UpdateChecker(state_path="/dev/null", current_version="0")
-        assert checker.is_cache_fresh({"latest_version": "1.0.0"}) is False
-
-    def test_returns_false_for_non_numeric_last_check(self):
-        """Legacy ISO strings or garbage values are treated as stale."""
-        checker = UpdateChecker(state_path="/dev/null", current_version="0")
-        assert checker.is_cache_fresh({"last_check": "2026-05-08T00:00:00"}) is False
-        assert checker.is_cache_fresh({"last_check": None}) is False
-
     def test_returns_true_for_recent_last_check(self):
         checker = UpdateChecker(state_path="/dev/null", current_version="0")
-        assert checker.is_cache_fresh({"last_check": time.time() - HOUR}) is True
+        state = UpdateState(last_check=int(time.time() - HOUR), latest_version="x")
+        assert checker.is_cache_fresh(state) is True
 
     def test_returns_false_for_old_last_check(self):
         checker = UpdateChecker(state_path="/dev/null", current_version="0")
-        assert checker.is_cache_fresh({"last_check": time.time() - 2 * DAY}) is False
+        state = UpdateState(last_check=int(time.time() - 2 * DAY), latest_version="x")
+        assert checker.is_cache_fresh(state) is False
+
+    def test_returns_false_for_default_sentinel(self):
+        checker = UpdateChecker(state_path="/dev/null", current_version="0")
+        assert checker.is_cache_fresh(UpdateState()) is False
+
+
+class TestUpdateState:
+    def test_default_sentinel(self):
+        state = UpdateState()
+        assert state.last_check == 0
+        assert state.latest_version == ""
+
+    def test_from_file_missing_returns_sentinel(self, tmp_path):
+        state = UpdateState.from_file(tmp_path / "missing.json")
+        assert state == UpdateState()
+
+    def test_from_file_corrupt_returns_sentinel(self, state_path):
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text("{not json")
+        assert UpdateState.from_file(state_path) == UpdateState()
+
+    def test_from_file_wrong_typed_returns_sentinel(self, state_path):
+        seed_state(state_path, {"last_check": "iso-string", "latest_version": "1.0"})
+        assert UpdateState.from_file(state_path) == UpdateState()
+
+    def test_from_file_round_trip(self, state_path):
+        original = UpdateState(last_check=12345, latest_version="1.2.3")
+        original.to_file(state_path)
+        assert UpdateState.from_file(state_path) == original
+
+    def test_from_file_extra_fields_ignored(self, state_path):
+        seed_state(
+            state_path,
+            {
+                "last_check": 100,
+                "latest_version": "1.0",
+                "extra": "ignored",
+            },
+        )
+        assert UpdateState.from_file(state_path) == UpdateState(
+            last_check=100,
+            latest_version="1.0",
+        )
 
 
 class TestRefresh:
@@ -110,7 +141,7 @@ class TestRefresh:
         with patch.object(checker, "fetch_latest_version") as fetch:
             checker.refresh()
         fetch.assert_not_called()
-        assert checker.latest_version is None
+        assert checker.state == UpdateState()
 
     def test_skips_when_opt_out_env_set(self, state_path, monkeypatch):
         monkeypatch.setenv("CONTREE_NO_UPDATE_CHECK", "1")
@@ -118,40 +149,37 @@ class TestRefresh:
         with patch.object(checker, "fetch_latest_version") as fetch:
             checker.refresh()
         fetch.assert_not_called()
-        assert checker.latest_version is None
+        assert checker.state == UpdateState()
 
     def test_fetches_and_writes_when_no_cache(self, state_path):
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
         with patch.object(checker, "fetch_latest_version", return_value="0.4.1"):
             checker.refresh()
-        assert checker.latest_version == "0.4.1"
+        assert checker.state.latest_version == "0.4.1"
         data = read_json(state_path)
         assert data["latest_version"] == "0.4.1"
-        assert data["current_version"] == "0.4.0"
-        assert isinstance(data["last_check"], (int, float))
+        assert isinstance(data["last_check"], int)
 
     def test_skips_network_within_interval(self, state_path):
         seed_state(
             state_path,
             {
-                "last_check": time.time() - HOUR,
+                "last_check": int(time.time() - HOUR),
                 "latest_version": "0.5.0",
-                "current_version": "0.4.0",
             },
         )
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
         with patch.object(checker, "fetch_latest_version") as fetch:
             checker.refresh()
         fetch.assert_not_called()
-        assert checker.latest_version == "0.5.0"
+        assert checker.state.latest_version == "0.5.0"
 
     def test_refetches_after_interval_expires(self, state_path):
         seed_state(
             state_path,
             {
-                "last_check": time.time() - 2 * DAY,
+                "last_check": int(time.time() - 2 * DAY),
                 "latest_version": "0.4.0",
-                "current_version": "0.4.0",
             },
         )
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
@@ -160,29 +188,28 @@ class TestRefresh:
         ) as fetch:
             checker.refresh()
         fetch.assert_called_once()
-        assert checker.latest_version == "0.4.5"
+        assert checker.state.latest_version == "0.4.5"
         assert read_json(state_path)["latest_version"] == "0.4.5"
 
     def test_network_failure_keeps_cached_value(self, state_path):
         seed_state(
             state_path,
             {
-                "last_check": time.time() - 2 * DAY,
+                "last_check": int(time.time() - 2 * DAY),
                 "latest_version": "0.4.0",
-                "current_version": "0.4.0",
             },
         )
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
         with patch.object(checker, "fetch_latest_version", return_value=None):
             checker.refresh()
-        assert checker.latest_version == "0.4.0"
+        assert checker.state.latest_version == "0.4.0"
         assert read_json(state_path)["latest_version"] == "0.4.0"
 
-    def test_network_failure_with_no_cache_leaves_latest_none(self, state_path):
+    def test_network_failure_with_no_cache_leaves_state_default(self, state_path):
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
         with patch.object(checker, "fetch_latest_version", return_value=None):
             checker.refresh()
-        assert checker.latest_version is None
+        assert checker.state == UpdateState()
         assert not state_path.exists()
 
     def test_corrupt_cache_is_overwritten(self, state_path):
@@ -194,18 +221,17 @@ class TestRefresh:
         ) as fetch:
             checker.refresh()
         fetch.assert_called_once()
-        assert checker.latest_version == "0.4.1"
+        assert checker.state.latest_version == "0.4.1"
         assert read_json(state_path)["latest_version"] == "0.4.1"
 
     def test_legacy_iso_last_check_is_discarded(self, state_path):
         """An old cache file written before the epoch migration is treated
-        as missing entirely — read_state rejects the whole record."""
+        as missing entirely."""
         seed_state(
             state_path,
             {
                 "last_check": "2026-05-08T12:00:00+00:00",
                 "latest_version": "0.4.0",
-                "current_version": "0.4.0",
             },
         )
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
@@ -214,27 +240,8 @@ class TestRefresh:
         ) as fetch:
             checker.refresh()
         fetch.assert_called_once()
-        # Discarded state -> nothing carried over -> only freshly fetched
-        # value remains.
         assert read_json(state_path)["latest_version"] == "0.4.5"
-        assert checker.latest_version == "0.4.5"
-
-    def test_wrong_typed_latest_version_is_discarded(self, state_path):
-        seed_state(
-            state_path,
-            {
-                "last_check": time.time() - 2 * DAY,
-                "latest_version": 42,  # not a string
-                "current_version": "0.4.0",
-            },
-        )
-        checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
-        with patch.object(
-            checker, "fetch_latest_version", return_value="0.4.5"
-        ) as fetch:
-            checker.refresh()
-        fetch.assert_called_once()
-        assert checker.latest_version == "0.4.5"
+        assert checker.state.latest_version == "0.4.5"
 
     def test_refresh_does_not_log_warning(self, state_path, caplog):
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
@@ -249,56 +256,57 @@ class TestRefresh:
 class TestIsLatest:
     def test_returns_true_in_editable_mode(self, state_path):
         checker = UpdateChecker(state_path=state_path, current_version="editable")
-        checker.latest_version = "9.9.9"
+        checker.state = UpdateState(last_check=1, latest_version="9.9.9")
         assert checker.is_latest() is True
 
     def test_returns_true_when_opt_out_env_set(self, state_path, monkeypatch):
         monkeypatch.setenv("CONTREE_NO_UPDATE_CHECK", "1")
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
-        checker.latest_version = "9.9.9"
+        checker.state = UpdateState(last_check=1, latest_version="9.9.9")
         assert checker.is_latest() is True
 
     def test_returns_false_when_outdated(self, state_path):
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
-        checker.latest_version = "0.5.0"
+        checker.state = UpdateState(last_check=1, latest_version="0.5.0")
         assert checker.is_latest() is False
 
     def test_returns_true_when_up_to_date(self, state_path):
         checker = UpdateChecker(state_path=state_path, current_version="0.5.0")
-        checker.latest_version = "0.5.0"
+        checker.state = UpdateState(last_check=1, latest_version="0.5.0")
         assert checker.is_latest() is True
 
     def test_returns_true_when_latest_unknown(self, state_path):
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
+        # Default sentinel state — latest_version is empty string.
         assert checker.is_latest() is True
 
     def test_returns_true_when_current_is_newer(self, state_path):
         checker = UpdateChecker(state_path=state_path, current_version="0.6.0")
-        checker.latest_version = "0.5.0"
+        checker.state = UpdateState(last_check=1, latest_version="0.5.0")
         assert checker.is_latest() is True
 
-    def test_returns_true_when_current_is_pre_release_of_same(self, state_path):
-        """Pre-release of the same release is "older", so warns to upgrade."""
+    def test_returns_false_when_current_is_pre_release_of_same(self, state_path):
+        """Pre-release of the same release is older, so warns to upgrade."""
         checker = UpdateChecker(state_path=state_path, current_version="0.5.0a1")
-        checker.latest_version = "0.5.0"
+        checker.state = UpdateState(last_check=1, latest_version="0.5.0")
         assert checker.is_latest() is False
 
     def test_returns_true_when_latest_is_pre_release_of_same(self, state_path):
         """If pypi only knows a pre-release, an installed stable is fine."""
         checker = UpdateChecker(state_path=state_path, current_version="0.5.0")
-        checker.latest_version = "0.5.0a1"
+        checker.state = UpdateState(last_check=1, latest_version="0.5.0a1")
         assert checker.is_latest() is True
 
     def test_does_not_touch_filesystem(self, state_path):
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
-        checker.latest_version = "0.5.0"
-        with patch.object(UpdateChecker, "read_state") as read:
+        checker.state = UpdateState(last_check=1, latest_version="0.5.0")
+        with patch.object(UpdateState, "from_file") as load:
             checker.is_latest()
-        read.assert_not_called()
+        load.assert_not_called()
 
     def test_does_not_log(self, state_path, caplog):
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
-        checker.latest_version = "0.5.0"
+        checker.state = UpdateState(last_check=1, latest_version="0.5.0")
         with caplog.at_level(logging.WARNING, logger="contree_cli.update_check"):
             assert checker.is_latest() is False
         assert caplog.records == []
