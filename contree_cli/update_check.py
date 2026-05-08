@@ -3,10 +3,14 @@
 State file at ``$CONTREE_HOME/cli/version_check.json``::
 
     {
-      "last_check": "2026-05-08T12:00:00+00:00",
+      "last_check": 1762555200.0,
       "latest_version": "0.5.0",
       "current_version": "0.4.2"
     }
+
+``last_check`` is a Unix epoch timestamp; storing seconds keeps the
+freshness check trivial (one subtraction) and immune to timezone /
+ISO-format quirks.
 
 Network errors, malformed cache files, and parse failures are swallowed:
 the update check must never break a user's command.
@@ -17,9 +21,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.request
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 
 from contree_cli import config
@@ -38,7 +43,9 @@ class UpdateChecker:
     NETWORK_TIMEOUT = 2.0
     OPT_OUT_ENV = "CONTREE_NO_UPDATE_CHECK"
     STATE_PATH = config.CONTREE_HOME / "cli" / "version_check.json"
-    VERSION_REGEX = re.compile(r"[^\d.]")
+    # Capture leading digits of each dot-separated component; anything
+    # past the digits (``a1``, ``-rc.1``, etc.) marks a pre-release.
+    COMPONENT_REGEX = re.compile(r"\d+")
 
     def __init__(
         self,
@@ -50,24 +57,44 @@ class UpdateChecker:
         self.current_version = current_version
         self.latest_version: str | None = None
 
-    def read_state(self) -> dict[str, str]:
+    def read_state(self) -> dict[str, object]:
+        """Load the cache file. Any schema violation -> empty dict.
+
+        A wrong-typed field (e.g. ``last_check`` saved as an ISO string
+        by an older release) makes the whole entry untrustworthy; the
+        next refresh just rewrites it.
+        """
         try:
             with self.state_path.open() as f:
                 data = json.load(f)
             assert isinstance(data, dict)
+            assert isinstance(data.get("last_check", 0), (int, float))
+            assert isinstance(data.get("latest_version", ""), str)
         except Exception:
             return {}
         return data
 
-    def write_state(self, state: dict[str, str]) -> None:
+    def write_state(self, state: dict[str, object]) -> None:
         with suppress(OSError):
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_path.write_text(json.dumps(state, indent=1))
 
-    def parse_version(self, value: str) -> tuple[int, ...]:
-        return tuple(
-            map(int, filter(None, self.VERSION_REGEX.sub("", value).split(".")))
-        )
+    def parse_version(self, value: str) -> tuple[tuple[int, int], ...]:
+        """Parse ``value`` into a sortable tuple of ``(number, rank)``.
+
+        ``rank`` is ``1`` for a clean numeric component and ``0`` for a
+        pre-release suffix (``a1``, ``-rc.1``, …). With this encoding,
+        ``0.4.2a1`` < ``0.4.2`` < ``0.4.21`` as expected. Components with
+        no digits at all are dropped.
+        """
+        parts: list[tuple[int, int]] = []
+        for raw in value.split("."):
+            match = self.COMPONENT_REGEX.search(raw)
+            if not match:
+                continue
+            tail = raw[match.end() :]
+            parts.append((int(match.group()), 0 if tail else 1))
+        return tuple(parts)
 
     def fetch_latest_version(self) -> str | None:
         try:
@@ -94,23 +121,19 @@ class UpdateChecker:
     def enabled(self) -> bool:
         return self.OPT_OUT_ENV not in os.environ and self.current_version != "editable"
 
-    def is_cache_fresh(self, state: dict[str, str]) -> bool:
+    def is_cache_fresh(self, state: dict[str, object]) -> bool:
         """True if ``state['last_check']`` is within ``CHECK_INTERVAL``."""
-        last_check_str = state.get("last_check")
-        if not isinstance(last_check_str, str):
+        last_check = state.get("last_check")
+        if not isinstance(last_check, (int, float)):
             return False
-        try:
-            last_check = datetime.fromisoformat(last_check_str)
-        except ValueError:
-            return False
-        return datetime.now(timezone.utc) - last_check < self.CHECK_INTERVAL
+        return time.time() - last_check < self.CHECK_INTERVAL.total_seconds()
 
     def refresh(self) -> None:
         """Read the cache once, refetch from PyPI if stale.
 
         Populates ``self.latest_version`` with whatever we know after
         this call (cached value, freshly fetched value, or ``None``).
-        :meth:`check` then decides whether to log based purely on
+        :meth:`is_latest` then decides whether to log based purely on
         in-memory state — no further file IO.
         """
         if not self.enabled:
@@ -132,7 +155,7 @@ class UpdateChecker:
         self.latest_version = latest
         self.write_state(
             {
-                "last_check": datetime.now(timezone.utc).isoformat(),
+                "last_check": time.time(),
                 "latest_version": latest,
                 "current_version": self.current_version,
             }

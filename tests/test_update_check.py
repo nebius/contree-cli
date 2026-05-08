@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+import time
 from unittest.mock import patch
 
 import pytest
@@ -24,23 +24,39 @@ def state_path(tmp_path):
     return tmp_path / "version_check.json"
 
 
+HOUR = 3600.0
+DAY = 86400.0
+
+
 class TestParseVersion:
     @pytest.mark.parametrize(
         "value,expected",
         [
-            ("1.2.3", (1, 2, 3)),
-            ("0.0.1", (0, 0, 1)),
-            ("0.4.2a1", (0, 4, 21)),
-            ("1", (1,)),
+            ("1.2.3", ((1, 1), (2, 1), (3, 1))),
+            ("0.0.1", ((0, 1), (0, 1), (1, 1))),
+            ("0.4.2a1", ((0, 1), (4, 1), (2, 0))),
+            ("1", ((1, 1),)),
             ("", ()),
-            ("1.x.3", (1, 3)),
-            ("v1.2.3", (1, 2, 3)),
-            ("1.0.0-rc.1", (1, 0, 0, 1)),
+            ("1.x.3", ((1, 1), (3, 1))),
+            ("v1.2.3", ((1, 1), (2, 1), (3, 1))),
+            ("1.0.0-rc.1", ((1, 1), (0, 1), (0, 0), (1, 1))),
         ],
     )
     def test_cases(self, value, expected):
         checker = UpdateChecker(state_path="/dev/null", current_version="0")
         assert checker.parse_version(value) == expected
+
+    def test_pre_release_sorts_before_release(self):
+        checker = UpdateChecker(state_path="/dev/null", current_version="0")
+        assert checker.parse_version("0.4.2a1") < checker.parse_version("0.4.2")
+
+    def test_higher_release_sorts_after_pre_release(self):
+        checker = UpdateChecker(state_path="/dev/null", current_version="0")
+        assert checker.parse_version("0.4.2") < checker.parse_version("0.4.21")
+
+    def test_rc_sorts_before_release(self):
+        checker = UpdateChecker(state_path="/dev/null", current_version="0")
+        assert checker.parse_version("1.0.0-rc.1") < checker.parse_version("1.0.0")
 
 
 class TestEnabled:
@@ -73,19 +89,19 @@ class TestIsCacheFresh:
         checker = UpdateChecker(state_path="/dev/null", current_version="0")
         assert checker.is_cache_fresh({"latest_version": "1.0.0"}) is False
 
-    def test_returns_false_for_unparseable_last_check(self):
+    def test_returns_false_for_non_numeric_last_check(self):
+        """Legacy ISO strings or garbage values are treated as stale."""
         checker = UpdateChecker(state_path="/dev/null", current_version="0")
-        assert checker.is_cache_fresh({"last_check": "not-a-timestamp"}) is False
+        assert checker.is_cache_fresh({"last_check": "2026-05-08T00:00:00"}) is False
+        assert checker.is_cache_fresh({"last_check": None}) is False
 
     def test_returns_true_for_recent_last_check(self):
         checker = UpdateChecker(state_path="/dev/null", current_version="0")
-        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-        assert checker.is_cache_fresh({"last_check": recent}) is True
+        assert checker.is_cache_fresh({"last_check": time.time() - HOUR}) is True
 
     def test_returns_false_for_old_last_check(self):
         checker = UpdateChecker(state_path="/dev/null", current_version="0")
-        old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-        assert checker.is_cache_fresh({"last_check": old}) is False
+        assert checker.is_cache_fresh({"last_check": time.time() - 2 * DAY}) is False
 
 
 class TestRefresh:
@@ -112,14 +128,13 @@ class TestRefresh:
         data = read_json(state_path)
         assert data["latest_version"] == "0.4.1"
         assert data["current_version"] == "0.4.0"
-        assert "last_check" in data
+        assert isinstance(data["last_check"], (int, float))
 
     def test_skips_network_within_interval(self, state_path):
-        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         seed_state(
             state_path,
             {
-                "last_check": recent,
+                "last_check": time.time() - HOUR,
                 "latest_version": "0.5.0",
                 "current_version": "0.4.0",
             },
@@ -128,15 +143,13 @@ class TestRefresh:
         with patch.object(checker, "fetch_latest_version") as fetch:
             checker.refresh()
         fetch.assert_not_called()
-        # Cached value loaded into self.
         assert checker.latest_version == "0.5.0"
 
     def test_refetches_after_interval_expires(self, state_path):
-        old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         seed_state(
             state_path,
             {
-                "last_check": old,
+                "last_check": time.time() - 2 * DAY,
                 "latest_version": "0.4.0",
                 "current_version": "0.4.0",
             },
@@ -151,11 +164,10 @@ class TestRefresh:
         assert read_json(state_path)["latest_version"] == "0.4.5"
 
     def test_network_failure_keeps_cached_value(self, state_path):
-        old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         seed_state(
             state_path,
             {
-                "last_check": old,
+                "last_check": time.time() - 2 * DAY,
                 "latest_version": "0.4.0",
                 "current_version": "0.4.0",
             },
@@ -164,7 +176,6 @@ class TestRefresh:
         with patch.object(checker, "fetch_latest_version", return_value=None):
             checker.refresh()
         assert checker.latest_version == "0.4.0"
-        # State file untouched (no rewrite).
         assert read_json(state_path)["latest_version"] == "0.4.0"
 
     def test_network_failure_with_no_cache_leaves_latest_none(self, state_path):
@@ -186,6 +197,45 @@ class TestRefresh:
         assert checker.latest_version == "0.4.1"
         assert read_json(state_path)["latest_version"] == "0.4.1"
 
+    def test_legacy_iso_last_check_is_discarded(self, state_path):
+        """An old cache file written before the epoch migration is treated
+        as missing entirely — read_state rejects the whole record."""
+        seed_state(
+            state_path,
+            {
+                "last_check": "2026-05-08T12:00:00+00:00",
+                "latest_version": "0.4.0",
+                "current_version": "0.4.0",
+            },
+        )
+        checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
+        with patch.object(
+            checker, "fetch_latest_version", return_value="0.4.5"
+        ) as fetch:
+            checker.refresh()
+        fetch.assert_called_once()
+        # Discarded state -> nothing carried over -> only freshly fetched
+        # value remains.
+        assert read_json(state_path)["latest_version"] == "0.4.5"
+        assert checker.latest_version == "0.4.5"
+
+    def test_wrong_typed_latest_version_is_discarded(self, state_path):
+        seed_state(
+            state_path,
+            {
+                "last_check": time.time() - 2 * DAY,
+                "latest_version": 42,  # not a string
+                "current_version": "0.4.0",
+            },
+        )
+        checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
+        with patch.object(
+            checker, "fetch_latest_version", return_value="0.4.5"
+        ) as fetch:
+            checker.refresh()
+        fetch.assert_called_once()
+        assert checker.latest_version == "0.4.5"
+
     def test_refresh_does_not_log_warning(self, state_path, caplog):
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
         with (
@@ -198,7 +248,6 @@ class TestRefresh:
 
 class TestIsLatest:
     def test_returns_true_in_editable_mode(self, state_path):
-        """Editable installs are always considered up to date."""
         checker = UpdateChecker(state_path=state_path, current_version="editable")
         checker.latest_version = "9.9.9"
         assert checker.is_latest() is True
@@ -220,14 +269,24 @@ class TestIsLatest:
         assert checker.is_latest() is True
 
     def test_returns_true_when_latest_unknown(self, state_path):
-        """Unknown latest defaults to "up to date" so callers don't warn."""
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
         assert checker.is_latest() is True
 
     def test_returns_true_when_current_is_newer(self, state_path):
-        """Pre-release/dev install ahead of pypi is "latest"."""
         checker = UpdateChecker(state_path=state_path, current_version="0.6.0")
         checker.latest_version = "0.5.0"
+        assert checker.is_latest() is True
+
+    def test_returns_true_when_current_is_pre_release_of_same(self, state_path):
+        """Pre-release of the same release is "older", so warns to upgrade."""
+        checker = UpdateChecker(state_path=state_path, current_version="0.5.0a1")
+        checker.latest_version = "0.5.0"
+        assert checker.is_latest() is False
+
+    def test_returns_true_when_latest_is_pre_release_of_same(self, state_path):
+        """If pypi only knows a pre-release, an installed stable is fine."""
+        checker = UpdateChecker(state_path=state_path, current_version="0.5.0")
+        checker.latest_version = "0.5.0a1"
         assert checker.is_latest() is True
 
     def test_does_not_touch_filesystem(self, state_path):
@@ -238,7 +297,6 @@ class TestIsLatest:
         read.assert_not_called()
 
     def test_does_not_log(self, state_path, caplog):
-        """is_latest() is a pure predicate; logging is the caller's job."""
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
         checker.latest_version = "0.5.0"
         with caplog.at_level(logging.WARNING, logger="contree_cli.update_check"):

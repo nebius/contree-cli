@@ -241,6 +241,15 @@ class TestAuthVerify:
         assert rc == 1
         assert Config().resolve().token is None
 
+    def test_non_dict_whoami_payload_warns_but_saves(self, config_dir, caplog):
+        """JSON list (or other non-dict) is treated as missing permissions."""
+        args = _make_auth_args(token="tok")
+        with caplog.at_level("WARNING"), mock_whoami(body=b"[]"):
+            rc = cmd_auth(args)
+        assert rc is None
+        assert "sandboxes are disabled" in caplog.text
+        assert Config().resolve().token == "tok"
+
     def test_success_logs_saved(self, config_dir, caplog):
         args = _make_auth_args(token="good")
         with caplog.at_level("INFO"), mock_whoami():

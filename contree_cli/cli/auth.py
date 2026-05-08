@@ -184,7 +184,9 @@ def env_fallback(names: tuple[str, ...], *, what: str) -> str | None:
     return None
 
 
-def check_permission(payload: dict[str, object], permission: str) -> bool:
+def check_permission(payload: object, permission: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
     perms = payload.get("permissions")
     if not isinstance(perms, dict):
         return False
