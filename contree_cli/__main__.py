@@ -33,7 +33,14 @@ def main() -> None:
     args = parser.parse_args()
     setup_logging(level=getattr(logging, args.log_level.upper(), logging.INFO))
 
-    checker.check()
+    if not checker.is_latest():
+        log.warning(
+            "A new version of contree-cli is available: %s (installed: %s)."
+            " Upgrade with `uv tool install -U contree-cli` or"
+            " `pip install -U contree-cli`.",
+            checker.latest_version,
+            checker.current_version,
+        )
 
     config_mod.CONFIG_FILE = args.config_path
     config_mod.CONFIG_DIR = args.config_path.parent
