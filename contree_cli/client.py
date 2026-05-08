@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 RETRY_DELAYS = (1, 2, 4, 5, 10, 10, 10)
 
 
-def _cli_version() -> str:
+def cli_version() -> str:
     try:
         return version("contree-cli")
     except PackageNotFoundError:
@@ -29,7 +29,7 @@ def _cli_version() -> str:
 
 
 CLI_USER_AGENT = (
-    f"contree-cli/{_cli_version()} "
+    f"contree-cli/{cli_version()} "
     f"Python/{'.'.join(map(str, sys.version_info))} "
     f"{platform.platform()} "
 )

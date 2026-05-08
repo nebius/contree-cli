@@ -72,12 +72,13 @@ mutating commands (change remote or local session state):
   contree tag UUID TAG | kill UUID | cd PATH | session checkout BRANCH
 
 environment variables:
-  CONTREE_PROFILE    Active config profile (selects which profile to use)
-  CONTREE_SESSION    Explicit session name (for multi-terminal workflows).
-                    If unset, contree auto-generates <cwd>+<8hex> (derived from
-                    profile+ppid+tty); export your own for stable reuse.
-                    You can also pass -S/--session instead of exporting env.
-  CONTREE_SESSION_DB Path to session SQLite database
+  CONTREE_PROFILE          Active config profile (selects which profile to use)
+  CONTREE_SESSION          Explicit session name (for multi-terminal workflows).
+                           If unset, contree auto-generates <cwd>+<8hex> (derived
+                           from profile+ppid+tty); export your own for stable
+                           reuse. You can also pass -S/--session instead.
+  CONTREE_SESSION_DB       Path to session SQLite database
+  CONTREE_NO_UPDATE_CHECK  Set to any value to disable PyPI update checks
 
 registration-time fallbacks (only read by `contree auth`, not at runtime):
   CONTREE_TOKEN / NEBIUS_API_KEY        Token used when --token is omitted

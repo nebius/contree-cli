@@ -2,6 +2,7 @@ import contextvars
 import logging
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
 
 import contree_cli.config as config_mod
@@ -12,11 +13,16 @@ from contree_cli.config import SETTINGS, Config
 from contree_cli.log import setup_logging
 from contree_cli.output import FORMATTERS
 from contree_cli.session import SessionStore, get_session_key
+from contree_cli.update_check import UpdateChecker
 
 log = logging.getLogger(__name__)
 
 
 def main() -> None:
+    checker = UpdateChecker()
+    with suppress(Exception):
+        checker.refresh()
+
     if len(sys.argv) == 1:
         parser.print_help()
         exit(0)
@@ -26,6 +32,8 @@ def main() -> None:
 
     args = parser.parse_args()
     setup_logging(level=getattr(logging, args.log_level.upper(), logging.INFO))
+
+    checker.check()
 
     config_mod.CONFIG_FILE = args.config_path
     config_mod.CONFIG_DIR = args.config_path.parent
