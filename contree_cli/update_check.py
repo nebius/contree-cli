@@ -92,9 +92,7 @@ class UpdateChecker:
 
     @property
     def enabled(self) -> bool:
-        return (
-            not os.environ.get(self.OPT_OUT_ENV) and self.current_version != "editable"
-        )
+        return self.OPT_OUT_ENV not in os.environ and self.current_version != "editable"
 
     def is_cache_fresh(self, state: dict[str, str]) -> bool:
         """True if ``state['last_check']`` is within ``CHECK_INTERVAL``."""

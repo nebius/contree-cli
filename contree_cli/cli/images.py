@@ -25,6 +25,7 @@ from contree_cli.types import (
     isoformat_datetime,
     parse_datetime,
     parse_interval,
+    positive_int,
 )
 
 logger = logging.getLogger(__name__)
@@ -194,7 +195,7 @@ def _add_list_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         *FLAGS["limit"],
-        type=int,
+        type=positive_int,
         default=LIMIT_DEFAULT,
         help="Stop after this many images and warn if more are available",
     )

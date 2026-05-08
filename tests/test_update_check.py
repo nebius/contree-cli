@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 import pytest
 
-from contree_cli import update_check
 from contree_cli.update_check import UpdateChecker
 
 
@@ -18,18 +17,6 @@ def read_json(path):
 def seed_state(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload))
-
-
-def fake_now(offset: timedelta):
-    """Patch update_check.datetime.now to return real-now + offset."""
-    pinned = datetime.now(timezone.utc) + offset
-
-    class FakeDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return pinned if tz is not None else pinned.replace(tzinfo=None)
-
-    return patch.object(update_check, "datetime", FakeDatetime)
 
 
 @pytest.fixture()
@@ -63,6 +50,12 @@ class TestEnabled:
 
     def test_disabled_when_opt_out_env_set(self, state_path, monkeypatch):
         monkeypatch.setenv("CONTREE_NO_UPDATE_CHECK", "1")
+        checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
+        assert checker.enabled is False
+
+    def test_disabled_when_opt_out_env_set_to_empty(self, state_path, monkeypatch):
+        """Presence (any value, even empty) opts out, per documented contract."""
+        monkeypatch.setenv("CONTREE_NO_UPDATE_CHECK", "")
         checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
         assert checker.enabled is False
 
@@ -156,27 +149,6 @@ class TestRefresh:
         fetch.assert_called_once()
         assert checker.latest_version == "0.4.5"
         assert read_json(state_path)["latest_version"] == "0.4.5"
-
-    def test_refetches_via_clock_mock(self, state_path):
-        """Cross-platform verification using mocked clock."""
-        seed_state(
-            state_path,
-            {
-                "last_check": datetime.now(timezone.utc).isoformat(),
-                "latest_version": "0.4.0",
-                "current_version": "0.4.0",
-            },
-        )
-        checker = UpdateChecker(state_path=state_path, current_version="0.4.0")
-        with (
-            fake_now(timedelta(days=2)),
-            patch.object(
-                checker, "fetch_latest_version", return_value="0.4.5"
-            ) as fetch,
-        ):
-            checker.refresh()
-        fetch.assert_called_once()
-        assert checker.latest_version == "0.4.5"
 
     def test_network_failure_keeps_cached_value(self, state_path):
         old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()

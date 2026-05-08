@@ -90,6 +90,17 @@ class ArgumentsFormatter(argparse.RawDescriptionHelpFormatter):
         return help_text
 
 
+def positive_int(value: str) -> int:
+    """argparse type for flags that must be at least 1."""
+    try:
+        n = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
 def get_command_docs(setup_fn: SetupFn) -> tuple[str | None, str | None]:
     """Extract description and epilog from the module that defines *setup_fn*.
 

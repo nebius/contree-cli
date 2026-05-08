@@ -328,10 +328,12 @@ Per-command -p is useful for cross-project operations:
   contree -p project-a images --prefix=base
   contree -p project-b images import tag:base:latest
 
-Data directory: ~/.config/contree-cli/
-  config.ini              profile credentials
-  sessions-{profile}.db   per-profile sessions, history, cache
-  skills.db               installed agent skill registry
+Data directory: $XDG_CONFIG_HOME/contree/ (or ~/.config/contree/)
+  auth.ini                       profile credentials (mode 0600)
+  cli.ini                        optional CLI defaults
+  cli/sessions/{profile}.db      per-profile sessions, history, cache
+  cli/skills.db                  installed agent skill registry
+  cli/version_check.json         cached PyPI update-check state
 
 Environment variables:
   CONTREE_HOME       data directory override

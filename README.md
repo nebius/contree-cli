@@ -72,7 +72,7 @@ contree --help
 contree auth
 ```
 
-You'll be prompted to enter your API token and project ID. The CLI verifies the token and saves credentials to `~/.config/contree-cli/config.ini`.
+You'll be prompted to enter your API token and project ID. The CLI verifies the token and saves credentials to `~/.config/contree/auth.ini` (override the data directory via `CONTREE_HOME`).
 
 If `--token`/`--url`/`--project` flags are omitted, `contree auth` reads `CONTREE_TOKEN` (or `NEBIUS_API_KEY`), `CONTREE_URL`, and `CONTREE_PROJECT` (or `NEBIUS_AI_PROJECT`) from the environment instead of prompting. These variables are read only during registration; runtime commands use the saved profile only.
 
@@ -289,7 +289,7 @@ Read at runtime (any command):
 
 | Variable | Purpose |
 |---|---|
-| `CONTREE_HOME` | Data directory (default `~/.config/contree-cli`) |
+| `CONTREE_HOME` | Data directory (default `$XDG_CONFIG_HOME/contree`, or `~/.config/contree`) |
 | `CONTREE_PROFILE` | Active profile name (selects which profile commands use) |
 | `CONTREE_SESSION` | Explicit session key (for multi-terminal workflows) |
 | `CONTREE_SESSION_DB` | Path to session SQLite database |

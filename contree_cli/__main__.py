@@ -19,10 +19,6 @@ log = logging.getLogger(__name__)
 
 
 def main() -> None:
-    checker = UpdateChecker()
-    with suppress(Exception):
-        checker.refresh()
-
     if len(sys.argv) == 1:
         parser.print_help()
         exit(0)
@@ -33,6 +29,12 @@ def main() -> None:
     args = parser.parse_args()
     setup_logging(level=getattr(logging, args.log_level.upper(), logging.INFO))
 
+    # Update check runs only after argparse so it skips --help / --version
+    # / no-command paths and so the warning respects --log-level. refresh()
+    # is best-effort; check() is a pure predicate.
+    checker = UpdateChecker()
+    with suppress(Exception):
+        checker.refresh()
     if not checker.is_latest():
         log.warning(
             "A new version of contree-cli is available: %s (installed: %s)."

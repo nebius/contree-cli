@@ -19,7 +19,13 @@ from typing import Any
 
 from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
 from contree_cli.output import OutputFormatter
-from contree_cli.types import FLAGS, isoformat_datetime, parse_datetime, parse_interval
+from contree_cli.types import (
+    FLAGS,
+    isoformat_datetime,
+    parse_datetime,
+    parse_interval,
+    positive_int,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +108,7 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
 
     p.add_argument(
         *FLAGS["show_max"],
-        type=int,
+        type=positive_int,
         default=1000,
         help=(
             "Show at most this many operations, useful"
