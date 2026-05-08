@@ -9,7 +9,7 @@ import platform
 import sys
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from importlib.metadata import PackageNotFoundError, version
 from typing import IO, cast
 from urllib.parse import urlencode, urlsplit
@@ -33,6 +33,37 @@ CLI_USER_AGENT = (
     f"Python/{'.'.join(map(str, sys.version_info))} "
     f"{platform.platform()} "
 )
+
+
+class HeaderFormatter:
+    """Lazy redactor for HTTP headers, formats only on emit."""
+
+    SENSITIVE_HEADERS = frozenset(
+        {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+            "x-auth-token",
+        }
+    )
+
+    def __init__(
+        self,
+        headers: dict[str, str] | list[tuple[str, str]],
+    ) -> None:
+        self.headers = headers
+
+    def __str__(self) -> str:
+        items: Iterable[tuple[str, str]] = (
+            self.headers.items() if isinstance(self.headers, dict) else self.headers
+        )
+        redacted = {
+            k: "<redacted>" if k.lower() in self.SENSITIVE_HEADERS else v
+            for k, v in items
+        }
+        return repr(redacted)
 
 
 class BodyFormatter:
@@ -186,9 +217,10 @@ class ContreeClient(ABC):
         attempts = len(RETRY_DELAYS) + 1
 
         log.debug(
-            "%s %s body=%s",
+            "%s %s headers=%s body=%s",
             method,
             full_path,
+            HeaderFormatter(merged),
             BodyFormatter(body, content_type=merged.get("Content-Type", "")),
         )
 
@@ -220,24 +252,27 @@ class ContreeClient(ABC):
 
             if 200 <= resp.status < 300:
                 log.debug(
-                    "%s %s -> %d %s",
+                    "%s %s -> %d %s headers=%s",
                     method,
                     full_path,
                     resp.status,
                     resp.reason,
+                    HeaderFormatter(list(resp.getheaders())),
                 )
                 if log.isEnabledFor(logging.DEBUG):
                     return self.log_and_buffer(method, full_path, resp)
                 return resp
 
+            resp_headers = list(resp.getheaders())
             resp_body = resp.read().decode("utf-8", errors="replace")
             log.debug(
-                "%s %s -> %d %s (%dB)",
+                "%s %s -> %d %s (%dB) headers=%s",
                 method,
                 full_path,
                 resp.status,
                 resp.reason,
                 len(resp_body),
+                HeaderFormatter(resp_headers),
             )
             log.debug(
                 "%s %s response body: %s",

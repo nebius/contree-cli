@@ -29,7 +29,8 @@ from contree_cli.types import (
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 100
+PAGE_SIZE = 500
+LIMIT_DEFAULT = 2000
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 DOCKER_HUB = "docker.io"
 
@@ -77,6 +78,7 @@ class ImagesArgs(ArgumentsProtocol):
     all_images: bool = False
     since: datetime | None = None
     until: datetime | None = None
+    limit: int = LIMIT_DEFAULT
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> ImagesArgs:
@@ -86,6 +88,7 @@ class ImagesArgs(ArgumentsProtocol):
             all_images=getattr(ns, "all_images", False),
             since=getattr(ns, "since", None),
             until=getattr(ns, "until", None),
+            limit=getattr(ns, "limit", LIMIT_DEFAULT),
         )
 
 
@@ -189,6 +192,12 @@ def _add_list_args(p: argparse.ArgumentParser) -> None:
         type=parse_interval,
         help="Show images before. " + str(parse_interval.__doc__),
     )
+    p.add_argument(
+        *FLAGS["limit"],
+        type=int,
+        default=LIMIT_DEFAULT,
+        help="Stop after this many images and warn if more are available",
+    )
 
 
 def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
@@ -249,7 +258,7 @@ def cmd_images(args: ImagesArgs) -> None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
 
-    base_params: dict[str, str] = {"limit": str(PAGE_SIZE)}
+    base_params: dict[str, str] = {}
     if args.prefix is not None:
         base_params["tag"] = args.prefix
     if args.uuid is not None:
@@ -262,13 +271,19 @@ def cmd_images(args: ImagesArgs) -> None:
         base_params["until"] = isoformat_datetime(args.until)
 
     offset = 0
-    while True:
-        params = {**base_params, "offset": str(offset)}
+    emitted = 0
+    while emitted < args.limit:
+        page_size = min(PAGE_SIZE, args.limit - emitted)
+        params = {
+            **base_params,
+            "offset": str(offset),
+            "limit": str(page_size),
+        }
         resp = client.get("/v1/images", params=params)
         data = json.loads(resp.read())
         images = data["images"]
         if not images:
-            break
+            return
         for image in images:
             created_at = parse_datetime(image["created_at"])
             formatter(
@@ -276,9 +291,31 @@ def cmd_images(args: ImagesArgs) -> None:
                 created_at=created_at,
                 tag=image.get("tag") or "",
             )
-        if len(images) < PAGE_SIZE:
-            break
+        emitted += len(images)
+        if len(images) < page_size:
+            return
         offset += len(images)
+        if emitted < args.limit:
+            logger.info(
+                "Fetched %d images so far... (press Ctrl+C to break)",
+                emitted,
+            )
+
+    # Hit the limit. Probe one extra record (offset=emitted, limit=1) to
+    # detect truncation without re-fetching a full page.
+    probe_params = {**base_params, "offset": str(offset), "limit": "1"}
+    resp = client.get("/v1/images", params=probe_params)
+    data = json.loads(resp.read())
+    if data.get("images"):
+        # Flush buffered output (e.g. TableFormatter) before the warning
+        # so the truncation note appears AFTER the listing on screen.
+        formatter.flush()
+        logger.warning(
+            "Output truncated at --limit=%d images; more results are"
+            " available. Raise --limit or narrow with"
+            " --prefix/--since/--until.",
+            args.limit,
+        )
 
 
 def _parse_explicit_tag(ref: str) -> tuple[str, str | None]:

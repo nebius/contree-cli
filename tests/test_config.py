@@ -149,7 +149,7 @@ class TestProfileResolution:
         assert p.name == "staging"
         assert p.token == "tok2"
 
-    def test_env_token_overrides_config(self, config_dir, monkeypatch):
+    def test_env_token_does_not_override_config(self, config_dir, monkeypatch):
         cfg = Config()
         cfg["default"] = ConfigProfile(
             name="default",
@@ -158,9 +158,9 @@ class TestProfileResolution:
         )
         monkeypatch.setenv("CONTREE_TOKEN", "env_token")
         p = Config().resolve()
-        assert p.token == "env_token"
+        assert p.token == "cfg_token"
 
-    def test_env_url_overrides_config(self, config_dir, monkeypatch):
+    def test_env_url_does_not_override_config(self, config_dir, monkeypatch):
         cfg = Config()
         cfg["default"] = ConfigProfile(
             name="default",
@@ -169,7 +169,7 @@ class TestProfileResolution:
         )
         monkeypatch.setenv("CONTREE_URL", "https://env.dev")
         p = Config().resolve()
-        assert p.url == "https://env.dev"
+        assert p.url == "https://custom.dev"
 
     def test_url_falls_back_for_jwt_when_missing(self, config_dir):
         """JWT profile with url key removed falls back to empty string."""
@@ -268,7 +268,7 @@ class TestAuthType:
         p = Config().resolve()
         assert p.project is None
 
-    def test_env_project_overrides_config(self, config_dir, monkeypatch):
+    def test_env_project_does_not_override_config(self, config_dir, monkeypatch):
         cfg = Config()
         cfg["default"] = ConfigProfile(
             name="default",
@@ -279,7 +279,7 @@ class TestAuthType:
         )
         monkeypatch.setenv("CONTREE_PROJECT", "aiproject-env")
         p = Config().resolve()
-        assert p.project == "aiproject-env"
+        assert p.project == "aiproject-cfg"
 
     def test_save_clears_project_when_none(self, config_dir):
         cfg = Config()

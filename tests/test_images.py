@@ -9,6 +9,7 @@ from conftest import ContreeTestClient
 
 from contree_cli import CLIENT, FORMATTER
 from contree_cli.cli.images import (
+    LIMIT_DEFAULT,
     PAGE_SIZE,
     ImagesArgs,
     ImportArgs,
@@ -167,6 +168,115 @@ class TestImagesPagination:
         _run_cmd_pages(contree_client, [page1, page2])
         out = capsys.readouterr().out
         assert out.count("uuid-") == PAGE_SIZE + 5
+
+    def test_progress_logged_per_full_page(self, contree_client, caplog):
+        """Each completed full page emits a progress line at INFO level."""
+        import logging
+
+        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
+        page2 = [_make_image(i) for i in range(PAGE_SIZE, PAGE_SIZE * 2)]
+        page3 = [_make_image(i) for i in range(PAGE_SIZE * 2, PAGE_SIZE * 2 + 3)]
+        with caplog.at_level(logging.INFO, logger="contree_cli.cli.images"):
+            _run_cmd_pages(contree_client, [page1, page2, page3])
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            f"Fetched {PAGE_SIZE} images so far" in m and "Ctrl+C" in m for m in msgs
+        )
+        assert any(
+            f"Fetched {PAGE_SIZE * 2} images so far" in m and "Ctrl+C" in m
+            for m in msgs
+        )
+        assert not any(f"{PAGE_SIZE * 2 + 3}" in m for m in msgs)
+
+    def test_default_limit_is_2000(self):
+        assert LIMIT_DEFAULT == 2000
+        assert ImagesArgs().limit == LIMIT_DEFAULT
+
+    def test_limit_truncates_with_warning(self, contree_client, caplog):
+        """Hitting --limit triggers a probe; non-empty probe -> warning."""
+        import logging
+
+        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
+        contree_client.respond_json({"images": page1})
+        contree_client.respond_json({"images": [_make_image(PAGE_SIZE)]})
+
+        FORMATTER.set(CSVFormatter())
+        ctx = copy_context()
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.images"):
+            ctx.run(cmd_images, ImagesArgs(limit=PAGE_SIZE))
+        msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("truncated" in m and f"--limit={PAGE_SIZE}" in m for m in msgs)
+        assert contree_client.request_count == 2
+
+    def test_limit_probe_uses_skip_of_one(self, contree_client):
+        """Probe is a single-record request, not a full page."""
+        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
+        contree_client.respond_json({"images": page1})
+        contree_client.respond_json({"images": []})
+
+        FORMATTER.set(CSVFormatter())
+        ctx = copy_context()
+        ctx.run(cmd_images, ImagesArgs(limit=PAGE_SIZE))
+
+        probe_path = contree_client.request_paths[1]
+        assert "limit=1" in probe_path
+        assert f"offset={PAGE_SIZE}" in probe_path
+
+    def test_limit_warning_after_table_flush(self, contree_client, caplog, capsys):
+        """TableFormatter buffer is flushed before the truncation warning."""
+        import logging
+
+        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
+        contree_client.respond_json({"images": page1})
+        contree_client.respond_json({"images": [_make_image(PAGE_SIZE)]})
+
+        FORMATTER.set(TableFormatter())
+        ctx = copy_context()
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.images"):
+            ctx.run(cmd_images, ImagesArgs(limit=PAGE_SIZE))
+
+        out = capsys.readouterr().out
+        # Table content must be printed (i.e. flushed) before the handler
+        # logs the warning. Verify the table is on stdout already.
+        assert "uuid-0" in out
+        assert f"uuid-{PAGE_SIZE - 1}" in out
+
+    def test_limit_no_warning_when_no_more(self, contree_client, caplog):
+        """Empty probe response -> no warning."""
+        import logging
+
+        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
+        contree_client.respond_json({"images": page1})
+        contree_client.respond_json({"images": []})
+
+        FORMATTER.set(CSVFormatter())
+        ctx = copy_context()
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.images"):
+            ctx.run(cmd_images, ImagesArgs(limit=PAGE_SIZE))
+        warns = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert not any("truncated" in r.getMessage() for r in warns)
+
+    def test_limit_request_uses_capped_page_size(self, contree_client):
+        """When --limit < PAGE_SIZE, the API request asks for limit items only."""
+        contree_client.respond_json({"images": [_make_image(i) for i in range(3)]})
+        contree_client.respond_json({"images": []})  # probe
+
+        FORMATTER.set(CSVFormatter())
+        ctx = copy_context()
+        ctx.run(cmd_images, ImagesArgs(limit=3))
+
+        assert "limit=3" in contree_client.request_paths[0]
+        assert "limit=1" in contree_client.request_paths[1]
+        assert contree_client.request_count == 2
+
+    def test_progress_not_logged_for_single_short_page(self, contree_client, caplog):
+        """Final/only partial page does not emit progress (output covers it)."""
+        import logging
+
+        images = [_make_image(i) for i in range(5)]
+        with caplog.at_level(logging.INFO, logger="contree_cli.cli.images"):
+            _run_cmd(contree_client, images)
+        assert not any("images so far" in r.getMessage() for r in caplog.records)
 
 
 class TestImagesCreatedAtFormats:

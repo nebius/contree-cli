@@ -335,10 +335,13 @@ Data directory: ~/.config/contree-cli/
 
 Environment variables:
   CONTREE_HOME       data directory override
-  CONTREE_TOKEN      API token (overrides config)
-  CONTREE_URL        API URL (overrides config)
-  CONTREE_PROFILE    active profile (overrides config)
+  CONTREE_PROFILE    active profile (selects which profile commands use)
   CONTREE_SESSION    explicit session key
+
+Read only by `contree auth` (registration-time fallbacks):
+  CONTREE_TOKEN / NEBIUS_API_KEY        token when --token is omitted
+  CONTREE_URL                           URL when --url is omitted
+  CONTREE_PROJECT / NEBIUS_AI_PROJECT   project ID when --project is omitted
 
 More: contree auth --help
 

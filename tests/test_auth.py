@@ -46,14 +46,26 @@ def _make_iam_args(**kwargs) -> AuthArgs:
     return AuthArgs(**defaults)
 
 
+def _whoami_body(*, permissions: dict[str, bool] | None = None) -> bytes:
+    body = {
+        "token_uuid": "00000000-0000-0000-0000-000000000000",
+        "token_expiration": None,
+        "permissions": {"list": True} if permissions is None else permissions,
+        "operations_stat": {},
+    }
+    import json as _json
+
+    return _json.dumps(body).encode()
+
+
 @contextmanager
-def _mock_whoami(status=200):
+def _mock_whoami(status=200, *, body: bytes | None = None):
     """Patch client_from_profile to return a fresh ContreeTestClient per call."""
     last_client: list[ContreeTestClient] = []
 
     def factory(profile, timeout=None):  # type: ignore[no-untyped-def]
         tc = ContreeTestClient()
-        tc.respond(status=status, body=b'{"ok":true}')
+        tc.respond(status=status, body=body if body is not None else _whoami_body())
         last_client.clear()
         last_client.append(tc)
         return tc
@@ -97,7 +109,7 @@ class TestAuthSave:
         assert p.token == "my_token"
         assert p.url == "https://my.dev"
         assert "Setting token for profile 'default'" in caplog.text
-        assert "Token verified and saved to profile 'default'" in caplog.text
+        assert "auth accepted, profile 'default' saved to ->" in caplog.text
 
     def test_logs_updating_for_existing_profile(self, config_dir, caplog):
         with _mock_whoami():
@@ -124,7 +136,7 @@ class TestAuthSave:
         p = Config().resolve()
         assert p.token == "tok"
         assert p.name == "staging"
-        assert "Token verified and saved to profile 'staging'" in caplog.text
+        assert "auth accepted, profile 'staging' saved to ->" in caplog.text
 
     def test_save_jwt_stores_type(self, config_dir):
         with _mock_whoami():
@@ -193,11 +205,48 @@ class TestAuthVerify:
         p = Config().resolve()
         assert p.token is None
 
+    def test_no_list_permission_warns_but_saves(self, config_dir, caplog):
+        args = _make_auth_args(token="tok")
+        with (
+            caplog.at_level("WARNING"),
+            _mock_whoami(body=_whoami_body(permissions={"list": False})),
+        ):
+            rc = cmd_auth(args)
+        assert rc is None
+        assert "sandboxes are disabled" in caplog.text
+        assert "Warning" in caplog.text
+        assert Config().resolve().token == "tok"
+
+    def test_no_list_permission_warning_includes_project(self, config_dir, caplog):
+        args = _make_iam_args(token="tok", project="aiproject-restricted")
+        with (
+            caplog.at_level("WARNING"),
+            _mock_whoami(body=_whoami_body(permissions={"list": False})),
+        ):
+            cmd_auth(args)
+        assert "aiproject-restricted" in caplog.text
+
+    def test_missing_permissions_field_warns(self, config_dir, caplog):
+        args = _make_auth_args(token="tok")
+        body = b'{"token_uuid":"x","token_expiration":null,"operations_stat":{}}'
+        with caplog.at_level("WARNING"), _mock_whoami(body=body):
+            rc = cmd_auth(args)
+        assert rc is None
+        assert "sandboxes are disabled" in caplog.text
+        assert Config().resolve().token == "tok"
+
+    def test_unparseable_whoami_rejected(self, config_dir, caplog):
+        args = _make_auth_args(token="tok")
+        with caplog.at_level("ERROR"), _mock_whoami(body=b"not-json"):
+            rc = cmd_auth(args)
+        assert rc == 1
+        assert Config().resolve().token is None
+
     def test_success_logs_saved(self, config_dir, caplog):
         args = _make_auth_args(token="good")
         with caplog.at_level("INFO"), _mock_whoami():
             cmd_auth(args)
-        assert "Token verified and saved" in caplog.text
+        assert "auth accepted" in caplog.text
 
     def test_whoami_called(self, config_dir):
         args = _make_auth_args(token="tok")
@@ -251,6 +300,65 @@ class TestNebius:
         assert p.project == "aiproject-auto"
 
 
+class TestContreeEnvFallbacks:
+    def test_contree_token_used_when_token_omitted(
+        self, config_dir, caplog, monkeypatch
+    ):
+        monkeypatch.setenv("CONTREE_TOKEN", "ctok")
+        with caplog.at_level("INFO"), _mock_whoami():
+            cmd_auth(AuthArgs(url="https://test.dev", auth_type=AuthType.JWT))
+        p = Config().resolve()
+        assert p.token == "ctok"
+        assert "Using token from CONTREE_TOKEN" in caplog.text
+
+    def test_contree_token_preferred_over_nebius_api_key(
+        self, config_dir, caplog, monkeypatch
+    ):
+        monkeypatch.setenv("CONTREE_TOKEN", "ctok")
+        monkeypatch.setenv("NEBIUS_API_KEY", "ntok")
+        with caplog.at_level("INFO"), _mock_whoami():
+            cmd_auth(AuthArgs(url="https://test.dev", auth_type=AuthType.JWT))
+        p = Config().resolve()
+        assert p.token == "ctok"
+
+    def test_contree_url_used_when_url_omitted(self, config_dir, caplog, monkeypatch):
+        monkeypatch.setenv("CONTREE_URL", "https://env-url.dev")
+        monkeypatch.setenv("NEBIUS_API_KEY", "tok")
+        with caplog.at_level("INFO"), _mock_whoami():
+            cmd_auth(AuthArgs(auth_type=AuthType.JWT))
+        p = Config().resolve()
+        assert p.url == "https://env-url.dev"
+
+    def test_contree_project_used_when_project_omitted(
+        self, config_dir, caplog, monkeypatch
+    ):
+        monkeypatch.setenv("CONTREE_PROJECT", "aiproject-c")
+        with caplog.at_level("INFO"), _mock_whoami():
+            cmd_auth(
+                AuthArgs(
+                    token="tok",
+                    url="https://iam.test",
+                    auth_type=AuthType.IAM,
+                )
+            )
+        p = Config().resolve()
+        assert p.project == "aiproject-c"
+        assert "Using project from CONTREE_PROJECT" in caplog.text
+
+    def test_explicit_token_flag_beats_env(self, config_dir, monkeypatch):
+        monkeypatch.setenv("CONTREE_TOKEN", "from-env")
+        with _mock_whoami():
+            cmd_auth(
+                AuthArgs(
+                    token="from-flag",
+                    url="https://test.dev",
+                    auth_type=AuthType.JWT,
+                )
+            )
+        p = Config().resolve()
+        assert p.token == "from-flag"
+
+
 # ---------------------------------------------------------------------------
 # Switch
 # ---------------------------------------------------------------------------
@@ -296,7 +404,7 @@ class TestAuthProfiles:
         def fake_factory(profile, timeout=None):  # type: ignore[no-untyped-def]
             tc = ContreeTestClient(token=profile.token)
             if profile.token == "tok-ok":
-                tc.respond(status=200, body=b'{"ok":true}')
+                tc.respond(status=200, body=_whoami_body())
             elif profile.token == "tok-timeout":
 
                 def timeout_get(path, params=None):  # type: ignore[no-untyped-def]
@@ -323,6 +431,39 @@ class TestAuthProfiles:
         assert by_name["ok"]["status"] == "ok"
         assert by_name["timeout"]["status"] == "timeout"
         assert by_name["error"]["status"] == "error"
+
+    def test_profiles_inactive_status(self, config_dir):
+        """Profile whose token lacks `list` permission is reported as inactive."""
+        with _mock_whoami():
+            cmd_auth(_make_auth_args(token="tok", profile="restricted"))
+
+        rows: list[dict[str, object]] = []
+
+        class CaptureFormatter:
+            def __call__(self, **kwargs: object) -> None:
+                rows.append(kwargs)
+
+            def flush(self) -> None:
+                return
+
+        def fake_factory(profile, timeout=None):  # type: ignore[no-untyped-def]
+            tc = ContreeTestClient(token=profile.token)
+            tc.respond(
+                status=200,
+                body=_whoami_body(permissions={"list": False, "spawn": True}),
+            )
+            return tc
+
+        FORMATTER.set(CaptureFormatter())
+        ctx = copy_context()
+        with patch(
+            "contree_cli.cli.auth.client_from_profile",
+            side_effect=fake_factory,
+        ):
+            ctx.run(cmd_list, ProfilesArgs(offline=False))
+
+        by_name = {str(row["name"]): row for row in rows}
+        assert by_name["restricted"]["status"] == "inactive"
 
     def test_profiles_offline_skips_probe(self, config_dir):
         with _mock_whoami():

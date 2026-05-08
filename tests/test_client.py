@@ -14,6 +14,7 @@ from contree_cli.client import (
     BodyFormatter,
     ContreeClient,
     ContreeJWTClient,
+    HeaderFormatter,
     resolve_image,
 )
 
@@ -408,6 +409,77 @@ class TestDebugLogging:
         msgs = "\n".join(r.getMessage() for r in caplog.records)
         assert "<binary" in msgs
         assert "Content-Type='application/octet-stream'" in msgs
+
+    def test_request_headers_logged_with_authorization_redacted(self, caplog):
+        self._enable_debug(caplog)
+        c = ContreeTestClient("https://contree.dev", "secret-token")
+        c.respond(status=200, body=b"{}")
+        c.request("GET", "/v1/images")
+        msgs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "headers=" in msgs
+        assert "secret-token" not in msgs
+        assert "<redacted>" in msgs
+
+    def test_response_headers_logged(self, caplog):
+        self._enable_debug(caplog)
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.fake.responses.append(
+            FakeResponse(
+                status=200,
+                body=b"{}",
+                headers={"Content-Type": "application/json", "X-Trace-Id": "abc"},
+            )
+        )
+        c.request("GET", "/v1/images")
+        msgs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "X-Trace-Id" in msgs
+        assert "abc" in msgs
+
+    def test_error_response_headers_logged(self, caplog):
+        self._enable_debug(caplog)
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.fake.responses.append(
+            FakeResponse(
+                status=400,
+                body=b"bad",
+                headers={"X-Trace-Id": "trace-err"},
+            )
+        )
+        with pytest.raises(ApiError):
+            c.request("GET", "/v1/images")
+        msgs = "\n".join(r.getMessage() for r in caplog.records)
+        assert "trace-err" in msgs
+
+
+class TestHeaderFormatter:
+    def test_redacts_authorization(self):
+        out = str(HeaderFormatter({"Authorization": "Bearer secret", "X-Foo": "bar"}))
+        assert "secret" not in out
+        assert "<redacted>" in out
+        assert "bar" in out
+
+    def test_redaction_is_case_insensitive(self):
+        out = str(HeaderFormatter({"AUTHORIZATION": "Bearer secret"}))
+        assert "secret" not in out
+        assert "<redacted>" in out
+
+    def test_accepts_list_of_tuples(self):
+        out = str(
+            HeaderFormatter(
+                [("Authorization", "Bearer secret"), ("X-Trace-Id", "abc")],
+            )
+        )
+        assert "secret" not in out
+        assert "abc" in out
+
+    def test_redacts_cookie(self):
+        out = str(HeaderFormatter({"Cookie": "session=xyz"}))
+        assert "xyz" not in out
+
+    def test_non_sensitive_passes_through(self):
+        out = str(HeaderFormatter({"User-Agent": "ua/1.0", "Project": "proj"}))
+        assert "ua/1.0" in out
+        assert "proj" in out
 
 
 class TestBodyFormatter:

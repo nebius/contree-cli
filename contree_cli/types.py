@@ -62,6 +62,7 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "uuid": ("-i", "--uuid"),
         "username": ("--username",),
         "password": ("--password",),
+        "limit": ("--limit",),
         # use
         "new": ("-N", "--new"),
         # session

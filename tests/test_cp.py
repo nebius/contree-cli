@@ -38,6 +38,11 @@ class StreamResponse:
             return str(self._length)
         return default
 
+    def getheaders(self) -> list[tuple[str, str]]:
+        if self._length is not None:
+            return [("Content-Length", str(self._length))]
+        return []
+
 
 def _run_cmd(
     tc: ContreeTestClient,
