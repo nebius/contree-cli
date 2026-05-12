@@ -379,6 +379,7 @@ def record_local_uuid(mf: MappedFile, file_uuid: str, store: SessionStore) -> No
     store.cache[("", cache_kind)] = {
         "uuid": file_uuid,
         "uploaded_at": time.time(),
+        "local_path": os.path.abspath(mf.host_path),
     }
 
 
@@ -418,6 +419,9 @@ def upload_files(
         cached = cached_local_uuid(mf, store)
         if cached:
             uploaded[mf.host_path] = cached
+            # Rewrite the entry so older payloads without local_path are
+            # backfilled with the current host path.
+            record_local_uuid(mf, cached, store)
         else:
             pending.append(mf)
 

@@ -217,6 +217,28 @@ class ImageCache(MutableMapping[CacheKey, object]):
         assert row is not None
         return row[0]  # type: ignore[no-any-return]
 
+    def local_file_paths(self) -> dict[str, str]:
+        """Map remote file UUID to the host path that uploaded it.
+
+        Reads every ``local_file:*`` cache entry, decodes its JSON
+        payload, and returns ``{remote_uuid: local_path}`` for entries
+        that have both fields. Older entries without ``local_path``
+        are silently skipped.
+        """
+        cur = self._conn.execute(
+            "SELECT value FROM image_cache WHERE kind LIKE 'local_file:%'",
+        )
+        result: dict[str, str] = {}
+        for row in cur.fetchall():
+            value = self._decode(row["value"])
+            if not isinstance(value, dict):
+                continue
+            uuid_str = value.get("uuid")
+            local_path = value.get("local_path")
+            if isinstance(uuid_str, str) and isinstance(local_path, str):
+                result[uuid_str] = local_path
+        return result
+
     def invalidate_prefix(
         self,
         *,

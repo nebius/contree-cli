@@ -771,6 +771,22 @@ class TestImageCache:
         cache2 = session_store.cache
         assert cache2["img-1", "files:/"] == ["root"]
 
+    def test_local_file_paths_returns_uuid_to_path(self, session_store: SessionStore):
+        cache = session_store.cache
+        cache[("", "local_file:a")] = {"uuid": "u-1", "local_path": "/host/a.txt"}
+        cache[("", "local_file:b")] = {"uuid": "u-2", "local_path": "/host/b.txt"}
+        cache[("img-x", "files:/etc")] = ["unrelated"]
+        result = cache.local_file_paths()
+        assert result == {"u-1": "/host/a.txt", "u-2": "/host/b.txt"}
+
+    def test_local_file_paths_skips_entries_without_local_path(
+        self, session_store: SessionStore
+    ):
+        cache = session_store.cache
+        cache[("", "local_file:old")] = {"uuid": "u-old"}  # no local_path
+        cache[("", "local_file:new")] = {"uuid": "u-new", "local_path": "/host/x"}
+        assert cache.local_file_paths() == {"u-new": "/host/x"}
+
     def test_global_image_list(self, session_store: SessionStore):
         """The image list cache uses empty-string UUID."""
         cache = session_store.cache

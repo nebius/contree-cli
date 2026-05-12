@@ -198,6 +198,29 @@ Pending files are injected into the next non-disposable run.
 Explicit --file takes priority over pending files at same path.
 Pending files are branch-aware.
 
+Listing uploaded files:
+  contree file ls                 list all uploaded files in the project
+  contree file ls --since 1d      narrow by upload time
+  contree file ls -q              uuid + sha256 + local_path only (quiet)
+  contree -f json file ls         JSON output for jq
+
+  Output joins remote files (uuid, sha256, size, created_at) with the
+  local upload cache: when the CLI uploaded the file from this host
+  it shows the absolute LOCAL_PATH alongside the remote UUID.
+
+  IMPORTANT: LOCAL_PATH is resolved ONLY for files uploaded from this
+  specific machine. The path-to-uuid mapping lives in the local SQLite
+  cache (per profile, under $CONTREE_HOME/cli/sessions/<profile>.db)
+  keyed by path+inode+mtime+size, and is NOT shared between hosts.
+  Rows show empty LOCAL_PATH when:
+    - the file was uploaded from a different machine or by a teammate;
+    - the local file has been moved, renamed, or its inode/mtime/size
+      changed since upload (the cache key no longer matches);
+    - the upload happened before path tracking landed (older entries
+      backfill on the next match).
+  An agent must not assume LOCAL_PATH is authoritative across hosts;
+  for cross-machine identity always use the remote UUID or sha256.
+
 More: contree run --help, contree file --help
 
 Execution modes
@@ -411,6 +434,7 @@ All commands
   env [KEY=VALUE ...]     Session env vars (-d to unset)
   file edit PATH          Edit remote file via $EDITOR
   file cp SRC DEST        Stage local file for next run
+  file ls [-q]            List uploaded files + local path (aliases: list)
   session list            List sessions (aliases: ls)
   session branch [NAME]   Create/list branches (aliases: br)
   session checkout BRANCH Switch branch (aliases: co)

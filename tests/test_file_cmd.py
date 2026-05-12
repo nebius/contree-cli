@@ -10,15 +10,18 @@ from unittest.mock import patch
 import pytest
 from conftest import ContreeTestClient
 
-from contree_cli import SESSION_STORE
+from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.cli.file import (
     FileCpArgs,
     FileEditArgs,
+    FileListArgs,
     _file_sha256,
     cmd_file_cp,
     cmd_file_edit,
+    cmd_file_ls,
 )
 from contree_cli.client import ApiError
+from contree_cli.output import JSONFormatter
 from contree_cli.session import SessionStore
 
 
@@ -93,6 +96,84 @@ def _run_file_edit(
     ):
         rc = ctx.run(cmd_file_edit, args)
     return rc
+
+
+def _run_file_ls(
+    tc: ContreeTestClient,
+    args: FileListArgs,
+    responses: list[StreamResponse],
+    *,
+    store: SessionStore,
+) -> int | None:
+    tc.fake.responses.extend(responses)
+    CLIENT.set(tc)
+    SESSION_STORE.set(store)
+    FORMATTER.set(JSONFormatter())
+    ctx = copy_context()
+    return ctx.run(cmd_file_ls, args)
+
+
+class TestFileLs:
+    def test_lists_with_local_path(self, contree_client, session_store, capsys):
+        session_store.cache[("", "local_file:a")] = {
+            "uuid": "file-1",
+            "local_path": "/host/app.py",
+        }
+        responses = [
+            _api_response(
+                {
+                    "files": [
+                        {"uuid": "file-1", "sha256": "abc", "size": 10},
+                        {"uuid": "file-2", "sha256": "def", "size": 20},
+                    ]
+                }
+            ),
+        ]
+        rc = _run_file_ls(
+            contree_client,
+            FileListArgs(limit=10),
+            responses,
+            store=session_store,
+        )
+        assert rc is None
+        out = capsys.readouterr().out.splitlines()
+        rows = [json.loads(line) for line in out]
+        assert rows[0]["uuid"] == "file-1"
+        assert rows[0]["local_path"] == "/host/app.py"
+        assert rows[1]["uuid"] == "file-2"
+        assert rows[1]["local_path"] == ""
+
+    def test_quiet_emits_three_columns(self, contree_client, session_store, capsys):
+        session_store.cache[("", "local_file:a")] = {
+            "uuid": "file-1",
+            "local_path": "/host/app.py",
+        }
+        responses = [
+            _api_response(
+                {
+                    "files": [
+                        {
+                            "uuid": "file-1",
+                            "sha256": "abc",
+                            "size": 10,
+                            "created_at": "2026-05-01T00:00:00Z",
+                        },
+                    ]
+                }
+            ),
+        ]
+        _run_file_ls(
+            contree_client,
+            FileListArgs(limit=10, quiet=True),
+            responses,
+            store=session_store,
+        )
+        out = capsys.readouterr().out.strip()
+        row = json.loads(out)
+        assert set(row) == {"uuid", "sha256", "local_path"}
+        assert row["uuid"] == "file-1"
+        assert row["sha256"] == "abc"
+        assert row["local_path"] == "/host/app.py"
 
 
 class TestFileSha256:

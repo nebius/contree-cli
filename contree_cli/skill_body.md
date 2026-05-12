@@ -167,6 +167,17 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
 - `cp`: download a file from the image to the host.
 - `file edit`: open a remote file in a host editor and stage it for the next run.
 - `file cp`: upload a local file and stage it for the next run.
+- `file ls`: list uploaded files; rows uploaded from this host show their
+  `local_path` so the agent can map a UUID back to a workspace file. Add
+  `-q` for a tight `uuid sha256 local_path` view.
+
+  **`local_path` is THIS-MACHINE ONLY.** The mapping lives in the local
+  CLI SQLite cache (`$CONTREE_HOME/cli/sessions/<profile>.db`) keyed by
+  `path + inode + mtime + size`. It is not synced anywhere. Rows uploaded
+  from a different machine, by another teammate, or before path tracking
+  landed will show an empty `local_path` — that is expected, not a bug.
+  When working across hosts, treat the remote `uuid`/`sha256` as the
+  authoritative identifier and never rely on `local_path` resolving.
 - `session branch`: create an experimental branch.
 - `session checkout`: switch active branch.
 - `session rollback`: move the active branch pointer backward.
