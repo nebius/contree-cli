@@ -29,7 +29,7 @@ class MappedFile:
     @classmethod
     def parse(cls, spec: str) -> "MappedFile":
         drive = pathlib.PurePath(spec).drive
-        parts = spec[len(drive) :].split(":")
+        parts = split_mapped_value(spec[len(drive) :])
         if not parts or not (drive + parts[0]):
             raise ValueError(f"invalid file spec {spec!r}: host_path is required")
 
@@ -166,3 +166,13 @@ def _parse_mode(value: str) -> int:
         return int(value, 8)
     except ValueError:
         return 0
+
+
+def split_mapped_value(text: str) -> list[str]:
+    """Split a ``--file`` value on ``:`` without validation or stat.
+
+    Used by tab completion to figure out which segment is being typed
+    (host path / instance path / u/g/m tag) without raising on partial
+    or syntactically odd input.
+    """
+    return text.split(":")

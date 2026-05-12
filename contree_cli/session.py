@@ -14,6 +14,7 @@ from functools import cached_property
 from pathlib import Path, PurePosixPath
 
 CONTREE_CONCURRENCY = int(os.getenv("CONTREE_CONCURRENCY", "8"))
+CONTREE_DB_TIMEOUT = float(os.getenv("CONTREE_DB_TIMEOUT", "30"))
 
 
 @dataclass(frozen=True)
@@ -161,7 +162,7 @@ class ImageCache(MutableMapping[CacheKey, object]):
             return json.loads(
                 gzip.decompress(base64.b64decode(blob[5:])),
             )
-        # Legacy: no prefix — plain JSON (written before this change).
+        # No prefix: plain JSON payload.
         return json.loads(blob)
 
     def __getitem__(self, key: CacheKey) -> object:
@@ -216,6 +217,35 @@ class ImageCache(MutableMapping[CacheKey, object]):
         assert row is not None
         return row[0]  # type: ignore[no-any-return]
 
+    def invalidate_prefix(
+        self,
+        *,
+        image_prefix: str | None = None,
+        kind_prefix: str | None = None,
+    ) -> int:
+        """Drop cache entries by image_uuid prefix and/or kind prefix.
+
+        Returns the number of rows removed. ``image_prefix`` and
+        ``kind_prefix`` may be combined; both default to "match anything"
+        when omitted (caller must pass at least one).
+        """
+        if image_prefix is None and kind_prefix is None:
+            raise ValueError("invalidate_prefix needs image_prefix or kind_prefix")
+        clauses: list[str] = []
+        params: list[object] = []
+        if image_prefix is not None:
+            clauses.append("image_uuid LIKE ?")
+            params.append(image_prefix + "%")
+        if kind_prefix is not None:
+            clauses.append("kind LIKE ?")
+            params.append(kind_prefix + "%")
+        cur = self._conn.execute(
+            "DELETE FROM image_cache WHERE " + " AND ".join(clauses),
+            tuple(params),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
 
 class SessionStore:
     MAX_SHELL_HISTORY = 10_000
@@ -223,10 +253,15 @@ class SessionStore:
     def __init__(self, db_path: Path, session_key: str) -> None:
         self._session_key = session_key
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path), timeout=5.0)
+        self._conn = sqlite3.connect(str(db_path), timeout=CONTREE_DB_TIMEOUT)
         self._conn.row_factory = sqlite3.Row
+        # WAL: concurrent readers + one writer; safe across processes.
+        # synchronous=NORMAL: faster commits in WAL, still durable on
+        # crash; shortens write-lock hold time, reducing SQLITE_BUSY
+        # between two contree shells sharing the per-profile DB.
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute(f"PRAGMA busy_timeout={int(CONTREE_DB_TIMEOUT * 1000)}")
         self._conn.executescript(SCHEMA)
 
     @cached_property

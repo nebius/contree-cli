@@ -50,7 +50,7 @@ contree session branch experiment
 contree run -e DEBUG=1 -- ./app
 ```
 
-**Builtins** — handled locally by the shell:
+**Builtins** -- handled locally by the shell:
 
 | Builtin | Description |
 |---------|-------------|
@@ -59,6 +59,7 @@ contree run -e DEBUG=1 -- ./app
 | `history [N]` | Show command history (optional limit) |
 | `help [TOPIC]` | Show help (optionally for a specific command) |
 | `clear` | Clear the terminal screen |
+| `timeout DURATION CMD...` | Run `CMD...` with the API operation timeout set to `DURATION` |
 | `--format NAME` / `-f NAME` | Change output format (or show current if no argument) |
 | `exit` / `quit` | Exit the shell (also Ctrl-D) |
 
@@ -77,6 +78,61 @@ contree run -e DEBUG=1 -- ./app
 `ls` and `cat` aliases fall back to running inside the sandbox when pending
 files exist or when args contain flags or glob characters.
 :::
+
+## Implicit run: shell-expression passthrough
+
+Bare commands are forwarded to the sandbox as a single shell expression with
+`shell=True`. The entire input line is sent verbatim to the remote `sh -c`,
+so operators like `|`, `;`, `&&`, `||`, `>`, `<` are interpreted by the
+remote shell exactly as typed:
+
+```text
+contree:/> mount | grep cgroup
+contree:/> echo 1 ; echo 2
+contree:/> apt-get update && apt-get install -y curl
+contree:/> uname -a > /tmp/info.txt
+```
+
+There is no local tokenize/rejoin step, so quoting is preserved:
+
+```text
+contree:/> python3 -c "print('hello world')"
+```
+
+## `timeout` builtin
+
+The shell recognises `timeout DURATION CMD...` and sets the server-side
+operation timeout to `DURATION` instead of running the GNU `timeout` binary
+inside the sandbox. The kill is enforced by the API, not by a wrapper
+process, so the operation surfaces a warning when the limit is hit:
+
+```text
+contree:/> timeout 30 apk add gcc
+contree:/> timeout 5m make build
+contree:/> timeout 1h python long_train.py
+```
+
+`DURATION` is an integer or decimal optionally followed by a unit suffix:
+
+| Suffix | Meaning |
+|--------|---------|
+| (none) | Seconds |
+| `s` | Seconds |
+| `m` | Minutes |
+| `h` | Hours |
+| `d` | Days |
+
+If `DURATION` is not a valid spec (for example `timeout --kill-after=5 30 cmd`
+or `timeout --help`), the shell falls through and sends the line to the
+sandbox unchanged, so the in-image `timeout` binary still handles advanced
+flags.
+
+When the limit is hit, the response carries `state.timed_out=true` and the
+shell logs:
+
+```text
+WARNING: Operation <uuid> timed out after 30s
+```
 
 ## Tab completion
 
@@ -129,8 +185,9 @@ preserving the newline inside the quoted string.
   sandbox (works for remote commands, not for contree output).
 - **No job control**: No `&`, `bg`, `fg`, or Ctrl-Z. Use `contree run -d`
   for background tasks.
-- **Bare commands use defaults**: No way to pass `--timeout`, `--env`, or
-  `--file` without the explicit `contree run` prefix.
+- **Bare commands use defaults**: `--env`, `--file`, `--disposable`, and
+  `--detach` require the explicit `contree run` prefix. The operation
+  timeout has a shorthand: `timeout DURATION CMD...` (see above).
 - **No `~` or glob expansion**: Passed as-is to the sandbox.
 - **Cannot nest shells**: Running `contree shell` inside a shell is not
   supported.

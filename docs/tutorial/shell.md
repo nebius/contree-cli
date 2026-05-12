@@ -39,11 +39,23 @@ contree:/> apt-get install -y curl
 contree:/> curl https://example.com
 ```
 
-Each command is an implicit `contree run` with `shell=True` -- pipes,
-redirects, and `&&` chains all work:
+Each command is an implicit `contree run` with `shell=True`. The whole
+input line is forwarded verbatim to the remote `sh -c`, so pipes,
+redirects, `;`, `&&`, and `||` are interpreted by the sandbox shell
+exactly as typed:
 
 ```text
 contree:/> echo hello && ls / | head -5
+contree:/> mount | grep cgroup
+contree:/> echo 1 ; echo 2
+contree:/> uname -a > /tmp/info.txt
+```
+
+Quoting from your local prompt is also preserved through to the remote
+shell:
+
+```text
+contree:/> python3 -c "print('hello world')"
 ```
 
 You can also use the explicit form, which is equivalent:
@@ -269,6 +281,30 @@ Clear the terminal screen:
 contree:/> clear
 ```
 
+### `timeout`
+
+Run a command with a server-enforced operation timeout. Mirrors the GNU
+`timeout` convention but sets `payload.timeout` on the API request instead
+of spawning a local wrapper inside the sandbox:
+
+```text
+contree:/> timeout 30 apk add gcc
+contree:/> timeout 5m make build
+contree:/> timeout 1h python long_train.py
+```
+
+`DURATION` accepts a bare integer or decimal (seconds by default) and
+the suffixes `s`, `m`, `h`, `d`. When the value cannot be parsed, the
+shell forwards the line untouched so the in-image `timeout` binary still
+handles advanced flags like `--kill-after` or `-s SIGTERM`.
+
+When the limit fires, the API returns `state.timed_out=true` (status may
+still be `SUCCESS` with `signal=9`), and the shell logs:
+
+```text
+WARNING: Operation <uuid> timed out after 30s
+```
+
 ### `--format` / `-f`
 
 Change the output format mid-session, or show the current format:
@@ -306,8 +342,9 @@ contree:/app> contree tag UUID my-app:v1
   not interpreted locally.
 - **No job control** -- no `&`, `bg`, `fg`, or Ctrl-Z. Use `contree run -d`
   for detached execution.
-- **Bare commands use defaults** -- you cannot pass `--timeout`, `--env`,
-  `--file`, or `--disposable` without the explicit `contree run` prefix.
+- **Bare commands use defaults** -- you cannot pass `--env`, `--file`, or
+  `--disposable` without the explicit `contree run` prefix. The operation
+  timeout has a shell shortcut: `timeout DURATION CMD...` (see above).
 - **No `~` or glob expansion** -- these tokens are passed as-is to the
   sandbox.
 - **Image list cache** -- newly created images during a session won't appear

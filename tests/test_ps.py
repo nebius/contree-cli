@@ -93,6 +93,76 @@ class TestCmdPs:
         assert "UUID" in lines[0]
 
 
+class TestPsDynamicFields:
+    """`emit_op` propagates every scalar field the API returns."""
+
+    def test_unknown_top_level_field_appears_in_row(self, contree_client, capsys):
+        """Server-side additions (e.g. ``cost``) show up without code changes."""
+        op = _make_op(0)
+        op["cost"] = 0.0042
+        op["project_id"] = "proj-abc"
+        _run_cmd(contree_client, [op], formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["cost"] == 0.0042
+        assert parsed["project_id"] == "proj-abc"
+
+    def test_nested_dict_field_skipped(self, contree_client, capsys):
+        """Nested structures (metadata, result) are filtered out of the row."""
+        op = _make_op(0)
+        op["metadata"] = {"big": "object"}
+        op["result"] = {"image": "img-1"}
+        _run_cmd(contree_client, [op], formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out)
+        assert "metadata" not in parsed
+        assert "result" not in parsed
+        assert parsed["uuid"] == "op-0"
+
+    def test_nested_list_field_skipped(self, contree_client, capsys):
+        op = _make_op(0)
+        op["tags"] = ["a", "b", "c"]
+        _run_cmd(contree_client, [op], formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out)
+        assert "tags" not in parsed
+
+    def test_new_datetime_field_parsed(self, contree_client, capsys):
+        """``finished_at``/``updated_at`` are auto-parsed like ``created_at``."""
+        op = _make_op(0)
+        op["finished_at"] = "2025-06-01T01:00:00Z"
+        _run_cmd(contree_client, [op], formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out)
+        # JSONFormatter serialises datetimes via _json_default -> isoformat.
+        assert parsed["finished_at"].startswith("2025-06-01T01:00:00")
+
+    def test_error_is_always_last_column(self, contree_client, capsys):
+        """``error`` is pinned to the trailing position regardless of API order."""
+        # Build an op where `error` is *not* the last key in insertion order.
+        op = {
+            "uuid": "op-0",
+            "error": "boom",
+            "status": "FAILED",
+            "kind": "instance",
+            "duration": 1.0,
+            "created_at": "2025-06-01T00:00:00Z",
+        }
+        _run_cmd(contree_client, [op], formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out)
+        keys = list(parsed.keys())
+        assert keys[-1] == "error"
+        assert parsed["error"] == "boom"
+
+    def test_error_last_even_when_added_field_present(self, contree_client, capsys):
+        """A new server field appears before ``error`` in the row."""
+        op = _make_op(0, status="FAILED")
+        op["error"] = "oom"
+        op["cost"] = 0.01  # server field added after `error` in the response
+        _run_cmd(contree_client, [op], formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out)
+        keys = list(parsed.keys())
+        assert keys[-1] == "error"
+        assert "cost" in keys
+        assert keys.index("cost") < keys.index("error")
+
+
 class TestPsParams:
     def test_status_param(self, contree_client):
         _run_cmd(contree_client, [], status="FAILED")

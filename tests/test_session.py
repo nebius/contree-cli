@@ -991,3 +991,23 @@ class TestHistoryDepth:
         assert session_store.history_depth() == 2
         session_store.set_image("img-3", kind="run")
         assert session_store.history_depth() == 3
+
+
+class TestConcurrentStores:
+    def test_two_stores_on_same_db_do_not_lock(self, tmp_path: Path):
+        # Two `contree shell` tabs share one per-profile SQLite file.
+        # WAL + busy_timeout must let interleaved writes succeed.
+        db = tmp_path / "shared.db"
+        store_a = SessionStore(db, "sess-a")
+        store_b = SessionStore(db, "sess-b")
+        try:
+            for i in range(20):
+                store_a.set_image(f"img-a-{i}", kind="run")
+                store_b.set_image(f"img-b-{i}", kind="run")
+                store_a.cache[(f"img-a-{i}", "list:/etc")] = {"n": i}
+                store_b.cache[(f"img-b-{i}", "list:/etc")] = {"n": i}
+            assert store_a.history_depth() == 20
+            assert store_b.history_depth() == 20
+        finally:
+            store_a.close()
+            store_b.close()

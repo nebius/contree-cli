@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import contree_cli.arguments  # noqa: F401  populates COMMAND_REGISTRY
 import contree_cli.config as config_mod
 from contree_cli import CLIENT, PROFILE
 from contree_cli.client import ContreeClient, ContreeIAMClient

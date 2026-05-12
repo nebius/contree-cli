@@ -591,7 +591,7 @@ class TestCwdAwareCompletion:
         files = [_make_file("/etc", is_dir=True)]
         completer, _client = _path_completer(files, image_cache, cwd="/")
 
-        with patch.object(completer, "_list_dir", wraps=completer._list_dir) as spy:
+        with patch.object(completer, "list_dir", wraps=completer.list_dir) as spy:
             _complete_line(completer, "/", "ls /", begidx=3)
         spy.assert_called_once()
         queried_path = spy.call_args[0][1]
@@ -602,7 +602,7 @@ class TestCwdAwareCompletion:
         files = [_make_file("/etc/hosts")]
         completer, _client = _path_completer(files, image_cache, cwd="/tmp")
 
-        with patch.object(completer, "_list_dir", wraps=completer._list_dir) as spy:
+        with patch.object(completer, "list_dir", wraps=completer.list_dir) as spy:
             results = _complete_line(
                 completer,
                 "../etc/",
@@ -1154,3 +1154,280 @@ class TestFormatCompletion:
         assert "table" in names
         assert "tsv" in names
         assert "json" not in names
+
+
+class TestArgparseDrivenCompletion:
+    """New argparse-walker dispatch covers nested subcommand positionals."""
+
+    def test_session_delete_completes_session_keys(self, image_cache):
+        sessions = [
+            Session(
+                session_key="alpha_keep",
+                active_branch="main",
+                current_image="img-1",
+                last_kind="run",
+                last_title="t",
+                updated_at="2025-01-01",
+            ),
+            Session(
+                session_key="beta_drop",
+                active_branch="main",
+                current_image="img-2",
+                last_kind="run",
+                last_title="t",
+                updated_at="2025-01-01",
+            ),
+        ]
+        completer = _session_completer(image_cache, sessions=sessions)
+        results = _complete_line(
+            completer,
+            "",
+            "contree session delete ",
+            begidx=23,
+        )
+        assert "alpha_keep " in results
+        assert "beta_drop " in results
+
+    def test_session_show_completes_session_keys(self, image_cache):
+        sessions = [
+            Session(
+                session_key="alpha_one",
+                active_branch="main",
+                current_image="img-1",
+                last_kind="run",
+                last_title="t",
+                updated_at="2025-01-01",
+            ),
+        ]
+        completer = _session_completer(image_cache, sessions=sessions)
+        results = _complete_line(
+            completer,
+            "",
+            "contree session show ",
+            begidx=21,
+        )
+        assert "alpha_one " in results
+
+    def test_run_use_flag_value_completes_image(self, image_cache):
+        images = [_make_image("img-1", tag="ubuntu:noble")]
+        completer, _client = _image_completer(images, image_cache)
+        results = _complete_line(
+            completer,
+            "",
+            "contree run --use ",
+            begidx=18,
+        )
+        assert "tag:ubuntu:noble " in results
+        assert "img-1 " in results
+
+    def test_run_equals_form_use_flag(self, image_cache):
+        images = [_make_image("img-1", tag="ubuntu:noble")]
+        completer, _client = _image_completer(images, image_cache)
+        results = _complete_line(
+            completer,
+            "--use=tag:ub",
+            "contree run --use=tag:ub",
+            begidx=12,
+        )
+        assert "tag:ubuntu:noble " in results
+
+    def test_run_remainder_swallows_flags(self):
+        completer = _make_completer()
+        results = _complete_line(
+            completer,
+            "--",
+            "contree run -- ./script --",
+            begidx=24,
+        )
+        assert results == []
+
+    def test_run_remainder_completes_sandbox_path(self, image_cache):
+        files = [_make_file("/etc/hosts")]
+        completer, _client = _path_completer(files, image_cache)
+        results = _complete_line(
+            completer,
+            "/etc/",
+            "contree run -- /etc/",
+            begidx=15,
+        )
+        assert "/etc/hosts " in results
+
+    def test_help_topic_completes_run(self):
+        completer = _make_completer()
+        results = _complete_line(completer, "ru", "help ru", begidx=5)
+        assert "run " in results
+
+    def test_session_branch_from_completes(self, image_cache):
+        branches = [("main", True), ("feature", False)]
+        completer = _session_completer(image_cache, branches=branches)
+        results = _complete_line(
+            completer,
+            "f",
+            "contree session branch new --from f",
+            begidx=34,
+        )
+        assert "feature " in results
+
+    def test_run_cwd_flag_dirs_only(self, image_cache):
+        files = [
+            _make_file("/etc/conf.d", is_dir=True),
+            _make_file("/etc/hosts"),
+        ]
+        completer, _client = _path_completer(files, image_cache)
+        results = _complete_line(
+            completer,
+            "/etc/",
+            "contree run --cwd /etc/",
+            begidx=18,
+        )
+        assert "/etc/conf.d/" in results
+        assert "/etc/hosts " not in results
+
+    def test_help_value_excludes_after_help_flag(self):
+        completer = _make_completer()
+        results = _complete_line(
+            completer,
+            "",
+            "contree run --help ",
+            begidx=19,
+        )
+        # After --help, argparse stops. We return nothing.
+        assert results == []
+
+    def test_choices_auto_bind_via_format_flag(self):
+        # Auto-bind for actions with `choices=` works through the argparse
+        # walker (the trie path also handles --format; this exercises the
+        # walker via the contree-prefixed form).
+        completer = _make_completer()
+        results = _complete_line(
+            completer,
+            "",
+            "contree -f ",
+            begidx=11,
+        )
+        names = [r.rstrip(" ") for r in results]
+        assert "json" in names
+        assert "table" in names
+
+
+class TestMappedFileCompletion:
+    """`--file ./host:/inst` whole-token replacement completion."""
+
+    def test_initial_host_path(self, tmp_path, image_cache):
+        f = tmp_path / "Makefile"
+        f.write_text("")
+        files = [_make_file("/etc/hosts")]
+        completer, _client = _path_completer(files, image_cache)
+        results = _complete_line(
+            completer,
+            f"{tmp_path}/Make",
+            f"contree run --file {tmp_path}/Make",
+            begidx=19,
+        )
+        assert any(r.endswith("/Makefile") for r in results)
+
+    def test_after_first_colon_offers_tags(self, image_cache):
+        files = [_make_file("/etc/hosts")]
+        completer, _client = _path_completer(files, image_cache)
+        results = _complete_line(
+            completer,
+            "./Makefile:",
+            "contree run --file ./Makefile:",
+            begidx=19,
+        )
+        # Empty tail after colon offers u/g/m + /
+        assert "./Makefile:u" in results
+        assert "./Makefile:g" in results
+        assert "./Makefile:m" in results
+        assert "./Makefile:/" in results
+
+    def test_after_colon_with_slash_completes_sandbox_path(self, image_cache):
+        files = [_make_file("/etc/hosts")]
+        completer, _client = _path_completer(files, image_cache)
+        results = _complete_line(
+            completer,
+            "./Makefile:/etc/",
+            "contree run --file ./Makefile:/etc/",
+            begidx=19,
+        )
+        assert "./Makefile:/etc/hosts" in results
+
+
+class TestProfileNamespacing:
+    """Cache keys are namespaced by active profile name."""
+
+    def test_image_cache_per_profile(self, image_cache):
+        from contree_cli.shell.cache import SourceCache
+
+        cache_a = SourceCache(image_cache, "alice")
+        cache_b = SourceCache(image_cache, "bob")
+        cache_a.set(scope="", kind="images", value=[{"uuid": "x"}])
+        assert cache_a.get(scope="", kind="images", ttl=60.0) == [{"uuid": "x"}]
+        assert cache_b.get(scope="", kind="images", ttl=60.0) is None
+
+    def test_invalidate_all_only_drops_active_profile(self, image_cache):
+        from contree_cli.shell.cache import SourceCache
+
+        cache_a = SourceCache(image_cache, "alice")
+        cache_b = SourceCache(image_cache, "bob")
+        cache_a.set(scope="", kind="images", value=[1])
+        cache_b.set(scope="", kind="images", value=[2])
+        cache_a.invalidate_all()
+        assert cache_a.get(scope="", kind="images", ttl=60.0) is None
+        assert cache_b.get(scope="", kind="images", ttl=60.0) == [2]
+
+
+class TestEnvKeySource:
+    """`env -d <TAB>` completes session env keys."""
+
+    def test_env_d_completes_existing_keys(self, image_cache):
+        store = MagicMock()
+        store.cache = image_cache
+        store.get_env.return_value = {"PATH": "/usr/bin", "DEBUG": "1"}
+        completer = _make_completer(client=MagicMock(), store=store)
+        results = _complete_line(
+            completer,
+            "",
+            "contree env -d ",
+            begidx=15,
+        )
+        assert "PATH " in results
+        assert "DEBUG " in results
+
+    def test_env_no_store_returns_empty(self):
+        completer = _make_completer(client=MagicMock(), store=None)
+        results = _complete_line(
+            completer,
+            "",
+            "contree env -d ",
+            begidx=15,
+        )
+        assert results == []
+
+
+class TestSkillSpecSource:
+    """`skill remove <TAB>` completes spec prefixes and host paths."""
+
+    def test_skill_remove_offers_prefixes(self):
+        completer = _make_completer()
+        results = _complete_line(
+            completer,
+            "",
+            "contree skill remove ",
+            begidx=21,
+        )
+        assert "claude:" in results
+        assert "codex:~" in results
+        assert "claude:~" in results
+
+    def test_skill_remove_filters_by_prefix(self):
+        completer = _make_completer()
+        results = _complete_line(
+            completer,
+            "claude",
+            "contree skill remove claude",
+            begidx=21,
+        )
+        assert "claude:" in results
+        assert "claude:~" in results
+        assert "codex:~" not in results

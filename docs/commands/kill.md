@@ -29,4 +29,5 @@ interrupted.
 ## See also
 
 - {doc}`ps` -- list operations to find UUIDs
+- {doc}`operation` -- multi-UUID variant: `contree op cancel UUID1 UUID2 ...`
 - {doc}`run` -- Ctrl-C during `contree run` also cancels the operation

@@ -19,7 +19,7 @@ from contree_cli.output import (
 )
 from contree_cli.shell.completer import ShellCompleter
 from contree_cli.shell.parser import build_shell_parser
-from contree_cli.shell.repl import ContreeShell
+from contree_cli.shell.repl import ContreeShell, intercept_timeout, parse_duration
 
 
 def _make_shell() -> ContreeShell:
@@ -230,7 +230,7 @@ class TestContreeAliases:
         FORMATTER.set(formatter)
         with patch.object(shell, "dispatch_run") as mock_run:
             shell.execute("cat")
-        mock_run.assert_called_once_with(["cat"])
+        mock_run.assert_called_once_with("cat")
 
     def test_cat_with_flags_falls_back_to_run(self):
         """'cat -n /etc/hosts' should fall back to implicit run."""
@@ -239,7 +239,7 @@ class TestContreeAliases:
         FORMATTER.set(formatter)
         with patch.object(shell, "dispatch_run") as mock_run:
             shell.execute("cat -n /etc/hosts")
-        mock_run.assert_called_once_with(["cat", "-n", "/etc/hosts"])
+        mock_run.assert_called_once_with("cat -n /etc/hosts")
 
     def test_cat_with_glob_falls_back_to_run(self):
         """'cat *.py' should fall back to implicit run."""
@@ -248,7 +248,7 @@ class TestContreeAliases:
         FORMATTER.set(formatter)
         with patch.object(shell, "dispatch_run") as mock_run:
             shell.execute("cat *.py")
-        mock_run.assert_called_once_with(["cat", "*.py"])
+        mock_run.assert_called_once_with("cat *.py")
 
     def test_cat_multiple_args_falls_back_to_run(self):
         """'cat a b' should fall back to implicit run."""
@@ -257,7 +257,7 @@ class TestContreeAliases:
         FORMATTER.set(formatter)
         with patch.object(shell, "dispatch_run") as mock_run:
             shell.execute("cat a b")
-        mock_run.assert_called_once_with(["cat", "a", "b"])
+        mock_run.assert_called_once_with("cat a b")
 
     def test_ls_with_flags_falls_back_to_run(self):
         """'ls -la' should fall back to implicit run."""
@@ -266,7 +266,7 @@ class TestContreeAliases:
         FORMATTER.set(formatter)
         with patch.object(shell, "dispatch_run") as mock_run:
             shell.execute("ls -la")
-        mock_run.assert_called_once_with(["ls", "-la"])
+        mock_run.assert_called_once_with("ls -la")
 
     def test_ls_multiple_args_falls_back_to_run(self):
         """'ls /etc /tmp' should fall back to implicit run."""
@@ -275,7 +275,7 @@ class TestContreeAliases:
         FORMATTER.set(formatter)
         with patch.object(shell, "dispatch_run") as mock_run:
             shell.execute("ls /etc /tmp")
-        mock_run.assert_called_once_with(["ls", "/etc", "/tmp"])
+        mock_run.assert_called_once_with("ls /etc /tmp")
 
     # -- Pending files force run -----------------------------------------------
 
@@ -288,7 +288,7 @@ class TestContreeAliases:
             patch.object(shell, "dispatch_run") as mock_run,
         ):
             shell.execute("cat /etc/hosts")
-        mock_run.assert_called_once_with(["cat", "/etc/hosts"])
+        mock_run.assert_called_once_with("cat /etc/hosts")
 
     def test_ls_with_pending_files_falls_back_to_run(self):
         """'ls /etc' with pending files should use run."""
@@ -299,7 +299,7 @@ class TestContreeAliases:
             patch.object(shell, "dispatch_run") as mock_run,
         ):
             shell.execute("ls /etc")
-        mock_run.assert_called_once_with(["ls", "/etc"])
+        mock_run.assert_called_once_with("ls /etc")
 
     def test_cat_without_pending_files_dispatches_contree(self):
         """'cat /etc/hosts' without pending files uses contree dispatch."""
@@ -453,19 +453,19 @@ class TestImplicitRun:
         shell = _make_shell()
         with patch.object(shell, "dispatch_run") as mock:
             shell.execute("echo hello")
-        mock.assert_called_once_with(["echo", "hello"])
+        mock.assert_called_once_with("echo hello")
 
     def test_dispatch_run_constructs_run_args(self):
-        """dispatch_run should construct RunArgs with shell=True."""
+        """dispatch_run wraps the raw line as a single shell-expression arg."""
         shell = _make_shell()
         formatter = DefaultFormatter()
         FORMATTER.set(formatter)
 
         with _mock_session(), patch("contree_cli.cli.run.cmd_run") as mock_cmd:
-            shell.dispatch_run(["grep", "-r", "root", "/etc"])
+            shell.dispatch_run("grep -r root /etc")
 
         args = mock_cmd.call_args[0][0]
-        assert args.command_args == ["grep", "-r", "root", "/etc"]
+        assert args.command_args == ["grep -r root /etc"]
         assert args.shell is True
 
     def test_bare_command_api_error_caught(self, capsys):
@@ -478,7 +478,7 @@ class TestImplicitRun:
             _mock_session(),
             patch("contree_cli.cli.run.cmd_run", side_effect=ApiError(500, "err", "")),
         ):
-            shell.dispatch_run(["echo", "hello"])
+            shell.dispatch_run("echo hello")
 
         err = capsys.readouterr().err
         assert "API error" in err
@@ -493,7 +493,7 @@ class TestImplicitRun:
             _mock_session(),
             patch("contree_cli.cli.run.cmd_run", side_effect=KeyboardInterrupt),
         ):
-            shell.dispatch_run(["sleep", "100"])
+            shell.dispatch_run("sleep 100")
         # Should not raise
 
     def test_bare_command_system_exit_caught(self):
@@ -506,21 +506,146 @@ class TestImplicitRun:
             _mock_session(),
             patch("contree_cli.cli.run.cmd_run", side_effect=SystemExit(1)),
         ):
-            shell.dispatch_run(["false"])
+            shell.dispatch_run("false")
         # Should not raise
 
     def test_pipe_expression(self):
-        """A pipe expression should be passed as-is with shell=True."""
+        """Shell metacharacters like '|' are preserved (not quoted as literals).
+
+        Regression: previously the shell REPL would re-join tokens via
+        ``shlex.join`` which wrapped operators in quotes, so the pipe was
+        passed to ``mount`` as a literal arg instead of being interpreted by
+        the remote shell.
+        """
         shell = _make_shell()
         formatter = DefaultFormatter()
         FORMATTER.set(formatter)
 
         with _mock_session(), patch("contree_cli.cli.run.cmd_run") as mock_cmd:
-            shell.dispatch_run(["ls", "/etc", "|", "head"])
+            shell.execute("mount | grep cg")
 
         args = mock_cmd.call_args[0][0]
-        assert args.command_args == ["ls", "/etc", "|", "head"]
+        assert args.command_args == ["mount | grep cg"]
         assert args.shell is True
+
+    def test_redirection_expression(self):
+        """A redirection expression should be passed verbatim to sh -c."""
+        shell = _make_shell()
+        formatter = DefaultFormatter()
+        FORMATTER.set(formatter)
+
+        with _mock_session(), patch("contree_cli.cli.run.cmd_run") as mock_cmd:
+            shell.execute("echo hi > /tmp/out")
+
+        args = mock_cmd.call_args[0][0]
+        assert args.command_args == ["echo hi > /tmp/out"]
+
+    def test_semicolon_chain(self):
+        """A ';' command chain should reach sh -c unquoted."""
+        shell = _make_shell()
+        formatter = DefaultFormatter()
+        FORMATTER.set(formatter)
+
+        with _mock_session(), patch("contree_cli.cli.run.cmd_run") as mock_cmd:
+            shell.execute("echo 1 ; echo 2")
+
+        args = mock_cmd.call_args[0][0]
+        assert args.command_args == ["echo 1 ; echo 2"]
+
+
+class TestTimeoutBuiltin:
+    """``timeout DURATION CMD...`` sets the API operation timeout."""
+
+    @pytest.mark.parametrize(
+        "spec,expected",
+        [
+            ("60", 60),
+            ("30s", 30),
+            ("5m", 300),
+            ("1h", 3600),
+            ("1d", 86400),
+            ("1.5m", 90),
+        ],
+    )
+    def test_parse_duration_valid(self, spec, expected):
+        assert parse_duration(spec) == expected
+
+    @pytest.mark.parametrize(
+        "spec",
+        ["", "abc", "0", "0s", "-5", "5x", "1.2.3", "5 m"],
+    )
+    def test_parse_duration_invalid(self, spec):
+        assert parse_duration(spec) is None
+
+    def test_intercept_basic(self):
+        result = intercept_timeout("timeout 60 apk add docker")
+        assert result == (60, "apk add docker")
+
+    def test_intercept_suffix(self):
+        result = intercept_timeout("timeout 5m make build")
+        assert result == (300, "make build")
+
+    def test_intercept_preserves_internal_quoting(self):
+        """Remainder keeps original quoting so sh -c parses it identically."""
+        result = intercept_timeout('timeout 30 sh -c "echo 1 ; echo 2"')
+        assert result == (30, 'sh -c "echo 1 ; echo 2"')
+
+    def test_intercept_rejects_unparseable_duration(self):
+        """Falls through when the duration is not a valid spec."""
+        assert intercept_timeout("timeout --help") is None
+        assert intercept_timeout("timeout -k 5 30 cmd") is None
+        assert intercept_timeout("timeout abc cmd") is None
+
+    def test_intercept_requires_command(self):
+        """No command after the duration → no interception."""
+        assert intercept_timeout("timeout 60") is None
+
+    def test_intercept_only_for_first_token(self):
+        """``timeout`` mid-line must not be intercepted."""
+        assert intercept_timeout("echo timeout 60 hi") is None
+
+    def test_execute_sets_operation_timeout(self):
+        """``timeout 90 long-build`` sets payload timeout to 90s."""
+        shell = _make_shell()
+        formatter = DefaultFormatter()
+        FORMATTER.set(formatter)
+
+        with _mock_session(), patch("contree_cli.cli.run.cmd_run") as mock_cmd:
+            shell.execute("timeout 90 long-build")
+
+        args = mock_cmd.call_args[0][0]
+        assert args.timeout == 90
+        assert args.command_args == ["long-build"]
+        assert args.shell is True
+
+    def test_execute_suffix_units(self):
+        shell = _make_shell()
+        formatter = DefaultFormatter()
+        FORMATTER.set(formatter)
+
+        with _mock_session(), patch("contree_cli.cli.run.cmd_run") as mock_cmd:
+            shell.execute("timeout 2m apk add docker")
+
+        args = mock_cmd.call_args[0][0]
+        assert args.timeout == 120
+        assert args.command_args == ["apk add docker"]
+
+    def test_execute_falls_through_when_unparseable(self):
+        """Unrecognised duration → run ``timeout`` as a normal shell command.
+
+        Lets the user reach the in-image ``timeout`` binary for advanced
+        usages (e.g. ``--kill-after``, signal flags) that we don't translate.
+        """
+        shell = _make_shell()
+        formatter = DefaultFormatter()
+        FORMATTER.set(formatter)
+
+        with _mock_session(), patch("contree_cli.cli.run.cmd_run") as mock_cmd:
+            shell.execute("timeout --help")
+
+        args = mock_cmd.call_args[0][0]
+        assert args.timeout is None
+        assert args.command_args == ["timeout --help"]
 
 
 class TestRun:
@@ -898,7 +1023,7 @@ class TestDispatchRunExceptionLogging:
                 "contree_cli.cli.run.cmd_run", side_effect=RuntimeError("unexpected")
             ),
         ):
-            shell.dispatch_run(["echo", "hello"])
+            shell.dispatch_run("echo hello")
         # Should not raise -- error is logged
 
     def test_dispatch_contree_general_exception_logged(self, capsys):

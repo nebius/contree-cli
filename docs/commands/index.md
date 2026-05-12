@@ -14,6 +14,7 @@ tag
 ps
 kill
 show
+operation
 ls
 cat
 cp

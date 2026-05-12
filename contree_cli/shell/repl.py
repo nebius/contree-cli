@@ -9,10 +9,11 @@ import shlex
 import sys
 from functools import cached_property
 
-from contree_cli import FORMATTER, IN_SHELL, SESSION_STORE, ArgumentsProtocol
+from contree_cli import FORMATTER, IN_SHELL, PROFILE, SESSION_STORE, ArgumentsProtocol
 from contree_cli.client import ApiError
 from contree_cli.output import FORMATTERS, OutputFormatter
 from contree_cli.session import SessionStore
+from contree_cli.shell.cache import SourceCache
 from contree_cli.shell.completer import ShellCompleter
 from contree_cli.shell.parser import ShellArgumentParser, ShellParseError
 from contree_cli.types import Colors
@@ -49,6 +50,46 @@ def _readline_safe_prompt(prompt: str) -> str:
     if LIBEDIT:
         return ANSI_RE.sub("", prompt)
     return ANSI_RE.sub(lambda m: "\x01" + m.group() + "\x02", prompt)
+
+
+DURATION_RE = re.compile(r"\A(\d+(?:\.\d+)?)([smhd]?)\Z")
+DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(text: str) -> int | None:
+    """Parse a ``timeout`` duration spec like ``60``, ``30s``, ``5m``, ``1h``.
+
+    Returns the duration in whole seconds, or ``None`` if *text* is not a
+    valid spec (in which case the caller should fall through and treat the
+    user input as a regular command line).
+    """
+    match = DURATION_RE.match(text)
+    if match is None:
+        return None
+    value = float(match.group(1))
+    multiplier = DURATION_UNITS[match.group(2)]
+    seconds = int(value * multiplier)
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def intercept_timeout(line: str) -> tuple[int, str] | None:
+    """Detect ``timeout DURATION COMMAND...`` and split off the duration.
+
+    Returns ``(seconds, remainder_line)`` when *line* starts with the
+    ``timeout`` builtin followed by a parseable duration and at least one
+    further token; ``None`` otherwise. Whitespace and quoting in the
+    remainder are preserved verbatim so ``sh -c`` sees the same expression
+    the user typed.
+    """
+    parts = line.split(None, 2)
+    if len(parts) < 3 or parts[0] != "timeout":
+        return None
+    seconds = parse_duration(parts[1])
+    if seconds is None:
+        return None
+    return seconds, parts[2]
 
 
 # Bare names that are forwarded as contree management commands.
@@ -91,6 +132,20 @@ _BUILTIN_HELP: dict[str, str] = {
         "  help run     help for the run command"
     ),
     "clear": "Usage: clear\n\nClear the terminal screen.",
+    "timeout": (
+        "Usage: timeout DURATION COMMAND...\n"
+        "\n"
+        "Run COMMAND in the sandbox with the API operation timeout set\n"
+        "to DURATION. Mirrors the convention of the GNU 'timeout'\n"
+        "binary but enforces the limit server-side instead of spawning\n"
+        "a local one.\n"
+        "\n"
+        "DURATION is an integer or float, optionally followed by a\n"
+        "unit suffix: s (seconds, default), m (minutes), h (hours),\n"
+        "d (days). When DURATION cannot be parsed, the line is sent to\n"
+        "the sandbox unmodified so the in-image 'timeout' binary still\n"
+        "works for advanced cases (signals, --kill-after, etc)."
+    ),
     "exit": "Usage: exit | quit\n\nExit the interactive shell (Ctrl-D also works).",
     "--format": (
         "Usage: --format [NAME] | -f [NAME]\n"
@@ -303,13 +358,74 @@ class ContreeShell:
                     resolved = [cmd] + [self.resolve_path(a) for a in args]
                     self.dispatch_contree(resolved)
                 else:
-                    self.dispatch_run(tokens)
+                    self.dispatch_run(line)
             case "vim" | "vi" | "nvim" | "nano":
                 self.dispatch_edit(cmd, tokens[1:])
             case "contree":
                 self.dispatch_contree(tokens[1:])
+            case "timeout":
+                intercepted = intercept_timeout(line)
+                if intercepted is None:
+                    self.dispatch_run(line)
+                else:
+                    seconds, remainder = intercepted
+                    self.dispatch_run(remainder, timeout=seconds)
             case _:
-                self.dispatch_run(tokens)
+                self.dispatch_run(line)
+
+    def session_snapshot(self) -> tuple[str, str, str, str]:
+        """Capture the state we watch for completion-cache invalidation."""
+        try:
+            profile = PROFILE.get().name
+        except LookupError:
+            profile = "default"
+        try:
+            session = self.session_store.session
+        except (LookupError, Exception):
+            session = None
+        if session is None:
+            return profile, self.session_store.session_key, "", ""
+        return (
+            profile,
+            session.session_key,
+            session.current_image,
+            session.active_branch,
+        )
+
+    def invalidate_completion_cache(
+        self,
+        before: tuple[str, str, str, str],
+        after: tuple[str, str, str, str],
+    ) -> None:
+        """Bust completion caches when watched session state changed."""
+        profile_before, key_before, image_before, branch_before = before
+        profile_after, key_after, image_after, branch_after = after
+        try:
+            cache = SourceCache(self.session_store.cache, profile_after)
+        except (LookupError, Exception):
+            return
+
+        if profile_before != profile_after:
+            cache.invalidate_all()
+            with contextlib.suppress(Exception):
+                SourceCache(
+                    self.session_store.cache,
+                    profile_before,
+                ).invalidate_all()
+            return
+
+        if key_before != key_after:
+            cache.invalidate_kind_prefix("")
+            return
+
+        if image_before != image_after:
+            cache.invalidate("", "images")
+            cache.invalidate_scope(image_before)
+            cache.invalidate_scope(image_after)
+            cache.invalidate("", "operations")
+
+        if branch_before != branch_after:
+            cache.invalidate_kind_prefix("branches")
 
     def dispatch_contree(self, tokens: list[str]) -> None:
         """Dispatch a contree management command via argparse."""
@@ -348,6 +464,7 @@ class ContreeShell:
 
         formatter = FORMATTER.get()
 
+        before = self.session_snapshot()
         try:
             handler(loader.from_args(ns))
         except ApiError as exc:
@@ -363,14 +480,30 @@ class ContreeShell:
             formatter.flush()
             if fmt_token is not None:
                 FORMATTER.reset(fmt_token)
+            self.invalidate_completion_cache(before, self.session_snapshot())
 
-    def dispatch_run(self, tokens: list[str]) -> None:
-        """Dispatch tokens as an implicit ``run`` in the sandbox."""
+    def dispatch_run(self, line: str, *, timeout: int | None = None) -> None:
+        """Dispatch a raw input line as an implicit ``run`` in the sandbox.
+
+        The line is forwarded verbatim as a single shell expression so the
+        remote ``sh -c`` sees operators like ``|``, ``;``, ``&&`` as the
+        user typed them, rather than as quoted literal tokens.
+
+        ``timeout`` overrides the API operation timeout. When ``None`` the
+        server falls back to its default. Set explicitly by the ``timeout``
+        shell builtin (``timeout 60 long-build``).
+        """
         from contree_cli.cli.run import RunArgs, cmd_run
 
-        args = RunArgs(command_args=tokens, shell=True, cwd=self.cwd)
+        args = RunArgs(
+            command_args=[line],
+            shell=True,
+            cwd=self.cwd,
+            timeout=timeout,
+        )
         formatter = FORMATTER.get()
 
+        before = self.session_snapshot()
         try:
             cmd_run(args)
         except ApiError as exc:
@@ -383,6 +516,7 @@ class ContreeShell:
             log.error("Command failed: %s", exc, exc_info=True)
         finally:
             formatter.flush()
+            self.invalidate_completion_cache(before, self.session_snapshot())
 
     def dispatch_edit(self, editor: str, args: list[str]) -> None:
         """Open a sandbox file in a host editor via ``file edit``."""
