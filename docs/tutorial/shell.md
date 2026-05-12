@@ -249,15 +249,18 @@ contree:/app> pwd
 
 ### `history`
 
-Show command history for the current session:
+Show command history for the current session, optionally filtered by a
+case-insensitive substring:
 
 ```text
-contree:/> history       # show all
-contree:/> history 20    # show last 20 entries
+contree:/> history                 # show all entries
+contree:/> history apt             # only lines containing "apt"
+contree:/> history 'contree '      # quoted match (note trailing space)
 ```
 
 History is persisted in SQLite per session (up to 10,000 lines) and
-restored when you re-enter the shell.
+restored when you re-enter the shell. Search is scoped to the current
+session key; different sessions have isolated history.
 
 ### `help`
 

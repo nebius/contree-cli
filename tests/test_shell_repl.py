@@ -106,7 +106,7 @@ class TestExecute:
 
         # Patch the parser to use our fake handler
         with patch.object(
-            shell._parser,
+            shell.parser,
             "parse_args",
         ) as mock_parse:
             ns = MagicMock()
@@ -126,7 +126,7 @@ class TestExecute:
         formatter = DefaultFormatter()
         FORMATTER.set(formatter)
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.handler = MagicMock(side_effect=ApiError(404, "Not Found", "gone"))
             ns.load_args = MagicMock()
@@ -144,7 +144,7 @@ class TestExecute:
         formatter = DefaultFormatter()
         FORMATTER.set(formatter)
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.handler = MagicMock(side_effect=KeyboardInterrupt)
             ns.load_args = MagicMock()
@@ -160,7 +160,7 @@ class TestExecute:
         formatter = DefaultFormatter()
         FORMATTER.set(formatter)
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.handler = MagicMock(side_effect=SystemExit(1))
             ns.load_args = MagicMock()
@@ -685,7 +685,7 @@ class TestFormatOverride:
         def fake_handler(args):
             captured_formatter["type"] = type(FORMATTER.get())
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.handler = fake_handler
             ns.load_args = MagicMock()
@@ -702,7 +702,7 @@ class TestFormatOverride:
         original = DefaultFormatter()
         FORMATTER.set(original)
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.handler = MagicMock()
             ns.load_args = MagicMock()
@@ -719,7 +719,7 @@ class TestFormatOverride:
         original = DefaultFormatter()
         FORMATTER.set(original)
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.handler = MagicMock(side_effect=ApiError(500, "err", ""))
             ns.load_args = MagicMock()
@@ -736,7 +736,7 @@ class TestFormatOverride:
         original = DefaultFormatter()
         FORMATTER.set(original)
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.handler = MagicMock()
             ns.load_args = MagicMock()
@@ -776,7 +776,7 @@ class TestHelpBuiltin:
         shell = _make_shell()
         shell.execute("help history")
         out = capsys.readouterr().out
-        assert "Usage: history" in out
+        assert "usage: history" in out.lower()
 
     def test_help_clear_prints_builtin(self, capsys):
         shell = _make_shell()
@@ -851,7 +851,7 @@ class TestHelpBuiltin:
         shell = _make_shell()
         shell.execute("help help")
         out = capsys.readouterr().out
-        assert "Usage: help" in out
+        assert "usage: help" in out.lower()
 
 
 class TestFormatCommand:
@@ -954,21 +954,90 @@ class TestHistoryBuiltin:
         assert "ls /etc" in out
         assert "cat /etc/hosts" in out
 
-    def test_history_with_count_limit(self, capsys):
+    def test_history_filters_by_substring(self, capsys):
+        """``history PATTERN`` keeps only lines containing PATTERN."""
         shell = _make_shell()
         with _mock_session() as store:
             store.load_shell_history.return_value = [
-                "cmd-1",
-                "cmd-2",
-                "cmd-3",
-                "cmd-4",
-                "cmd-5",
+                "apt-get update",
+                "ls /etc",
+                "apt-get install curl",
+                "cat /etc/hosts",
             ]
-            shell.execute("history 2")
+            shell.execute("history apt")
         out = capsys.readouterr().out
-        assert "cmd-4" in out
-        assert "cmd-5" in out
-        assert "cmd-1" not in out
+        assert "apt-get update" in out
+        assert "apt-get install curl" in out
+        assert "ls /etc" not in out
+        assert "cat /etc/hosts" not in out
+
+    def test_history_filter_is_case_insensitive(self, capsys):
+        shell = _make_shell()
+        with _mock_session() as store:
+            store.load_shell_history.return_value = ["LS /etc", "ls /tmp"]
+            shell.execute("history LS")
+        out = capsys.readouterr().out
+        assert "LS /etc" in out
+        assert "ls /tmp" in out
+
+    def test_history_quoted_pattern_with_space(self, capsys):
+        """A quoted pattern with a trailing space matches `contree ` literally."""
+        shell = _make_shell()
+        with _mock_session() as store:
+            store.load_shell_history.return_value = [
+                "contree show UUID",
+                "contree-helper foo",
+                "apt install contree",
+                "contree run -- make",
+            ]
+            shell.execute("history 'contree '")
+        out = capsys.readouterr().out
+        assert "contree show UUID" in out
+        assert "contree run -- make" in out
+        # Trailing space excludes `contree-helper` (no space after contree)
+        assert "contree-helper foo" not in out
+        # And `apt install contree` (contree without trailing space inside line)
+        assert "apt install contree" not in out
+
+    def test_history_no_matches_message(self, capsys):
+        shell = _make_shell()
+        with _mock_session() as store:
+            store.load_shell_history.return_value = ["ls /etc", "cat /etc/hosts"]
+            shell.execute("history xyzzy")
+        out = capsys.readouterr().out
+        assert "no matches" in out
+        assert "xyzzy" in out
+
+
+class TestArgparseBuiltins:
+    """history and help are backed by ShellArgumentParser."""
+
+    def test_history_dash_h_prints_usage(self, capsys):
+        shell = _make_shell()
+        shell.execute("history --help")
+        out = capsys.readouterr().out
+        assert "usage: history" in out.lower()
+        assert "PATTERN" in out
+
+    def test_history_unknown_flag_prints_error(self, capsys):
+        shell = _make_shell()
+        shell.execute("history --bogus")
+        err = capsys.readouterr().err
+        assert "history:" in err
+
+    def test_help_dash_h_prints_usage(self, capsys):
+        shell = _make_shell()
+        shell.execute("help --help")
+        out = capsys.readouterr().out
+        assert "usage: help" in out.lower()
+        assert "TOPIC" in out
+
+    def test_help_with_flag_like_topic_resolves(self, capsys):
+        """``help -f`` reaches BUILTIN_HELP via the HELP_ALIASES table."""
+        shell = _make_shell()
+        shell.execute("help -f")
+        out = capsys.readouterr().out
+        assert "--format" in out
 
 
 class TestShellPrevention:
@@ -977,7 +1046,7 @@ class TestShellPrevention:
         formatter = DefaultFormatter()
         FORMATTER.set(formatter)
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.command = "shell"
             ns.handler = MagicMock()
@@ -1031,7 +1100,7 @@ class TestDispatchRunExceptionLogging:
         formatter = DefaultFormatter()
         FORMATTER.set(formatter)
 
-        with patch.object(shell._parser, "parse_args") as mock_parse:
+        with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
             ns.command = "ls"
             ns.handler = MagicMock(side_effect=RuntimeError("oops"))
@@ -1065,40 +1134,40 @@ class TestNvimAlias:
 
 class TestReadContinuation:
     def test_complete_line_returns_unchanged(self):
-        result = ContreeShell._read_continuation("ls /etc")
+        result = ContreeShell.read_continuation("ls /etc")
         assert result == "ls /etc"
 
     def test_trailing_backslash_joins_lines(self):
         with patch("builtins.input", return_value="/etc"):
-            result = ContreeShell._read_continuation("ls \\")
+            result = ContreeShell.read_continuation("ls \\")
         # backslash-newline removed, space before \ provides separation
         assert result == "ls /etc"
 
     def test_unclosed_quote_preserves_newline(self):
         with patch("builtins.input", return_value='world"'):
-            result = ContreeShell._read_continuation('echo "hello')
+            result = ContreeShell.read_continuation('echo "hello')
         # bare newline inside quotes is preserved (no preceding \)
         assert result == 'echo "hello\nworld"'
 
     def test_ctrl_c_cancels_continuation(self):
         with patch("builtins.input", side_effect=KeyboardInterrupt):
-            result = ContreeShell._read_continuation("ls \\")
+            result = ContreeShell.read_continuation("ls \\")
         assert result == ""
 
     def test_ctrl_d_cancels_continuation(self):
         with patch("builtins.input", side_effect=EOFError):
-            result = ContreeShell._read_continuation("ls \\")
+            result = ContreeShell.read_continuation("ls \\")
         assert result == ""
 
     def test_multi_line_continuation(self):
         inputs = iter(["/a \\", "/b"])
         with patch("builtins.input", side_effect=inputs):
-            result = ContreeShell._read_continuation("ls \\")
+            result = ContreeShell.read_continuation("ls \\")
         assert result == "ls /a /b"
 
     def test_continuation_produces_correct_tokens(self):
         with patch("builtins.input", side_effect=["-alh \\", "/sys"]):
-            result = ContreeShell._read_continuation("ls \\")
+            result = ContreeShell.read_continuation("ls \\")
         import shlex
 
         assert shlex.split(result) == ["ls", "-alh", "/sys"]

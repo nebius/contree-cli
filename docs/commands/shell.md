@@ -56,7 +56,7 @@ contree run -e DEBUG=1 -- ./app
 |---------|-------------|
 | `cd [PATH]` | Change working directory (`cd -` for previous) |
 | `pwd` | Print working directory |
-| `history [N]` | Show command history (optional limit) |
+| `history [SEARCH]` | Show command history, optionally filtered by substring |
 | `help [TOPIC]` | Show help (optionally for a specific command) |
 | `clear` | Clear the terminal screen |
 | `timeout DURATION CMD...` | Run `CMD...` with the API operation timeout set to `DURATION` |
@@ -161,6 +161,21 @@ except bare (implicit run) commands. Press Tab to complete:
 Path completions query the sandbox filesystem via the inspect API
 and are cached persistently -- subsequent completions for the same
 directory are instant.
+
+## History search
+
+The `history` builtin takes an optional pattern and filters the
+persisted history by case-insensitive substring:
+
+```text
+contree:/> history                 # show every entry for this session
+contree:/> history apt             # any line containing "apt"
+contree:/> history 'contree '      # exact "contree " (with trailing space)
+contree:/> history make            # any line containing "make"
+```
+
+History is per-session: searches see only the current `session_key`'s
+entries. Up to 10,000 lines are kept; older lines are trimmed on save.
 
 ## Line continuation
 

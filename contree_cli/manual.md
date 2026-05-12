@@ -62,10 +62,11 @@ Interactive shell
 
 Inside the shell:
   - Bare commands run in the sandbox (implicit contree run)
-  - ls / cat use the API — no VM spawned
+  - ls / cat use the API, no VM spawned
   - vim / nano open contree file edit with your host editor
   - cd changes session working directory
   - Tab completes commands, paths, images, branches
+  - 'history [SEARCH]' filters persisted history by substring
   - Use 'contree run' prefix for flags like -D, -e, --file
 
 More: contree shell --help

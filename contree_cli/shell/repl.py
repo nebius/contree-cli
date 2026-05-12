@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import logging
 import re
 import shlex
 import sys
+from dataclasses import dataclass
 from functools import cached_property
 
 from contree_cli import FORMATTER, IN_SHELL, PROFILE, SESSION_STORE, ArgumentsProtocol
@@ -19,8 +21,6 @@ from contree_cli.shell.parser import ShellArgumentParser, ShellParseError
 from contree_cli.types import Colors
 
 log = logging.getLogger(__name__)
-
-_PROMPT_BASE = "contree"
 
 # Regex matching ANSI escape sequences (CSI and OSC).
 ANSI_RE = re.compile(r"(\033\[[0-9;]*m)")
@@ -39,7 +39,7 @@ except ImportError:
     LIBEDIT = False
 
 
-def _readline_safe_prompt(prompt: str) -> str:
+def readline_safe_prompt(prompt: str) -> str:
     """Make *prompt* safe for readline cursor-position tracking.
 
     GNU readline recognises ``\\x01``/``\\x02`` markers around invisible
@@ -99,14 +99,80 @@ CONTREE_ALIASES = frozenset({"ls", "cat"})
 EDITOR_ALIASES = frozenset({"vim", "vi", "nvim", "nano"})
 
 # Aliases for ``help <topic>`` lookup.
-_HELP_ALIASES: dict[str, str] = {
+HELP_ALIASES: dict[str, str] = {
     "quit": "exit",
     "-f": "--format",
     "vi": "vim",
 }
 
+
+HISTORY_PARSER = ShellArgumentParser(
+    prog="history",
+    description=(
+        "Show command history for the current session, "
+        "optionally filtered by a case-insensitive substring."
+    ),
+)
+HISTORY_PARSER.add_argument(
+    "search",
+    nargs="?",
+    default=None,
+    metavar="PATTERN",
+    help="Case-insensitive substring; only matching lines are shown",
+)
+
+
+HELP_PARSER = ShellArgumentParser(
+    prog="help",
+    description=(
+        "Show general shell help, or detailed help for a builtin, "
+        "alias, or contree command."
+    ),
+)
+HELP_PARSER.add_argument(
+    "topic",
+    nargs="?",
+    default=None,
+    metavar="TOPIC",
+    help="Builtin, alias, or contree command name",
+)
+
+
+@dataclass(frozen=True)
+class HistoryArgs:
+    search: str | None
+
+
+@dataclass(frozen=True)
+class HelpArgs:
+    topic: str | None
+
+
+def get_help(parser: ShellArgumentParser) -> str:
+    """Return *parser*'s formatted help text (trailing newline stripped)."""
+    return parser.format_help().rstrip()
+
+
+def parse_builtin(
+    parser: ShellArgumentParser,
+    tokens: list[str],
+) -> argparse.Namespace | None:
+    """Run *parser* on *tokens*. Return ``None`` when callers should stop.
+
+    ``ShellParseError`` with ``status == 0`` means argparse already
+    printed ``--help`` output to stdout; callers stop. A non-zero status
+    means an actual parse error: the message is forwarded to stderr.
+    """
+    try:
+        return parser.parse_args(tokens)
+    except ShellParseError as exc:
+        if exc.status != 0 and exc.message:
+            print(f"{parser.prog}: {exc.message}", file=sys.stderr)
+        return None
+
+
 # Per-builtin help text shown by ``help <topic>``.
-_BUILTIN_HELP: dict[str, str] = {
+BUILTIN_HELP: dict[str, str] = {
     "cd": (
         "Usage: cd [PATH]\n"
         "\n"
@@ -117,20 +183,8 @@ _BUILTIN_HELP: dict[str, str] = {
         "  cd          reset to sandbox default"
     ),
     "pwd": "Usage: pwd\n\nPrint the current working directory.",
-    "history": (
-        "Usage: history [N]\n"
-        "\n"
-        "Show command history for the current session.\n"
-        "Optional argument N limits output to the last N entries."
-    ),
-    "help": (
-        "Usage: help [TOPIC]\n"
-        "\n"
-        "Show general shell help, or help for a specific command.\n"
-        "  help         general shell help\n"
-        "  help cd      help for the cd builtin\n"
-        "  help run     help for the run command"
-    ),
+    "history": get_help(HISTORY_PARSER),
+    "help": get_help(HELP_PARSER),
     "clear": "Usage: clear\n\nClear the terminal screen.",
     "timeout": (
         "Usage: timeout DURATION COMMAND...\n"
@@ -201,9 +255,9 @@ class ContreeShell:
         parser: ShellArgumentParser,
         completer: ShellCompleter,
     ) -> None:
-        self._parser = parser
-        self._completer = completer
-        self.__prev_cwd = "/"
+        self.parser = parser
+        self.completer = completer
+        self.prev_cwd = "/"
 
     @property
     def cwd(self) -> str:
@@ -211,12 +265,8 @@ class ContreeShell:
 
     @cwd.setter
     def cwd(self, value: str) -> None:
-        self.__prev_cwd = self.cwd
+        self.prev_cwd = self.cwd
         self.session_store.set_cwd(value)
-
-    @property
-    def prev_cwd(self) -> str:
-        return self.__prev_cwd
 
     @cached_property
     def session_store(self) -> SessionStore:
@@ -251,8 +301,8 @@ class ContreeShell:
         print(line, file=sys.stderr)
 
     @property
-    def _prompt(self) -> str:
-        """Short input prompt — only cwd and branch, no ANSI length issues."""
+    def prompt(self) -> str:
+        """Short input prompt: cwd and branch on the active line."""
         branch = ""
         try:
             session = self.session_store.session
@@ -268,7 +318,7 @@ class ContreeShell:
         token = IN_SHELL.set(True)
 
         if READLINE_AVAILABLE:
-            readline.set_completer(self._completer.complete)
+            readline.set_completer(self.completer.complete)
             readline.set_completer_delims(" \t\n")
 
         print("contree interactive shell (type 'help' for commands, Ctrl-D to exit)")
@@ -276,7 +326,7 @@ class ContreeShell:
             while True:
                 try:
                     self.print_status_line()
-                    line = input(_readline_safe_prompt(self._prompt))
+                    line = input(readline_safe_prompt(self.prompt))
                 except KeyboardInterrupt:
                     # Ctrl-C on empty prompt — print newline, continue
                     print()
@@ -285,7 +335,7 @@ class ContreeShell:
                 if not line:
                     continue
                 # Handle line continuation (trailing \ or unclosed quotes)
-                line = self._read_continuation(line)
+                line = self.read_continuation(line)
                 if not line:
                     continue
                 self.execute(line)
@@ -296,7 +346,7 @@ class ContreeShell:
             IN_SHELL.reset(token)
 
     @staticmethod
-    def _read_continuation(line: str) -> str:
+    def read_continuation(line: str) -> str:
         """Prompt for continuation lines when input is incomplete.
 
         Handles trailing backslash (line continuation) and unclosed
@@ -315,7 +365,7 @@ class ContreeShell:
             except ValueError:
                 pass
             try:
-                continuation = input(_readline_safe_prompt("> "))
+                continuation = input(readline_safe_prompt("> "))
             except KeyboardInterrupt:
                 print()
                 return ""
@@ -430,7 +480,7 @@ class ContreeShell:
     def dispatch_contree(self, tokens: list[str]) -> None:
         """Dispatch a contree management command via argparse."""
         try:
-            ns = self._parser.parse_args(tokens)
+            ns = self.parser.parse_args(tokens)
         except ShellParseError as exc:
             # status=0 means --help was triggered (already printed)
             if exc.status == 0:
@@ -573,8 +623,13 @@ class ContreeShell:
             return
         self.cwd = self.session_store.resolve_path(target)
 
-    def handle_history(self, args: list[str]) -> None:
-        """Print shell history from the session database."""
+    def handle_history(self, tokens: list[str]) -> None:
+        """Print shell history, optionally filtered by case-insensitive substring."""
+        ns = parse_builtin(HISTORY_PARSER, tokens)
+        if ns is None:
+            return
+        args = HistoryArgs(search=ns.search)
+
         try:
             lines = self.session_store.load_shell_history()
         except (LookupError, Exception):
@@ -582,13 +637,17 @@ class ContreeShell:
         if not lines:
             print("(no history)")
             return
-        # Optional: limit output with an argument (e.g. ``history 20``)
-        count = len(lines)
-        if args:
-            with contextlib.suppress(ValueError):
-                count = int(args[0])
-        for i, line in enumerate(lines[-count:], start=max(1, len(lines) - count + 1)):
-            print(f" {i:5d}  {line}")
+
+        numbered = list(enumerate(lines, start=1))
+        if args.search is not None:
+            needle = args.search.casefold()
+            numbered = [(n, line) for n, line in numbered if needle in line.casefold()]
+            if not numbered:
+                print(f"(no matches for {args.search!r})")
+                return
+
+        for n, line in numbered:
+            print(f" {n:5d}  {line}")
 
     @staticmethod
     def format_name(formatter: OutputFormatter) -> str:
@@ -611,14 +670,23 @@ class ContreeShell:
             return
         FORMATTER.set(FORMATTERS[name]())
 
-    def handle_help(self, args: list[str]) -> None:
+    def handle_help(self, tokens: list[str]) -> None:
         """Show general shell help or help for a specific topic."""
-        if not args:
+        # A topic can itself look like a flag (e.g. ``help -f``,
+        # ``help --format``). Prepend ``--`` so argparse treats anything
+        # other than ``-h``/``--help`` as a positional value.
+        if tokens and tokens[0].startswith("-") and tokens[0] not in ("-h", "--help"):
+            tokens = ["--", *tokens]
+        ns = parse_builtin(HELP_PARSER, tokens)
+        if ns is None:
+            return
+        args = HelpArgs(topic=ns.topic)
+        if args.topic is None:
             self.print_shell_help()
             return
-        topic = _HELP_ALIASES.get(args[0], args[0])
-        if topic in _BUILTIN_HELP:
-            print(_BUILTIN_HELP[topic])
+        topic = HELP_ALIASES.get(args.topic, args.topic)
+        if topic in BUILTIN_HELP:
+            print(BUILTIN_HELP[topic])
             return
         # Delegate to the contree command's --help.
         self.dispatch_contree([topic, "--help"])
@@ -635,7 +703,7 @@ class ContreeShell:
             "Builtins:\n"
             "  cd [PATH]          Change working directory (cd - for previous)\n"
             "  pwd                Print working directory\n"
-            "  history [N]        Show command history (optional limit)\n"
+            "  history [SEARCH]   Show history (filter by case-insensitive substring)\n"
             "  help [TOPIC]       Show help for a command or builtin\n"
             "  clear              Clear the terminal screen\n"
             "  --format [NAME]    Change or show the output format\n"
