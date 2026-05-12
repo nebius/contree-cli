@@ -160,6 +160,9 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
 
 - `use`: bind the session to an image or reusable tag.
 - `run`: execute a command in the current session image.
+- `build`: interpret a `Dockerfile` and produce a tagged image, reusing
+  cached layers per context directory. Prefer this over hand-running
+  each Dockerfile step when one already exists.
 - `ls` / `cat`: inspect files from the image without spawning a VM.
 - `cp`: download a file from the image to the host.
 - `file edit`: open a remote file in a host editor and stage it for the next run.
@@ -431,6 +434,34 @@ contree -S agent_task_nim cp /work/project/main ./results/nim/
 
 Each subagent works in complete isolation. The parent agent collects
 `./results/<lang>/` after all subagents finish.
+
+## Building from a Dockerfile
+
+When a repo already has a `Dockerfile`, do not reproduce each step by
+hand. Run `contree build` instead:
+
+```bash
+contree build . --tag myapp:dev
+contree build ./app --dockerfile ./app/Dockerfile.prod --tag svc:prod
+contree build . --build-arg VERSION=1.2
+contree build . --no-cache
+```
+
+- Cache is keyed by `abspath(CONTEXT)`. Same context + same Dockerfile
+  + same build args = full layer cache hit on re-runs.
+- Supported directives: `FROM`, `RUN`, `COPY`, `ADD` (local paths
+  only), `WORKDIR`, `ENV`, `ARG`, `USER`. `CMD`/`ENTRYPOINT`/`LABEL`
+  /`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`/`HEALTHCHECK`/`ONBUILD`
+  /`SHELL` are parsed but skipped with a warning.
+- Multi-stage (`FROM ... AS x`, `COPY --from=x`) is not yet supported;
+  use a single linear pipeline for now.
+- `<CONTEXT>/.dockerignore` filters `COPY`/`ADD` walks. Globs `*` /
+  `**` / `?` / `[abc]` work; trailing `/` matches a directory and
+  everything below it; lines starting with `!` re-include.
+- Tag the resulting image with `--tag NAME[:TAG]` to make it
+  reusable.
+
+Use `contree build --help` for the full flag list.
 
 ## Built-in manual
 

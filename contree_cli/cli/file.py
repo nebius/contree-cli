@@ -123,7 +123,7 @@ def _upload_and_record(
     """Upload a local file (with dedup) and record as pending."""
     sha = _file_sha256(local_path)
     try:
-        resp = client.get("/v1/files", params={"sha256": sha})
+        resp = client.get(f"/v1/files/{sha}")
         file_uuid = json.loads(resp.read())["uuid"]
         logger.info("File already exists on server (%s)", file_uuid)
     except ApiError as exc:

@@ -384,10 +384,11 @@ def record_local_uuid(mf: MappedFile, file_uuid: str, store: SessionStore) -> No
 
 def upload_one_remote(client: ContreeClient, mf: MappedFile) -> tuple[MappedFile, str]:
     """HTTP-only upload (sha256 dedup + POST /v1/files). Thread-safe."""
+    sha = mf.sha256()
     try:
-        resp = client.get("/v1/files", params={"sha256": mf.sha256()})
+        resp = client.get(f"/v1/files/{sha}")
         file_uuid = str(json.loads(resp.read())["uuid"])
-        logger.info("Uploaded file: %s -> %s", mf.host_path, file_uuid)
+        logger.info("File reused: %s -> %s", mf.host_path, file_uuid)
         return mf, file_uuid
     except ApiError as exc:
         if exc.status != 404:

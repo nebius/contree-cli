@@ -9,6 +9,7 @@
 
 use
 run
+build
 images
 tag
 ps

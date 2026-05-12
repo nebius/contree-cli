@@ -427,7 +427,7 @@ class TestFileUpload:
         # Verify dedup check then file upload
         req0 = contree_client.get_request(0)
         assert req0.method == "GET"
-        assert "/v1/files?sha256=" in req0.path
+        assert "/v1/files/" in req0.path
         req1 = contree_client.get_request(1)
         assert req1.method == "POST"
         assert "/v1/files" in req1.path
@@ -466,7 +466,7 @@ class TestFileUpload:
         assert body["files"]["/app/script.sh"]["uid"] == 1000
 
     def test_file_dedup_skips_upload(self, contree_client, session_store, tmp_path):
-        """GET /v1/files?sha256=... returns 200 -> no POST upload, UUID reused."""
+        """GET /v1/files/... returns 200 -> no POST upload, UUID reused."""
         session_store.set_image(IMG_UUID, kind="test")
         host_file = tmp_path / "data.txt"
         host_file.write_text("content")
@@ -491,7 +491,7 @@ class TestFileUpload:
         # Only GET (dedup), POST (spawn), GET (poll) -- no POST /v1/files
         req0 = contree_client.get_request(0)
         assert req0.method == "GET"
-        assert "/v1/files?sha256=" in req0.path
+        assert "/v1/files/" in req0.path
         assert methods.count("POST") == 1  # only the spawn POST
 
         # Spawn uses the existing UUID
@@ -522,7 +522,7 @@ class TestFileUpload:
         ]
         with caplog.at_level(logging.INFO):
             _run_cmd(contree_client, args, responses, store=session_store)
-        assert "Uploaded file:" in caplog.text
+        assert "File reused:" in caplog.text
         assert "existing-uuid" in caplog.text
 
     def test_file_dedup_non_404_raises(self, contree_client, session_store, tmp_path):
@@ -613,7 +613,7 @@ class TestFileUpload:
 
         req0 = contree_client.get_request(0)
         assert req0.method == "GET"
-        assert "/v1/files?sha256=" in req0.path
+        assert "/v1/files/" in req0.path
         spawn_req = contree_client.get_request(1)
         spawn_body = json.loads(spawn_req.body)
         assert spawn_body["files"]["/app/cached-change.txt"]["uuid"] == "new-uuid"

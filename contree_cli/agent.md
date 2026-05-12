@@ -134,7 +134,28 @@ Tag conventions:
 Always search before building:
   contree images --prefix=python-dev
 
-More: contree images --help, contree tag --help
+Building from a Dockerfile:
+  When a project already ships a Dockerfile, prefer `contree build`
+  over hand-running each step. It executes FROM/RUN/COPY/WORKDIR/ENV
+  /ARG/USER against the API and caches every layer as a branch so
+  rebuilds are fast.
+
+  Layer cache is keyed by abspath(context), shared across invocations:
+    contree build .                     build ./Dockerfile, no tag
+    contree build . --tag myapp:dev     build + tag the final image
+    contree build ./app --dockerfile ./app/Dockerfile.prod --tag svc:prod
+    contree build . --build-arg VERSION=1.2
+    contree build . --no-cache          force rebuild
+
+  Supported directives: FROM, RUN, COPY, ADD (local paths only),
+  WORKDIR, ENV, ARG, USER. CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/etc.
+  are parsed but skipped with a warning. Multi-stage (AS / --from)
+  is not yet supported.
+
+  .dockerignore is applied to every COPY/ADD walk on top of the
+  default exclude list (.git, __pycache__, node_modules, etc.).
+
+More: contree build --help, contree images --help, contree tag --help
 
 Files and directories
 =====================
@@ -373,6 +394,7 @@ All commands
 
   use [IMAGE]             Set or show session image (aliases: ci)
   run [-- CMD]            Spawn sandbox instance (aliases: r)
+  build [CONTEXT]         Build image from Dockerfile (aliases: bd)
   images                  List/import images (aliases: i, img)
   tag [IMAGE] TAG         Tag image (aliases: t)
   ps                      List operations
