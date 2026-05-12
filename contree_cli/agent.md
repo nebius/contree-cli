@@ -211,9 +211,30 @@ Piped stdin:
 Detached mode (-d):
   contree run -d -- long-running-task
   contree ps                              check status
+  contree ps -a -S FAILED --since=1h      recent failures
   contree show UUID                       view result
   contree session wait                    block until done
   contree session wait UUID1 UUID2        wait for specific ops
+
+Monitoring background operations:
+  Use the `operation` namespace (alias `op`) when juggling several
+  detached runs. `op ls` is `ps`; `op show` and `op cancel` accept
+  multiple UUIDs in one call.
+
+  contree op ls                           list operations (= ps)
+  contree op ls -a -S EXECUTING           filter active runs
+  contree op show UUID1 UUID2 UUID3       inspect a batch in one call
+  contree op cancel UUID1 UUID2           cancel selected operations
+  contree op cancel --all                 cancel every active op (rare)
+
+  Fan-out + join pattern:
+    A=$(contree run -d -- make -C /work/a build | jq -r .uuid)
+    B=$(contree run -d -- make -C /work/b build | jq -r .uuid)
+    contree session wait "$A" "$B"
+    contree op show "$A" "$B"
+
+  Background checks are cheap: terminal results are cached locally,
+  so repeated `op show` / `show` calls do not re-hit the API.
 
 Disposable mode (-D) — no image checkpoint:
   contree run -D -- rm -rf /tmp/*
@@ -357,6 +378,10 @@ All commands
   ps                      List operations
   kill UUID               Cancel operation
   show UUID               Show operation result
+  operation list          List operations (aliases: op ls)
+  operation show UUID...  Show one or more operation results (aliases: op)
+  operation cancel UUID...
+                          Cancel one or more operations (or --all)
   ls [PATH]               List files in image (no VM)
   cat PATH                Show file content (no VM)
   cp PATH DEST            Download file from image

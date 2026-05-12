@@ -68,12 +68,12 @@ class TestCmdImages:
         ]
         _run_cmd(contree_client, images)
         out = capsys.readouterr().out
-        # tag is empty string, so the row ends with a trailing comma-separator
         lines = out.splitlines()
         data_line = lines[1]
         assert "ccc" in data_line
-        # empty tag means two consecutive delimiters or trailing delimiter
-        assert data_line.endswith(",")
+        # null tag renders as empty in CSV: two consecutive delimiters
+        # around its position.
+        assert ",," in data_line
 
     def test_empty_list(self, contree_client, capsys):
         _run_cmd(contree_client, [])
@@ -100,6 +100,38 @@ class TestCmdImages:
         lines = capsys.readouterr().out.splitlines()
         assert len(lines) == 3  # header + 2 rows
         assert "UUID" in lines[0]
+
+    def test_unknown_field_passes_through(self, contree_client, capsys):
+        """New server fields (e.g. ``size``, ``digest``) reach the row as-is."""
+        images = [
+            {
+                "uuid": "ggg",
+                "tag": "v4",
+                "created_at": "2025-06-01T00:00:00Z",
+                "size": 12345,
+                "digest": "sha256:abcd",
+            },
+        ]
+        _run_cmd(contree_client, images, formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["size"] == 12345
+        assert parsed["digest"] == "sha256:abcd"
+
+    def test_nested_fields_skipped(self, contree_client, capsys):
+        images = [
+            {
+                "uuid": "hhh",
+                "tag": "v5",
+                "created_at": "2025-06-01T00:00:00Z",
+                "metadata": {"foo": "bar"},
+                "tags": ["a", "b"],
+            },
+        ]
+        _run_cmd(contree_client, images, formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert "metadata" not in parsed
+        assert "tags" not in parsed
+        assert parsed["uuid"] == "hhh"
 
 
 class TestImagesParams:

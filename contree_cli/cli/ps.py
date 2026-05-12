@@ -137,12 +137,6 @@ def emit_op(formatter: OutputFormatter, op: dict[str, Any], *, quiet: bool) -> N
     if quiet:
         print(op["uuid"])
         return
-    # Take every scalar top-level field from the API response so new server
-    # fields show up automatically. Nested structures (metadata, result) are
-    # skipped to keep the table readable -- use `show UUID` for the detail
-    # view that drills into them. ``error`` is pinned to the last column
-    # because it can be a long free-form message and trailing it keeps the
-    # rest of the row aligned.
     row = {
         key: transform_field(key, value)
         for key, value in op.items()

@@ -168,7 +168,13 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
 - `session checkout`: switch active branch.
 - `session rollback`: move the active branch pointer backward.
 - `session wait`: wait for active operations, or specific operation UUIDs.
-- `ps` / `show` / `kill`: inspect, read, or cancel operations.
+- `ps` / `show` / `kill`: inspect, read, or cancel a single operation.
+- `operation` (alias `op`): grouped namespace for the same actions plus
+  multi-UUID variants. Use this when monitoring background work.
+  - `op ls` -- same flags as `ps`, lists operations. Pipe to `-q` for UUIDs.
+  - `op show UUID1 UUID2 ...` -- fetch several operation results in one call.
+  - `op cancel UUID1 UUID2 ...` -- cancel several operations, or `--all`
+    to cancel every active one.
 
 ## Execution patterns
 
@@ -292,10 +298,49 @@ Use staged files when several edits should land together on the next run. Use `-
 
 ## Detached operations
 
+Use detached runs whenever a step is slow (large image imports, builds,
+test suites). The CLI returns immediately with an operation UUID;
+monitoring is then a polling problem rather than a blocking one.
+
 - Start long work detached: `contree -S <key> run -d -- long-job`
-- Inspect running operations with `contree ps`
-- Read results with `contree show <operation-uuid>`
-- Use `contree session wait [OP_ID ...]` when available to wait for active or specific operations.
+- Fan out several jobs in parallel: each `run -d` returns its own UUID.
+
+Monitoring background operations:
+
+- `contree ps` -- active operations (PENDING, ASSIGNED, EXECUTING).
+- `contree ps -a` -- include completed/failed/cancelled.
+- `contree ps -q` -- UUIDs only, pipe-friendly.
+- `contree op ls` -- alias for `ps`, identical flags.
+- `contree show UUID` -- single-operation detail (status, duration,
+  exit code, stdout/stderr, resulting image).
+- `contree op show UUID1 UUID2 UUID3` -- fetch several operations in
+  one shot. Convenient when fanning out runs and checking the batch.
+- `contree session wait` -- block until all active ops of the current
+  session reach terminal state.
+- `contree session wait UUID1 UUID2` -- block on specific UUIDs.
+
+Cancelling:
+
+- `contree kill UUID` -- single operation.
+- `contree op cancel UUID1 UUID2` -- batch of UUIDs.
+- `contree op cancel --all` -- every active operation (use sparingly).
+
+Common patterns:
+
+```bash
+# Fan out: start three builds, wait for all, inspect each
+A=$(contree run -d -- make -C /work/a build | jq -r .uuid)
+B=$(contree run -d -- make -C /work/b build | jq -r .uuid)
+C=$(contree run -d -- make -C /work/c build | jq -r .uuid)
+contree session wait "$A" "$B" "$C"
+contree op show "$A" "$B" "$C"
+
+# Snapshot what is running right now
+contree -f json op ls | jq '.uuid'
+
+# Find recent failures across the project
+contree -f json ps -a -S FAILED --since=1h
+```
 
 ## Output and automation
 

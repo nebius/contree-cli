@@ -287,12 +287,16 @@ def cmd_images(args: ImagesArgs) -> None:
         if not images:
             return
         for image in images:
-            created_at = parse_datetime(image["created_at"])
-            formatter(
-                uuid=image["uuid"],
-                created_at=created_at,
-                tag=image.get("tag") or "",
-            )
+            row: dict[str, object] = {}
+            for key, value in image.items():
+                if isinstance(value, (dict, list)):
+                    continue
+                if key == "created_at" and isinstance(value, str):
+                    value = parse_datetime(value)
+                if key == "tag" and value is None:
+                    value = ""
+                row[key] = value
+            formatter(**row)
         emitted += len(images)
         if len(images) < page_size:
             return
