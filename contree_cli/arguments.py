@@ -6,6 +6,7 @@ from pathlib import Path
 from contree_cli.cli import (
     agent,
     auth,
+    build,
     cat,
     cd,
     cp,
@@ -14,6 +15,7 @@ from contree_cli.cli import (
     images,
     kill,
     ls,
+    operation,
     ps,
     run,
     session,
@@ -44,6 +46,9 @@ examples:
   contree run --file ./src:/app/src -- make -C /app/src
   contree images --prefix=ubuntu
   contree ps -q
+  contree op ls                       same as `contree ps`
+  contree op show UUID1 UUID2         multi-UUID show
+  contree op cancel UUID1 UUID2       multi-UUID cancel (or --all)
   contree show OPERATION_UUID
   contree tag IMAGE_UUID latest
   contree ls /etc                    list files in session image
@@ -206,11 +211,18 @@ def register(
 
 register("use", "Set or show current session image", use.setup_parser, aliases=["ci"])
 register("run", "Spawn a sandbox instance", run.setup_parser, aliases=["r"])
+register("build", "Build image from Dockerfile", build.setup_parser, aliases=["bd"])
 register("images", "List and import images", images.setup_parser, aliases=["i", "img"])
 register("tag", "Tag an image", tag.setup_parser, aliases=["t"])
 register("ps", "List operations/instances", ps.setup_parser)
 register("kill", "Cancel an operation", kill.setup_parser)
 register("show", "Show operation result", show.setup_parser)
+register(
+    "operation",
+    "Manage operations (list/show/cancel)",
+    operation.setup_parser,
+    aliases=["op"],
+)
 register("ls", "List files in image", ls.setup_parser)
 register("cat", "Show file content from image", cat.setup_parser)
 register("cp", "Copy file from image to local path", cp.setup_parser)

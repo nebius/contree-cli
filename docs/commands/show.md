@@ -40,4 +40,5 @@ For `csv`, `tsv`, and `table` formats, stdout/stderr are omitted -- use
 ## See also
 
 - {doc}`ps` -- list operations to find UUIDs
+- {doc}`operation` -- multi-UUID variant: `contree op show UUID1 UUID2 ...`
 - {doc}`run` -- the command that creates operations

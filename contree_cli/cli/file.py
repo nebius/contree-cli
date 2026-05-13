@@ -23,13 +23,26 @@ import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
-from contree_cli import CLIENT, SESSION_STORE, ArgumentsProtocol, SetupResult
+from contree_cli import (
+    CLIENT,
+    FORMATTER,
+    SESSION_STORE,
+    ArgumentsProtocol,
+    SetupResult,
+)
 from contree_cli.client import ApiError, ContreeClient, resolve_image, stream_response
 from contree_cli.config import EDITOR
 from contree_cli.session import SessionStore
-from contree_cli.types import FLAGS
+from contree_cli.types import (
+    FLAGS,
+    isoformat_datetime,
+    parse_datetime,
+    parse_interval,
+    positive_int,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +72,27 @@ class FileCpArgs(ArgumentsProtocol):
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> FileCpArgs:
         return cls(src=ns.src, dest=ns.dest)
+
+
+FILE_LIST_LIMIT_DEFAULT = 1000
+FILE_LIST_PAGE_SIZE = 1000
+
+
+@dataclass(frozen=True)
+class FileListArgs(ArgumentsProtocol):
+    since: datetime | None = None
+    until: datetime | None = None
+    limit: int = FILE_LIST_LIMIT_DEFAULT
+    quiet: bool = False
+
+    @classmethod
+    def from_args(cls, ns: argparse.Namespace) -> FileListArgs:
+        return cls(
+            since=getattr(ns, "since", None),
+            until=getattr(ns, "until", None),
+            limit=getattr(ns, "limit", FILE_LIST_LIMIT_DEFAULT),
+            quiet=bool(getattr(ns, "quiet", False)),
+        )
 
 
 def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
@@ -102,6 +136,58 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     cp_p.add_argument("dest", help="Destination path inside image")
     cp_p.set_defaults(handler=cmd_file_cp, load_args=FileCpArgs)
 
+    ls_p = sub.add_parser(
+        "ls",
+        aliases=["list"],
+        help="List uploaded files (joined with local cache)",
+        description=(
+            "List remote files uploaded to the project and, when present in"
+            " the local upload cache, show what produced them under the"
+            " 'source' column: either an absolute host path (for run --file"
+            " / COPY uploads) or a URL (for ADD URL).\n"
+            "\n"
+            "source is THIS-MACHINE ONLY: the mapping lives in the local"
+            " CLI cache ($CONTREE_HOME/cli/sessions/<profile>.db) and is"
+            " never synced. Files uploaded from a different host, by a"
+            " teammate, or before tracking landed will show an empty source"
+            " -- that is expected, not a bug. Use the remote uuid or sha256"
+            " for cross-machine identity."
+        ),
+        epilog=(
+            "examples:\n"
+            "  contree file ls\n"
+            "  contree file ls --since 1d\n"
+            "  contree file ls --limit 5000\n"
+            "  contree file ls -q              # uuid + sha256 + source\n"
+            "  contree -f json file ls\n"
+        ),
+    )
+    ls_p.add_argument(
+        *FLAGS["since"],
+        type=parse_interval,
+        help=parse_interval.__doc__,
+    )
+    ls_p.add_argument(
+        *FLAGS["until"],
+        type=parse_interval,
+        help="Show files before. " + str(parse_interval.__doc__),
+    )
+    ls_p.add_argument(
+        *FLAGS["limit"],
+        type=positive_int,
+        default=FILE_LIST_LIMIT_DEFAULT,
+        help="Stop after this many files and warn if more are available",
+    )
+    ls_p.add_argument(
+        *FLAGS["quiet"],
+        action="store_true",
+        help=(
+            "Emit only uuid, sha256, and source columns. source is populated"
+            " only for files uploaded from this very machine."
+        ),
+    )
+    ls_p.set_defaults(handler=cmd_file_ls, load_args=FileListArgs)
+
     return cmd_file_edit, FileEditArgs
 
 
@@ -123,7 +209,7 @@ def _upload_and_record(
     """Upload a local file (with dedup) and record as pending."""
     sha = _file_sha256(local_path)
     try:
-        resp = client.get("/v1/files", params={"sha256": sha})
+        resp = client.get(f"/v1/files/{sha}")
         file_uuid = json.loads(resp.read())["uuid"]
         logger.info("File already exists on server (%s)", file_uuid)
     except ApiError as exc:
@@ -221,4 +307,64 @@ def cmd_file_cp(args: FileCpArgs) -> int | None:
         args.dest,
         title=f"Change file {args.dest}",
     )
+    return None
+
+
+def cmd_file_ls(args: FileListArgs) -> int | None:
+    client = CLIENT.get()
+    store = SESSION_STORE.get()
+    formatter = FORMATTER.get()
+
+    sources = store.cache.local_file_paths()
+
+    params: dict[str, str] = {}
+    if args.since is not None:
+        params["since"] = isoformat_datetime(args.since)
+    if args.until is not None:
+        params["until"] = isoformat_datetime(args.until)
+
+    offset = 0
+    emitted = 0
+    while emitted < args.limit:
+        page_size = min(FILE_LIST_PAGE_SIZE, args.limit - emitted)
+        page = {**params, "offset": str(offset), "limit": str(page_size)}
+        resp = client.get("/v1/files", params=page)
+        data = json.loads(resp.read())
+        files = data.get("files", [])
+        if not files:
+            return None
+        for entry in files:
+            uuid_str = entry.get("uuid")
+            source = sources.get(uuid_str, "") if isinstance(uuid_str, str) else ""
+            if args.quiet:
+                formatter(
+                    uuid=uuid_str,
+                    sha256=entry.get("sha256", ""),
+                    source=source,
+                )
+                continue
+            row: dict[str, object] = {}
+            for key, value in entry.items():
+                if isinstance(value, (dict, list)):
+                    continue
+                if key in {"created_at", "updated_at"} and isinstance(value, str):
+                    value = parse_datetime(value)
+                row[key] = value
+            row["source"] = source
+            formatter(**row)
+        emitted += len(files)
+        if len(files) < page_size:
+            return None
+        offset += len(files)
+
+    probe = {**params, "offset": str(offset), "limit": "1"}
+    resp = client.get("/v1/files", params=probe)
+    data = json.loads(resp.read())
+    if data.get("files"):
+        formatter.flush()
+        logger.warning(
+            "Output truncated at --limit=%d files; more results are"
+            " available. Raise --limit or narrow with --since/--until.",
+            args.limit,
+        )
     return None

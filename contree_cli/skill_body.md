@@ -160,15 +160,36 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
 
 - `use`: bind the session to an image or reusable tag.
 - `run`: execute a command in the current session image.
+- `build`: interpret a `Dockerfile` and produce a tagged image, reusing
+  cached layers per context directory. Prefer this over hand-running
+  each Dockerfile step when one already exists.
 - `ls` / `cat`: inspect files from the image without spawning a VM.
 - `cp`: download a file from the image to the host.
 - `file edit`: open a remote file in a host editor and stage it for the next run.
 - `file cp`: upload a local file and stage it for the next run.
+- `file ls`: list uploaded files; rows produced from this host carry a
+  `source` field (host path for `run --file` / `COPY`, URL for
+  `ADD URL`). Add `-q` for a tight `uuid sha256 source` view.
+
+  **`source` is THIS-MACHINE ONLY.** The mapping lives in the local
+  CLI SQLite cache (`$CONTREE_HOME/cli/sessions/<profile>.db`) keyed
+  by `path + inode + mtime + size` for host paths and by the URL
+  itself for URL fetches. It is not synced anywhere. Rows uploaded
+  from a different machine, by another teammate, or before tracking
+  landed will show an empty `source` -- that is expected, not a bug.
+  When working across hosts, treat the remote `uuid`/`sha256` as the
+  authoritative identifier and never rely on `source` resolving.
 - `session branch`: create an experimental branch.
 - `session checkout`: switch active branch.
 - `session rollback`: move the active branch pointer backward.
 - `session wait`: wait for active operations, or specific operation UUIDs.
-- `ps` / `show` / `kill`: inspect, read, or cancel operations.
+- `ps` / `show` / `kill`: inspect, read, or cancel a single operation.
+- `operation` (alias `op`): grouped namespace for the same actions plus
+  multi-UUID variants. Use this when monitoring background work.
+  - `op ls` -- same flags as `ps`, lists operations. Pipe to `-q` for UUIDs.
+  - `op show UUID1 UUID2 ...` -- fetch several operation results in one call.
+  - `op cancel UUID1 UUID2 ...` -- cancel several operations, or `--all`
+    to cancel every active one.
 
 ## Execution patterns
 
@@ -292,10 +313,49 @@ Use staged files when several edits should land together on the next run. Use `-
 
 ## Detached operations
 
+Use detached runs whenever a step is slow (large image imports, builds,
+test suites). The CLI returns immediately with an operation UUID;
+monitoring is then a polling problem rather than a blocking one.
+
 - Start long work detached: `contree -S <key> run -d -- long-job`
-- Inspect running operations with `contree ps`
-- Read results with `contree show <operation-uuid>`
-- Use `contree session wait [OP_ID ...]` when available to wait for active or specific operations.
+- Fan out several jobs in parallel: each `run -d` returns its own UUID.
+
+Monitoring background operations:
+
+- `contree ps` -- active operations (PENDING, ASSIGNED, EXECUTING).
+- `contree ps -a` -- include completed/failed/cancelled.
+- `contree ps -q` -- UUIDs only, pipe-friendly.
+- `contree op ls` -- alias for `ps`, identical flags.
+- `contree show UUID` -- single-operation detail (status, duration,
+  exit code, stdout/stderr, resulting image).
+- `contree op show UUID1 UUID2 UUID3` -- fetch several operations in
+  one shot. Convenient when fanning out runs and checking the batch.
+- `contree session wait` -- block until all active ops of the current
+  session reach terminal state.
+- `contree session wait UUID1 UUID2` -- block on specific UUIDs.
+
+Cancelling:
+
+- `contree kill UUID` -- single operation.
+- `contree op cancel UUID1 UUID2` -- batch of UUIDs.
+- `contree op cancel --all` -- every active operation (use sparingly).
+
+Common patterns:
+
+```bash
+# Fan out: start three builds, wait for all, inspect each
+A=$(contree run -d -- make -C /work/a build | jq -r .uuid)
+B=$(contree run -d -- make -C /work/b build | jq -r .uuid)
+C=$(contree run -d -- make -C /work/c build | jq -r .uuid)
+contree session wait "$A" "$B" "$C"
+contree op show "$A" "$B" "$C"
+
+# Snapshot what is running right now
+contree -f json op ls | jq '.uuid'
+
+# Find recent failures across the project
+contree -f json ps -a -S FAILED --since=1h
+```
 
 ## Output and automation
 
@@ -386,6 +446,34 @@ contree -S agent_task_nim cp /work/project/main ./results/nim/
 
 Each subagent works in complete isolation. The parent agent collects
 `./results/<lang>/` after all subagents finish.
+
+## Building from a Dockerfile
+
+When a repo already has a `Dockerfile`, do not reproduce each step by
+hand. Run `contree build` instead:
+
+```bash
+contree build . --tag myapp:dev
+contree build ./app --dockerfile ./app/Dockerfile.prod --tag svc:prod
+contree build . --build-arg VERSION=1.2
+contree build . --no-cache
+```
+
+- Cache is keyed by `abspath(CONTEXT)`. Same context + same Dockerfile
+  + same build args = full layer cache hit on re-runs.
+- Supported directives: `FROM`, `RUN`, `COPY`, `ADD` (local paths
+  only), `WORKDIR`, `ENV`, `ARG`, `USER`. `CMD`/`ENTRYPOINT`/`LABEL`
+  /`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`/`HEALTHCHECK`/`ONBUILD`
+  /`SHELL` are parsed but skipped with a warning.
+- Multi-stage (`FROM ... AS x`, `COPY --from=x`) is not yet supported;
+  use a single linear pipeline for now.
+- `<CONTEXT>/.dockerignore` filters `COPY`/`ADD` walks. Globs `*` /
+  `**` / `?` / `[abc]` work; trailing `/` matches a directory and
+  everything below it; lines starting with `!` re-include.
+- Tag the resulting image with `--tag NAME[:TAG]` to make it
+  reusable.
+
+Use `contree build --help` for the full flag list.
 
 ## Built-in manual
 

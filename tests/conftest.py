@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import contree_cli.arguments  # noqa: F401  populates COMMAND_REGISTRY
 import contree_cli.config as config_mod
 from contree_cli import CLIENT, PROFILE
 from contree_cli.client import ContreeClient, ContreeIAMClient
@@ -87,10 +88,19 @@ class FakeConnection:
         self,
         method: str,
         path: str,
-        body: bytes | None = None,
+        body: object = None,
         headers: dict[str, str] | None = None,
     ) -> None:
-        self.requests.append(RecordedRequest(method, path, body, headers or {}))
+        if hasattr(body, "read") and not isinstance(body, (bytes, bytearray)):
+            chunks: list[bytes] = []
+            while True:
+                chunk = body.read(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            body = b"".join(chunks)
+        recorded = body if isinstance(body, (bytes, bytearray, type(None))) else None
+        self.requests.append(RecordedRequest(method, path, recorded, headers or {}))
 
     def getresponse(self) -> FakeResponse:
         return self.responses.pop(0)

@@ -46,8 +46,15 @@ contree ps -q | xargs -I {} contree show {}
 
 Without `-a`, only `PENDING`, `ASSIGNED`, and `EXECUTING` are shown.
 
+## Dynamic output columns
+
+`ps` renders every scalar top-level field the API returns (not a fixed
+subset), so new server fields appear automatically. `error` is pinned
+to the last column. See {doc}`operation` for the full description.
+
 ## See also
 
 - {doc}`show` -- inspect a specific operation
 - {doc}`kill` -- cancel a running operation
+- {doc}`operation` -- group + multi-UUID variants (`contree op ls/show/cancel`)
 - {doc}`/tutorial/workflows` -- monitoring and scripting patterns

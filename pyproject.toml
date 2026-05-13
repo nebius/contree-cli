@@ -1,6 +1,6 @@
 [project]
 name = "contree-cli"
-version = "0.4.4"
+version = "0.6.0"
 description = "CLI client for the ConTree sandbox platform"
 readme = "README.md"
 requires-python = ">=3.10"

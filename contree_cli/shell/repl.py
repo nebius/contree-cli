@@ -2,24 +2,25 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import logging
 import re
 import shlex
 import sys
+from dataclasses import dataclass
 from functools import cached_property
 
-from contree_cli import FORMATTER, IN_SHELL, SESSION_STORE, ArgumentsProtocol
+from contree_cli import FORMATTER, IN_SHELL, PROFILE, SESSION_STORE, ArgumentsProtocol
 from contree_cli.client import ApiError
 from contree_cli.output import FORMATTERS, OutputFormatter
 from contree_cli.session import SessionStore
+from contree_cli.shell.cache import SourceCache
 from contree_cli.shell.completer import ShellCompleter
 from contree_cli.shell.parser import ShellArgumentParser, ShellParseError
 from contree_cli.types import Colors
 
 log = logging.getLogger(__name__)
-
-_PROMPT_BASE = "contree"
 
 # Regex matching ANSI escape sequences (CSI and OSC).
 ANSI_RE = re.compile(r"(\033\[[0-9;]*m)")
@@ -38,7 +39,7 @@ except ImportError:
     LIBEDIT = False
 
 
-def _readline_safe_prompt(prompt: str) -> str:
+def readline_safe_prompt(prompt: str) -> str:
     """Make *prompt* safe for readline cursor-position tracking.
 
     GNU readline recognises ``\\x01``/``\\x02`` markers around invisible
@@ -51,6 +52,46 @@ def _readline_safe_prompt(prompt: str) -> str:
     return ANSI_RE.sub(lambda m: "\x01" + m.group() + "\x02", prompt)
 
 
+DURATION_RE = re.compile(r"\A(\d+(?:\.\d+)?)([smhd]?)\Z")
+DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(text: str) -> int | None:
+    """Parse a ``timeout`` duration spec like ``60``, ``30s``, ``5m``, ``1h``.
+
+    Returns the duration in whole seconds, or ``None`` if *text* is not a
+    valid spec (in which case the caller should fall through and treat the
+    user input as a regular command line).
+    """
+    match = DURATION_RE.match(text)
+    if match is None:
+        return None
+    value = float(match.group(1))
+    multiplier = DURATION_UNITS[match.group(2)]
+    seconds = int(value * multiplier)
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def intercept_timeout(line: str) -> tuple[int, str] | None:
+    """Detect ``timeout DURATION COMMAND...`` and split off the duration.
+
+    Returns ``(seconds, remainder_line)`` when *line* starts with the
+    ``timeout`` builtin followed by a parseable duration and at least one
+    further token; ``None`` otherwise. Whitespace and quoting in the
+    remainder are preserved verbatim so ``sh -c`` sees the same expression
+    the user typed.
+    """
+    parts = line.split(None, 2)
+    if len(parts) < 3 or parts[0] != "timeout":
+        return None
+    seconds = parse_duration(parts[1])
+    if seconds is None:
+        return None
+    return seconds, parts[2]
+
+
 # Bare names that are forwarded as contree management commands.
 CONTREE_ALIASES = frozenset({"ls", "cat"})
 
@@ -58,14 +99,80 @@ CONTREE_ALIASES = frozenset({"ls", "cat"})
 EDITOR_ALIASES = frozenset({"vim", "vi", "nvim", "nano"})
 
 # Aliases for ``help <topic>`` lookup.
-_HELP_ALIASES: dict[str, str] = {
+HELP_ALIASES: dict[str, str] = {
     "quit": "exit",
     "-f": "--format",
     "vi": "vim",
 }
 
+
+HISTORY_PARSER = ShellArgumentParser(
+    prog="history",
+    description=(
+        "Show command history for the current session, "
+        "optionally filtered by a case-insensitive substring."
+    ),
+)
+HISTORY_PARSER.add_argument(
+    "search",
+    nargs="?",
+    default=None,
+    metavar="PATTERN",
+    help="Case-insensitive substring; only matching lines are shown",
+)
+
+
+HELP_PARSER = ShellArgumentParser(
+    prog="help",
+    description=(
+        "Show general shell help, or detailed help for a builtin, "
+        "alias, or contree command."
+    ),
+)
+HELP_PARSER.add_argument(
+    "topic",
+    nargs="?",
+    default=None,
+    metavar="TOPIC",
+    help="Builtin, alias, or contree command name",
+)
+
+
+@dataclass(frozen=True)
+class HistoryArgs:
+    search: str | None
+
+
+@dataclass(frozen=True)
+class HelpArgs:
+    topic: str | None
+
+
+def get_help(parser: ShellArgumentParser) -> str:
+    """Return *parser*'s formatted help text (trailing newline stripped)."""
+    return parser.format_help().rstrip()
+
+
+def parse_builtin(
+    parser: ShellArgumentParser,
+    tokens: list[str],
+) -> argparse.Namespace | None:
+    """Run *parser* on *tokens*. Return ``None`` when callers should stop.
+
+    ``ShellParseError`` with ``status == 0`` means argparse already
+    printed ``--help`` output to stdout; callers stop. A non-zero status
+    means an actual parse error: the message is forwarded to stderr.
+    """
+    try:
+        return parser.parse_args(tokens)
+    except ShellParseError as exc:
+        if exc.status != 0 and exc.message:
+            print(f"{parser.prog}: {exc.message}", file=sys.stderr)
+        return None
+
+
 # Per-builtin help text shown by ``help <topic>``.
-_BUILTIN_HELP: dict[str, str] = {
+BUILTIN_HELP: dict[str, str] = {
     "cd": (
         "Usage: cd [PATH]\n"
         "\n"
@@ -76,21 +183,23 @@ _BUILTIN_HELP: dict[str, str] = {
         "  cd          reset to sandbox default"
     ),
     "pwd": "Usage: pwd\n\nPrint the current working directory.",
-    "history": (
-        "Usage: history [N]\n"
-        "\n"
-        "Show command history for the current session.\n"
-        "Optional argument N limits output to the last N entries."
-    ),
-    "help": (
-        "Usage: help [TOPIC]\n"
-        "\n"
-        "Show general shell help, or help for a specific command.\n"
-        "  help         general shell help\n"
-        "  help cd      help for the cd builtin\n"
-        "  help run     help for the run command"
-    ),
+    "history": get_help(HISTORY_PARSER),
+    "help": get_help(HELP_PARSER),
     "clear": "Usage: clear\n\nClear the terminal screen.",
+    "timeout": (
+        "Usage: timeout DURATION COMMAND...\n"
+        "\n"
+        "Run COMMAND in the sandbox with the API operation timeout set\n"
+        "to DURATION. Mirrors the convention of the GNU 'timeout'\n"
+        "binary but enforces the limit server-side instead of spawning\n"
+        "a local one.\n"
+        "\n"
+        "DURATION is an integer or float, optionally followed by a\n"
+        "unit suffix: s (seconds, default), m (minutes), h (hours),\n"
+        "d (days). When DURATION cannot be parsed, the line is sent to\n"
+        "the sandbox unmodified so the in-image 'timeout' binary still\n"
+        "works for advanced cases (signals, --kill-after, etc)."
+    ),
     "exit": "Usage: exit | quit\n\nExit the interactive shell (Ctrl-D also works).",
     "--format": (
         "Usage: --format [NAME] | -f [NAME]\n"
@@ -146,9 +255,9 @@ class ContreeShell:
         parser: ShellArgumentParser,
         completer: ShellCompleter,
     ) -> None:
-        self._parser = parser
-        self._completer = completer
-        self.__prev_cwd = "/"
+        self.parser = parser
+        self.completer = completer
+        self.prev_cwd = "/"
 
     @property
     def cwd(self) -> str:
@@ -156,12 +265,8 @@ class ContreeShell:
 
     @cwd.setter
     def cwd(self, value: str) -> None:
-        self.__prev_cwd = self.cwd
+        self.prev_cwd = self.cwd
         self.session_store.set_cwd(value)
-
-    @property
-    def prev_cwd(self) -> str:
-        return self.__prev_cwd
 
     @cached_property
     def session_store(self) -> SessionStore:
@@ -196,8 +301,8 @@ class ContreeShell:
         print(line, file=sys.stderr)
 
     @property
-    def _prompt(self) -> str:
-        """Short input prompt — only cwd and branch, no ANSI length issues."""
+    def prompt(self) -> str:
+        """Short input prompt: cwd and branch on the active line."""
         branch = ""
         try:
             session = self.session_store.session
@@ -213,7 +318,7 @@ class ContreeShell:
         token = IN_SHELL.set(True)
 
         if READLINE_AVAILABLE:
-            readline.set_completer(self._completer.complete)
+            readline.set_completer(self.completer.complete)
             readline.set_completer_delims(" \t\n")
 
         print("contree interactive shell (type 'help' for commands, Ctrl-D to exit)")
@@ -221,7 +326,7 @@ class ContreeShell:
             while True:
                 try:
                     self.print_status_line()
-                    line = input(_readline_safe_prompt(self._prompt))
+                    line = input(readline_safe_prompt(self.prompt))
                 except KeyboardInterrupt:
                     # Ctrl-C on empty prompt — print newline, continue
                     print()
@@ -230,7 +335,7 @@ class ContreeShell:
                 if not line:
                     continue
                 # Handle line continuation (trailing \ or unclosed quotes)
-                line = self._read_continuation(line)
+                line = self.read_continuation(line)
                 if not line:
                     continue
                 self.execute(line)
@@ -241,7 +346,7 @@ class ContreeShell:
             IN_SHELL.reset(token)
 
     @staticmethod
-    def _read_continuation(line: str) -> str:
+    def read_continuation(line: str) -> str:
         """Prompt for continuation lines when input is incomplete.
 
         Handles trailing backslash (line continuation) and unclosed
@@ -260,7 +365,7 @@ class ContreeShell:
             except ValueError:
                 pass
             try:
-                continuation = input(_readline_safe_prompt("> "))
+                continuation = input(readline_safe_prompt("> "))
             except KeyboardInterrupt:
                 print()
                 return ""
@@ -303,18 +408,79 @@ class ContreeShell:
                     resolved = [cmd] + [self.resolve_path(a) for a in args]
                     self.dispatch_contree(resolved)
                 else:
-                    self.dispatch_run(tokens)
+                    self.dispatch_run(line)
             case "vim" | "vi" | "nvim" | "nano":
                 self.dispatch_edit(cmd, tokens[1:])
             case "contree":
                 self.dispatch_contree(tokens[1:])
+            case "timeout":
+                intercepted = intercept_timeout(line)
+                if intercepted is None:
+                    self.dispatch_run(line)
+                else:
+                    seconds, remainder = intercepted
+                    self.dispatch_run(remainder, timeout=seconds)
             case _:
-                self.dispatch_run(tokens)
+                self.dispatch_run(line)
+
+    def session_snapshot(self) -> tuple[str, str, str, str]:
+        """Capture the state we watch for completion-cache invalidation."""
+        try:
+            profile = PROFILE.get().name
+        except LookupError:
+            profile = "default"
+        try:
+            session = self.session_store.session
+        except (LookupError, Exception):
+            session = None
+        if session is None:
+            return profile, self.session_store.session_key, "", ""
+        return (
+            profile,
+            session.session_key,
+            session.current_image,
+            session.active_branch,
+        )
+
+    def invalidate_completion_cache(
+        self,
+        before: tuple[str, str, str, str],
+        after: tuple[str, str, str, str],
+    ) -> None:
+        """Bust completion caches when watched session state changed."""
+        profile_before, key_before, image_before, branch_before = before
+        profile_after, key_after, image_after, branch_after = after
+        try:
+            cache = SourceCache(self.session_store.cache, profile_after)
+        except (LookupError, Exception):
+            return
+
+        if profile_before != profile_after:
+            cache.invalidate_all()
+            with contextlib.suppress(Exception):
+                SourceCache(
+                    self.session_store.cache,
+                    profile_before,
+                ).invalidate_all()
+            return
+
+        if key_before != key_after:
+            cache.invalidate_kind_prefix("")
+            return
+
+        if image_before != image_after:
+            cache.invalidate("", "images")
+            cache.invalidate_scope(image_before)
+            cache.invalidate_scope(image_after)
+            cache.invalidate("", "operations")
+
+        if branch_before != branch_after:
+            cache.invalidate_kind_prefix("branches")
 
     def dispatch_contree(self, tokens: list[str]) -> None:
         """Dispatch a contree management command via argparse."""
         try:
-            ns = self._parser.parse_args(tokens)
+            ns = self.parser.parse_args(tokens)
         except ShellParseError as exc:
             # status=0 means --help was triggered (already printed)
             if exc.status == 0:
@@ -348,6 +514,7 @@ class ContreeShell:
 
         formatter = FORMATTER.get()
 
+        before = self.session_snapshot()
         try:
             handler(loader.from_args(ns))
         except ApiError as exc:
@@ -363,14 +530,30 @@ class ContreeShell:
             formatter.flush()
             if fmt_token is not None:
                 FORMATTER.reset(fmt_token)
+            self.invalidate_completion_cache(before, self.session_snapshot())
 
-    def dispatch_run(self, tokens: list[str]) -> None:
-        """Dispatch tokens as an implicit ``run`` in the sandbox."""
+    def dispatch_run(self, line: str, *, timeout: int | None = None) -> None:
+        """Dispatch a raw input line as an implicit ``run`` in the sandbox.
+
+        The line is forwarded verbatim as a single shell expression so the
+        remote ``sh -c`` sees operators like ``|``, ``;``, ``&&`` as the
+        user typed them, rather than as quoted literal tokens.
+
+        ``timeout`` overrides the API operation timeout. When ``None`` the
+        server falls back to its default. Set explicitly by the ``timeout``
+        shell builtin (``timeout 60 long-build``).
+        """
         from contree_cli.cli.run import RunArgs, cmd_run
 
-        args = RunArgs(command_args=tokens, shell=True, cwd=self.cwd)
+        args = RunArgs(
+            command_args=[line],
+            shell=True,
+            cwd=self.cwd,
+            timeout=timeout,
+        )
         formatter = FORMATTER.get()
 
+        before = self.session_snapshot()
         try:
             cmd_run(args)
         except ApiError as exc:
@@ -383,6 +566,7 @@ class ContreeShell:
             log.error("Command failed: %s", exc, exc_info=True)
         finally:
             formatter.flush()
+            self.invalidate_completion_cache(before, self.session_snapshot())
 
     def dispatch_edit(self, editor: str, args: list[str]) -> None:
         """Open a sandbox file in a host editor via ``file edit``."""
@@ -439,8 +623,13 @@ class ContreeShell:
             return
         self.cwd = self.session_store.resolve_path(target)
 
-    def handle_history(self, args: list[str]) -> None:
-        """Print shell history from the session database."""
+    def handle_history(self, tokens: list[str]) -> None:
+        """Print shell history, optionally filtered by case-insensitive substring."""
+        ns = parse_builtin(HISTORY_PARSER, tokens)
+        if ns is None:
+            return
+        args = HistoryArgs(search=ns.search)
+
         try:
             lines = self.session_store.load_shell_history()
         except (LookupError, Exception):
@@ -448,13 +637,17 @@ class ContreeShell:
         if not lines:
             print("(no history)")
             return
-        # Optional: limit output with an argument (e.g. ``history 20``)
-        count = len(lines)
-        if args:
-            with contextlib.suppress(ValueError):
-                count = int(args[0])
-        for i, line in enumerate(lines[-count:], start=max(1, len(lines) - count + 1)):
-            print(f" {i:5d}  {line}")
+
+        numbered = list(enumerate(lines, start=1))
+        if args.search is not None:
+            needle = args.search.casefold()
+            numbered = [(n, line) for n, line in numbered if needle in line.casefold()]
+            if not numbered:
+                print(f"(no matches for {args.search!r})")
+                return
+
+        for n, line in numbered:
+            print(f" {n:5d}  {line}")
 
     @staticmethod
     def format_name(formatter: OutputFormatter) -> str:
@@ -477,14 +670,23 @@ class ContreeShell:
             return
         FORMATTER.set(FORMATTERS[name]())
 
-    def handle_help(self, args: list[str]) -> None:
+    def handle_help(self, tokens: list[str]) -> None:
         """Show general shell help or help for a specific topic."""
-        if not args:
+        # A topic can itself look like a flag (e.g. ``help -f``,
+        # ``help --format``). Prepend ``--`` so argparse treats anything
+        # other than ``-h``/``--help`` as a positional value.
+        if tokens and tokens[0].startswith("-") and tokens[0] not in ("-h", "--help"):
+            tokens = ["--", *tokens]
+        ns = parse_builtin(HELP_PARSER, tokens)
+        if ns is None:
+            return
+        args = HelpArgs(topic=ns.topic)
+        if args.topic is None:
             self.print_shell_help()
             return
-        topic = _HELP_ALIASES.get(args[0], args[0])
-        if topic in _BUILTIN_HELP:
-            print(_BUILTIN_HELP[topic])
+        topic = HELP_ALIASES.get(args.topic, args.topic)
+        if topic in BUILTIN_HELP:
+            print(BUILTIN_HELP[topic])
             return
         # Delegate to the contree command's --help.
         self.dispatch_contree([topic, "--help"])
@@ -501,7 +703,7 @@ class ContreeShell:
             "Builtins:\n"
             "  cd [PATH]          Change working directory (cd - for previous)\n"
             "  pwd                Print working directory\n"
-            "  history [N]        Show command history (optional limit)\n"
+            "  history [SEARCH]   Show history (filter by case-insensitive substring)\n"
             "  help [TOPIC]       Show help for a command or builtin\n"
             "  clear              Clear the terminal screen\n"
             "  --format [NAME]    Change or show the output format\n"

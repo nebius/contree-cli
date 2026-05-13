@@ -134,7 +134,28 @@ Tag conventions:
 Always search before building:
   contree images --prefix=python-dev
 
-More: contree images --help, contree tag --help
+Building from a Dockerfile:
+  When a project already ships a Dockerfile, prefer `contree build`
+  over hand-running each step. It executes FROM/RUN/COPY/WORKDIR/ENV
+  /ARG/USER against the API and caches every layer as a branch so
+  rebuilds are fast.
+
+  Layer cache is keyed by abspath(context), shared across invocations:
+    contree build .                     build ./Dockerfile, no tag
+    contree build . --tag myapp:dev     build + tag the final image
+    contree build ./app --dockerfile ./app/Dockerfile.prod --tag svc:prod
+    contree build . --build-arg VERSION=1.2
+    contree build . --no-cache          force rebuild
+
+  Supported directives: FROM, RUN, COPY, ADD (local paths only),
+  WORKDIR, ENV, ARG, USER. CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/etc.
+  are parsed but skipped with a warning. Multi-stage (AS / --from)
+  is not yet supported.
+
+  .dockerignore is applied to every COPY/ADD walk on top of the
+  default exclude list (.git, __pycache__, node_modules, etc.).
+
+More: contree build --help, contree images --help, contree tag --help
 
 Files and directories
 =====================
@@ -177,6 +198,32 @@ Pending files are injected into the next non-disposable run.
 Explicit --file takes priority over pending files at same path.
 Pending files are branch-aware.
 
+Listing uploaded files:
+  contree file ls                 list all uploaded files in the project
+  contree file ls --since 1d      narrow by upload time
+  contree file ls -q              uuid + sha256 + source only (quiet)
+  contree -f json file ls         JSON output for jq
+
+  Output joins remote files (uuid, sha256, size, created_at) with the
+  local upload cache. The SOURCE column shows whatever this machine
+  used to produce the file:
+    - absolute host path for files uploaded via `run --file` / `COPY`;
+    - https://... URL for files fetched via `ADD URL`.
+
+  IMPORTANT: SOURCE is resolved ONLY for files uploaded from this
+  specific machine. The mapping lives in the local SQLite cache (per
+  profile, under $CONTREE_HOME/cli/sessions/<profile>.db) keyed by
+  path+inode+mtime+size (for host paths) or by the URL itself (for
+  URL fetches), and is NOT shared between hosts. Rows show empty
+  SOURCE when:
+    - the file was uploaded from a different machine or by a teammate;
+    - the host file has been moved, renamed, or its inode/mtime/size
+      changed since upload (the cache key no longer matches);
+    - the upload happened before tracking landed (older entries
+      backfill on the next match).
+  An agent must not assume SOURCE is authoritative across hosts;
+  for cross-machine identity always use the remote UUID or sha256.
+
 More: contree run --help, contree file --help
 
 Execution modes
@@ -211,9 +258,30 @@ Piped stdin:
 Detached mode (-d):
   contree run -d -- long-running-task
   contree ps                              check status
+  contree ps -a -S FAILED --since=1h      recent failures
   contree show UUID                       view result
   contree session wait                    block until done
   contree session wait UUID1 UUID2        wait for specific ops
+
+Monitoring background operations:
+  Use the `operation` namespace (alias `op`) when juggling several
+  detached runs. `op ls` is `ps`; `op show` and `op cancel` accept
+  multiple UUIDs in one call.
+
+  contree op ls                           list operations (= ps)
+  contree op ls -a -S EXECUTING           filter active runs
+  contree op show UUID1 UUID2 UUID3       inspect a batch in one call
+  contree op cancel UUID1 UUID2           cancel selected operations
+  contree op cancel --all                 cancel every active op (rare)
+
+  Fan-out + join pattern:
+    A=$(contree run -d -- make -C /work/a build | jq -r .uuid)
+    B=$(contree run -d -- make -C /work/b build | jq -r .uuid)
+    contree session wait "$A" "$B"
+    contree op show "$A" "$B"
+
+  Background checks are cheap: terminal results are cached locally,
+  so repeated `op show` / `show` calls do not re-hit the API.
 
 Disposable mode (-D) — no image checkpoint:
   contree run -D -- rm -rf /tmp/*
@@ -352,11 +420,16 @@ All commands
 
   use [IMAGE]             Set or show session image (aliases: ci)
   run [-- CMD]            Spawn sandbox instance (aliases: r)
+  build [CONTEXT]         Build image from Dockerfile (aliases: bd)
   images                  List/import images (aliases: i, img)
   tag [IMAGE] TAG         Tag image (aliases: t)
   ps                      List operations
   kill UUID               Cancel operation
   show UUID               Show operation result
+  operation list          List operations (aliases: op ls)
+  operation show UUID...  Show one or more operation results (aliases: op)
+  operation cancel UUID...
+                          Cancel one or more operations (or --all)
   ls [PATH]               List files in image (no VM)
   cat PATH                Show file content (no VM)
   cp PATH DEST            Download file from image
@@ -364,6 +437,7 @@ All commands
   env [KEY=VALUE ...]     Session env vars (-d to unset)
   file edit PATH          Edit remote file via $EDITOR
   file cp SRC DEST        Stage local file for next run
+  file ls [-q]            List uploaded files + local path (aliases: list)
   session list            List sessions (aliases: ls)
   session branch [NAME]   Create/list branches (aliases: br)
   session checkout BRANCH Switch branch (aliases: co)

@@ -1,15 +1,44 @@
-"""Tab completion for the interactive shell."""
+"""Tab completion for the interactive shell.
+
+Argparse-driven: walks the live ``ShellArgumentParser`` tree returned
+by :func:`build_shell_parser` to decide what the user is typing
+(subcommand, flag name, flag value, positional). Per-action completion
+sources live in :mod:`contree_cli.shell.argmap`, keyed by
+``(command_path, dest)``.
+
+The trie handles only bare-token shell builtins (``cd``, ``pwd``,
+``vim``, ``ls``, ``cat``, ``--format``, ``-f``, ...) since
+``repl.execute`` intercepts them before argparse sees them.
+
+Public entry points: :class:`ShellCompleter` with
+``.complete(text, state)`` (readline hook) and
+``.compute_completions(text, line, begidx)``.
+"""
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import shlex
 from typing import TYPE_CHECKING
 
-from contree_cli.output import FORMATTERS
-from contree_cli.shell.parser import CommandInfo, ShellArgumentParser, get_command_names
+from contree_cli.shell import argspec
+from contree_cli.shell.argmap import lookup as argmap_lookup
+from contree_cli.shell.cache import SourceCache
+from contree_cli.shell.parser import (
+    CommandInfo,
+    ShellArgumentParser,
+    build_shell_parser,
+    get_command_names,
+)
+from contree_cli.shell.sources import (
+    SOURCES,
+    CompletionContext,
+    complete_choices,
+    complete_command_name,
+    complete_sandbox_dir,
+    complete_sandbox_path,
+)
 from contree_cli.shell.trie import Handler, PrefixRouter
 
 if TYPE_CHECKING:
@@ -19,8 +48,27 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+BUILTIN_BARE_COMMANDS: tuple[str, ...] = (
+    "cd",
+    "pwd",
+    "history",
+    "help",
+    "clear",
+    "exit",
+    "quit",
+    "vim",
+    "vi",
+    "nvim",
+    "nano",
+    "ls",
+    "cat",
+    "--format",
+    "-f",
+)
+
+
 class ShellCompleter:
-    """Readline completer with PrefixRouter-based dispatch."""
+    """Readline completer with argparse-driven dispatch."""
 
     def __init__(
         self,
@@ -29,74 +77,23 @@ class ShellCompleter:
         store: SessionStore | None = None,
         root_parser: ShellArgumentParser | None = None,
     ) -> None:
-        self._commands = commands
-        self._command_names = get_command_names()
-        self._client = client
-        self._store = store
-        self._root_parser = root_parser
-        self._matches: list[str] = []
+        self.commands = commands
+        self.command_names = get_command_names()
+        self.client = client
+        self.store = store
+        self.matches: list[str] = []
+
+        if root_parser is None:
+            root_parser, _ = build_shell_parser()
+        self.root_parser = root_parser
 
         self.router: PrefixRouter = PrefixRouter()
-        self._build_router()
+        self.build_router()
 
-    def _build_router(self) -> None:
-        r = self.router
-
-        # Shell builtins with no argument completion
-        for name in ("exit", "quit", "pwd", "history", "clear"):
-            r[(name,)] = self._complete_noop
-
-        r[("help",)] = self._complete_help_names
-        r[("cd",)] = self._complete_dir_only
-
-        # Editors → sandbox path
-        for name in ("vim", "vi", "nano"):
-            r[(name,)] = self._complete_sandbox_path
-
-        # Bare aliases → sandbox path (same as contree ls/cat)
-        r[("ls",)] = self._complete_sandbox_path
-        r[("cat",)] = self._complete_sandbox_path
-
-        # contree subcommand argument completers
-        arg_map: dict[str, Handler] = {
-            "ls": self._complete_sandbox_path,
-            "cat": self._complete_sandbox_path,
-            "cp": self._complete_sandbox_path,
-            "cd": self._complete_dir_only,
-            "use": self._complete_image,
-            "tag": self._complete_image,
-            "show": self._complete_operation,
-            "kill": self._complete_operation,
-        }
-
-        # Register all contree commands (names + aliases)
-        for name in self._command_names:
-            handler = arg_map.get(name, self._complete_noop)
-            r[("contree", name)] = handler
-
-        # Register subparser children so subcommand name completion works.
-        # E.g. "contree file <TAB>" should show "edit", "cp", etc.
-        for name, info in self._commands.items():
-            for sub_name in self._get_subcommand_names(info.parser):
-                key = ("contree", name, sub_name)
-                if key not in r:
-                    r[key] = self._complete_noop
-
-        # --format / -f — complete format names
-        r[("--format",)] = self._complete_format_name
-        r[("-f",)] = self._complete_format_name
-
-        # Nested subcommands with specific completers
-        r[("contree", "session", "use")] = self._complete_session_name
-        r[("contree", "session", "checkout")] = self._complete_branch
-        r[("contree", "session", "co")] = self._complete_branch
-        r[("contree", "session", "branch")] = self._complete_branch
-        r[("contree", "session", "br")] = self._complete_branch
-        r[("contree", "file", "edit")] = self._complete_sandbox_path
-        r[("contree", "file", "e")] = self._complete_sandbox_path
+    # -- public API used by readline and tests ----------------------------
 
     def complete(self, text: str, state: int) -> str | None:
-        """Readline completer function (called repeatedly with state=0,1,...)."""
+        """Readline completer hook (called repeatedly with state=0,1,...)."""
         if state == 0:
             try:
                 import readline
@@ -106,9 +103,9 @@ class ShellCompleter:
             except (ImportError, AttributeError):
                 line = text
                 begidx = 0
-            self._matches = self.compute_completions(text, line, begidx)
-        if state < len(self._matches):
-            return self._matches[state]
+            self.matches = self.compute_completions(text, line, begidx)
+        if state < len(self.matches):
+            return self.matches[state]
         return None
 
     def compute_completions(
@@ -117,134 +114,125 @@ class ShellCompleter:
         line: str,
         begidx: int,
     ) -> list[str]:
-        """Determine context and return matching completions."""
+        """Return matches for *text* given the full *line* and cursor index."""
         before_cursor = line[:begidx]
         try:
             tokens = shlex.split(before_cursor)
         except ValueError:
             return []
 
-        # No tokens yet → root child names
+        ctx = self.context()
+
+        # First token completion: nothing typed yet, or a single partial.
         if not tokens:
             return [n + " " for n in self.router.children if n.startswith(text)]
 
-        node, depth = self.router.resolve(tuple(tokens))
-        remaining = tuple(tokens[depth:])
+        # Bare-token shell builtins go through the trie.
+        first = tokens[0]
+        if first in BUILTIN_BARE_COMMANDS:
+            return self.dispatch_trie(tokens, text, ctx)
 
-        # Flag-value completion: -f/--format <TAB> → format names
-        if tokens and tokens[-1] in ("-f", "--format"):
-            return self._complete_format_name((), text)
+        # Everything else is argparse-driven: with or without the literal
+        # "contree" prefix.
+        argparse_tokens = tokens[1:] if first == "contree" else tokens
+        return self.complete_argparse(argparse_tokens, text, ctx)
 
-        # Flags: look up the parser from commands dict
-        if text.startswith("-"):
-            parser = self._find_parser(tokens)
-            if parser is not None:
-                return self._complete_flags(parser, text)
+    # -- trie path --------------------------------------------------------
 
-        # Children → subcommand name completion
-        if node.children:
-            matches = [n + " " for n in node.children if n.startswith(text)]
-            if matches:
-                return matches
+    def build_router(self) -> None:
+        r = self.router
 
-        # Handler with remaining tokens
-        if node.value is not None:
-            return node.value(remaining, text)
+        for name in ("exit", "quit", "pwd", "clear"):
+            r[(name,)] = handler_noop
 
-        # Fallback: implicit run mode — path-like text gets path completion,
-        # anything else gets root command names as suggestions.
-        if self._looks_like_path(text):
-            return self._complete_sandbox_path((), text)
+        r[("history",)] = handler_noop
 
-        return [n + " " for n in self.router.children if n.startswith(text)]
+        r[("help",)] = self.handler_help
+        r[("cd",)] = self.handler_sandbox_dir
 
-    # ------------------------------------------------------------------
-    # Parser lookup for flag completion
-    # ------------------------------------------------------------------
+        for name in ("vim", "vi", "nvim", "nano"):
+            r[(name,)] = self.handler_sandbox_path
 
-    def _find_parser(
+        r[("ls",)] = self.handler_sandbox_path
+        r[("cat",)] = self.handler_sandbox_path
+
+        # Format flag belongs to the trie so "--format <TAB>" works as a
+        # standalone shell builtin (intercepted in repl.execute).
+        r[("--format",)] = self.handler_format
+        r[("-f",)] = self.handler_format
+
+        # Register every contree command name (and aliases) as router roots
+        # so first-token completion still lists them. Their values are
+        # resolved by the argparse path, so the handler is a noop here.
+        for name in self.command_names:
+            r[("contree", name)] = handler_noop
+
+    def dispatch_trie(
         self,
         tokens: list[str],
-    ) -> argparse.ArgumentParser | None:
-        """Find the argparse parser for the current command context."""
-        # Strip "contree" prefix if present
-        cmd_tokens = tokens[1:] if tokens and tokens[0] == "contree" else tokens
-        if not cmd_tokens:
-            return None
-        cmd_name = cmd_tokens[0]
-        if cmd_name not in self._commands:
-            return None
-        return self._commands[cmd_name].parser
-
-    # ------------------------------------------------------------------
-    # Completion handlers  (remaining, text) -> list[str]
-    # ------------------------------------------------------------------
-
-    def _complete_noop(
-        self,
-        remaining: tuple[str, ...],
         text: str,
+        ctx: CompletionContext,
     ) -> list[str]:
+        """Resolve a builtin via the trie."""
+        node, depth = self.router.resolve(tuple(tokens))
+        # Format flag value: "--format <TAB>" or "-f <TAB>".
+        if tokens and tokens[-1] in ("--format", "-f"):
+            return self.handler_format((), text, ctx)
+        if node.value is not None:
+            remaining = tuple(tokens[depth:])
+            return node.value(remaining, text, ctx)
         return []
 
-    def _complete_help_names(
+    # -- argparse path ----------------------------------------------------
+
+    def complete_argparse(
         self,
-        remaining: tuple[str, ...],
+        tokens: list[str],
         text: str,
+        ctx: CompletionContext,
     ) -> list[str]:
-        """``help <name>`` — all known command / alias / shell names."""
-        all_names = sorted({*self._command_names, *self.router.children})
-        return [n + " " for n in all_names if n.startswith(text)]
+        walk_result = argspec.walk(self.root_parser, tokens)
+        target = argspec.next_target(walk_result, tokens, text)
 
-    def _complete_format_name(
-        self,
-        remaining: tuple[str, ...],
-        text: str,
-    ) -> list[str]:
-        """Complete output format names (``--format json``, ``-f table``)."""
-        return [n + " " for n in sorted(FORMATTERS) if n.startswith(text)]
+        if isinstance(target, argspec.End):
+            # Implicit-run fallback: bare command not recognised by argparse,
+            # path-like text gets sandbox-path completion.
+            if self.looks_like_path(text):
+                return complete_sandbox_path(text, ctx)
+            if not tokens:
+                return [n + " " for n in self.router.children if n.startswith(text)]
+            return []
 
-    def _complete_dir_only(
-        self,
-        remaining: tuple[str, ...],
-        text: str,
-    ) -> list[str]:
-        """Complete sandbox directory paths (no files)."""
-        return self._complete_sandbox_path_inner(text, dirs_only=True)
+        if isinstance(target, argspec.Subcommand):
+            choices = list(target.action.choices.keys())
+            return [n + " " for n in choices if n.startswith(text)]
 
-    def _complete_sandbox_path(
-        self,
-        remaining: tuple[str, ...],
-        text: str,
-    ) -> list[str]:
-        """Complete a sandbox file/directory path."""
-        return self._complete_sandbox_path_inner(text)
+        if isinstance(target, argspec.FlagName):
+            return self.list_flag_names(target.parser, text)
 
-    @staticmethod
-    def _looks_like_path(text: str) -> bool:
-        """Return True when *text* looks like a filesystem path."""
-        return "/" in text or text.startswith(".") or text.startswith("~")
+        if isinstance(target, argspec.FlagValue):
+            return self.complete_action_value(
+                target.action,
+                target.value_text,
+                ctx,
+                walk_result.command_path,
+            )
 
-    # ------------------------------------------------------------------
-    # Low-level helpers
-    # ------------------------------------------------------------------
+        if isinstance(target, argspec.Positional):
+            return self.complete_action_value(
+                target.action,
+                text,
+                ctx,
+                walk_result.command_path,
+            )
 
-    @staticmethod
-    def _get_subcommand_names(
-        parser: argparse.ArgumentParser,
-    ) -> list[str]:
-        """Extract subcommand names from a parser (if it has subparsers)."""
-        for action in parser._actions:
-            if isinstance(action, argparse._SubParsersAction):
-                return list(action.choices.keys())
         return []
 
-    def _complete_flags(
+    def list_flag_names(
         self,
         parser: argparse.ArgumentParser,
         text: str,
     ) -> list[str]:
-        """Complete flag names from parser actions."""
         flags: list[str] = []
         for action in parser._actions:
             for opt in action.option_strings:
@@ -252,234 +240,132 @@ class ShellCompleter:
                     flags.append(opt + " ")
         return flags
 
-    def _complete_sandbox_path_inner(
+    def complete_action_value(
         self,
+        action: argparse.Action,
         text: str,
-        *,
-        dirs_only: bool = False,
+        ctx: CompletionContext,
+        command_path: tuple[str, ...],
     ) -> list[str]:
-        """Complete a sandbox file path via the inspect API."""
-        if self._client is None or self._store is None:
-            return []
+        source_name = argmap_lookup(command_path, action.dest)
+        if source_name is not None:
+            fn = SOURCES.get(source_name)
+            if fn is not None:
+                return fn(text, ctx)
+        if action.choices is not None:
+            return complete_choices(action.choices, text)
+        return []
 
-        try:
-            session = self._store.session
-            if session is None:
-                return []
-            image_uuid = session.current_image
-        except (SystemExit, Exception):
-            return []
+    # -- handlers used by trie -------------------------------------------
 
-        # Split into directory + prefix for the API query.
-        # resolve_path handles cwd joining and .. normalisation.
-        if "/" in text:
-            last_slash = text.rindex("/")
-            user_dir = text[: last_slash + 1] or "/"
-            prefix = text[last_slash + 1 :]
-            resolved = self._store.resolve_path(user_dir)
-            api_dir = resolved if resolved == "/" else resolved + "/"
-        else:
-            user_dir = ""
-            prefix = text
-            resolved = self._store.resolve_path("")
-            api_dir = resolved if resolved == "/" else resolved + "/"
-
-        entries = self._list_dir(image_uuid, api_dir)
-        if entries is None:
-            return []
-
-        results: list[str] = []
-        for entry in entries:
-            path = entry.get("path", "")
-            if not isinstance(path, str) or not path:
-                continue
-            is_dir = bool(entry.get("is_dir"))
-            if dirs_only and not is_dir:
-                continue
-            # API returns full paths like "/etc/hosts" — extract basename
-            name = path.rsplit("/", 1)[-1]
-            if not name.startswith(prefix):
-                continue
-            # Return the path as the user typed it (relative or absolute)
-            full = user_dir + name
-            if is_dir:
-                full += "/"
-            else:
-                full += " "
-            results.append(full)
-        return results
-
-    def _complete_image(
+    def handler_help(
         self,
         remaining: tuple[str, ...],
         text: str,
+        ctx: CompletionContext,
     ) -> list[str]:
-        """Complete image references (``tag:NAME`` or UUID).
+        return complete_command_name(text, ctx)
 
-        When the user types a ``tag:`` prefix, matches are filtered
-        against the full ``tag:NAME`` candidate.  Otherwise bare text
-        is matched against tag names directly and the completion
-        inserts the ``tag:`` prefix for the user.
-        """
-        images = self._list_images()
-        if images is None:
-            return []
-
-        results: list[str] = []
-        for img in images:
-            tag = img.get("tag")
-            if isinstance(tag, str) and tag:
-                prefixed = f"tag:{tag}"
-                if text.startswith("tag:"):
-                    if prefixed.startswith(text):
-                        results.append(prefixed + " ")
-                elif tag.startswith(text):
-                    results.append(prefixed + " ")
-            uuid_str = img.get("uuid")
-            if isinstance(uuid_str, str) and uuid_str.startswith(text):
-                results.append(uuid_str + " ")
-        return results
-
-    def _complete_operation(
+    def handler_sandbox_dir(
         self,
         remaining: tuple[str, ...],
         text: str,
+        ctx: CompletionContext,
     ) -> list[str]:
-        """Complete operation UUIDs for ``show`` and ``kill``."""
-        ops = self._list_operations()
-        if ops is None:
-            return []
-        results: list[str] = []
-        for op in ops:
-            uuid_str = op.get("uuid")
-            if isinstance(uuid_str, str) and uuid_str.startswith(text):
-                results.append(uuid_str + " ")
-        return results
+        return complete_sandbox_dir(text, ctx)
 
-    def _list_operations(self) -> list[dict[str, object]] | None:
-        """Fetch recent operations from the API (no caching)."""
-        if self._client is None:
-            return None
-        try:
-            resp = self.client.get(
-                "/v1/operations",
-                params={"limit": "100"},
-            )
-            data = json.loads(resp.read())
-            return data.get("operations", [])  # type: ignore[no-any-return]
-        except Exception:
-            log.debug("Operation completion failed")
-            return None
-
-    def _complete_session_name(
+    def handler_sandbox_path(
         self,
         remaining: tuple[str, ...],
         text: str,
+        ctx: CompletionContext,
     ) -> list[str]:
-        """Complete session names for ``session use``."""
-        if self._store is None:
-            return []
-        try:
-            sessions = self._store.list_sessions()
-        except Exception:
-            return []
-        results: list[str] = []
-        for s in sessions:
-            key = s.session_key
-            # Match full key
-            if key.startswith(text):
-                results.append(key + " ")
-            # Match suffix (last component after _)
-            suffix = key.rsplit("_", 1)[-1] if "_" in key else ""
-            if suffix and suffix != key and suffix.startswith(text):
-                results.append(suffix + " ")
-        return results
+        return complete_sandbox_path(text, ctx)
 
-    def _complete_branch(
+    def handler_format(
         self,
         remaining: tuple[str, ...],
         text: str,
+        ctx: CompletionContext,
     ) -> list[str]:
-        """Complete branch names for ``session checkout/branch``."""
-        if self._store is None:
-            return []
-        try:
-            branches = self._store.list_branches()
-        except Exception:
-            return []
-        return [name + " " for name, _active in branches if name.startswith(text)]
+        from contree_cli.output import FORMATTERS
 
-    @property
-    def client(self) -> ContreeClient:
-        if self._client is None:
-            raise RuntimeError("ContreeClient is not set")
-        return self._client
+        return [n + " " for n in sorted(FORMATTERS) if n.startswith(text)]
 
-    @property
-    def cache(self) -> ImageCache:
-        if self._store is None:
-            raise RuntimeError("SessionStore is not set")
-        return self._store.cache
+    # -- helpers ---------------------------------------------------------
 
-    def cached(
-        self,
-        key: tuple[str, str],
-    ) -> list[dict[str, object]] | None:
-        """Return a cached value or ``None``."""
-        result = self.cache.get(key)
-        return result  # type: ignore[return-value]
+    @staticmethod
+    def looks_like_path(text: str) -> bool:
+        return "/" in text or text.startswith(".") or text.startswith("~")
 
-    def _list_images(self) -> list[dict[str, object]] | None:
-        """Fetch image list from the API, with persistent caching."""
-        if self._client is None or self._store is None:
-            return None
-
-        cache_key = ("", "images")
-        cached = self.cached(cache_key)
-        if cached is not None:
-            return cached
-
-        try:
-            resp = self.client.get(
-                "/v1/images",
-                params={"limit": "100"},
-            )
-            data = json.loads(resp.read())
-            images: list[dict[str, object]] = data.get("images", [])
-            self.cache[cache_key] = images
-            return images
-        except Exception:
-            log.debug("Image completion failed")
-            return None
-
-    def _list_dir(
+    def list_dir(
         self,
         image_uuid: str,
         dir_path: str,
     ) -> list[dict[str, object]] | None:
-        """List a sandbox directory, with persistent caching."""
-        cache_key = (image_uuid, f"files:{dir_path}")
+        """Method-form wrapper around :func:`sources.list_sandbox_dir`.
 
-        cached = self.cached(cache_key)
-        if cached is not None:
-            return cached
+        Bound on the instance so callers (including tests) can override
+        the sandbox listing strategy by patching one attribute.
+        """
+        from contree_cli.shell.sources import list_sandbox_dir
+
+        return list_sandbox_dir(self.context(), image_uuid, dir_path)
+
+    def context(self) -> CompletionContext:
+        cache = (
+            SourceCache(self.store.cache, self.profile_name())
+            if self.store is not None
+            else None
+        )
+        cwd = ""
+        if self.store is not None:
+            try:
+                cwd_value = self.store.get_cwd()
+                cwd = cwd_value if isinstance(cwd_value, str) else ""
+            except Exception:
+                cwd = ""
+        return CompletionContext(
+            client=self.client,
+            store=self.store,
+            cache=cache,
+            profile=self.profile_name(),
+            cwd=cwd,
+            tokens=tuple(),
+            list_dir=self.list_dir,
+        )
+
+    @staticmethod
+    def profile_name() -> str:
+        from contree_cli import PROFILE
 
         try:
-            from contree_cli.client import resolve_image
+            return PROFILE.get().name
+        except LookupError:
+            return "default"
 
-            uuid = resolve_image(self.client, image_uuid)
-            resp = self.client.get(
-                f"/v1/inspect/{uuid}/list",
-                params={"path": dir_path},
-            )
-            data = json.loads(resp.read())
-            file_list: list[dict[str, object]] = data.get("files", [])
-            self.cache[cache_key] = file_list
-            return file_list
-        except Exception:
-            log.debug(
-                "Path completion failed for %s:%s",
-                image_uuid,
-                dir_path,
-            )
-            return None
+    @property
+    def cache(self) -> ImageCache:
+        if self.store is None:
+            raise RuntimeError("SessionStore is not set")
+        return self.store.cache
+
+
+# ---------------------------------------------------------------------------
+# Trie handlers shared across multiple commands
+# ---------------------------------------------------------------------------
+
+
+def handler_noop(
+    remaining: tuple[str, ...],
+    text: str,
+    ctx: CompletionContext,
+) -> list[str]:
+    return []
+
+
+__all__ = [
+    "Handler",
+    "PrefixRouter",
+    "ShellCompleter",
+]

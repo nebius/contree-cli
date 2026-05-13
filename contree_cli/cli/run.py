@@ -379,15 +379,17 @@ def record_local_uuid(mf: MappedFile, file_uuid: str, store: SessionStore) -> No
     store.cache[("", cache_kind)] = {
         "uuid": file_uuid,
         "uploaded_at": time.time(),
+        "local_path": os.path.abspath(mf.host_path),
     }
 
 
 def upload_one_remote(client: ContreeClient, mf: MappedFile) -> tuple[MappedFile, str]:
     """HTTP-only upload (sha256 dedup + POST /v1/files). Thread-safe."""
+    sha = mf.sha256()
     try:
-        resp = client.get("/v1/files", params={"sha256": mf.sha256()})
+        resp = client.get(f"/v1/files/{sha}")
         file_uuid = str(json.loads(resp.read())["uuid"])
-        logger.info("Uploaded file: %s -> %s", mf.host_path, file_uuid)
+        logger.info("File reused: %s -> %s", mf.host_path, file_uuid)
         return mf, file_uuid
     except ApiError as exc:
         if exc.status != 404:
@@ -417,6 +419,9 @@ def upload_files(
         cached = cached_local_uuid(mf, store)
         if cached:
             uploaded[mf.host_path] = cached
+            # Rewrite the entry so older payloads without local_path are
+            # backfilled with the current host path.
+            record_local_uuid(mf, cached, store)
         else:
             pending.append(mf)
 
@@ -441,9 +446,13 @@ def _build_payload(
 ) -> dict[str, object]:
     """Build the JSON payload for POST /v1/instances."""
     if args.shell:
-        # In shell mode the API runs `sh -c <command>`, so we must
-        # rebuild the original argv into a shell-safe expression.
-        command = shlex.join(args.command_args)
+        # API runs `sh -c <command>`. A single arg is already a shell
+        # expression (the user pre-quoted it: `run -s -- 'a ; b'`), so
+        # passing it through verbatim preserves operators like `;`, `&&`,
+        # `|`. Multiple args are individual tokens that need joining with
+        # quoting to preserve argument boundaries.
+        parts = args.command_args
+        command = parts[0] if len(parts) == 1 else shlex.join(parts)
     else:
         # In non-shell mode the API exec's command + args directly,
         # JSON list elements preserve boundaries, no quoting needed.
@@ -710,7 +719,21 @@ def cmd_run(args: RunArgs) -> int | None:
     # 6. Cache terminal operation result
     store.cache[(op_uuid, "operation")] = op
 
-    if op["status"] != "SUCCESS":
+    metadata = op.get("metadata") or {}
+    assert isinstance(metadata, dict)
+    instance_result = metadata.get("result") or {}
+    assert isinstance(instance_result, dict)
+    state = instance_result.get("state") or {}
+    assert isinstance(state, dict)
+    timed_out = bool(state.get("timed_out"))
+
+    if timed_out:
+        logger.warning(
+            "Operation %s timed out after %ss",
+            op_uuid,
+            args.timeout if args.timeout is not None else "?",
+        )
+    elif op["status"] != "SUCCESS":
         logger.fatal(
             "Operation %s ended with status %s%s",
             op_uuid,
@@ -744,12 +767,6 @@ def cmd_run(args: RunArgs) -> int | None:
             title = " ".join(args.command_args) if args.command_args else ""
             store.create_disposable_branch(op_uuid, title)
 
-    metadata = op.get("metadata") or {}
-    assert isinstance(metadata, dict)
-    instance_result = metadata.get("result") or {}
-    assert isinstance(instance_result, dict)
-    state = instance_result.get("state") or {}
-    assert isinstance(state, dict)
     exit_code = state.get("exit_code")
     if isinstance(exit_code, int):
         return exit_code

@@ -119,21 +119,31 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     return cmd_ps, PsArgs
 
 
+DATETIME_FIELDS = frozenset({"created_at", "started_at", "finished_at", "updated_at"})
+
+
+def transform_field(key: str, value: Any) -> Any:
+    """Light-touch typing for known fields, pass-through for everything else."""
+    if value is None:
+        return "" if key == "error" else None
+    if key in DATETIME_FIELDS:
+        return parse_datetime(value)
+    if key == "duration":
+        return timedelta(seconds=value)
+    return value
+
+
 def emit_op(formatter: OutputFormatter, op: dict[str, Any], *, quiet: bool) -> None:
-    row = dict(
-        uuid=op["uuid"],
-        status=op["status"],
-        kind=op["kind"],
-        created_at=parse_datetime(op["created_at"]),
-        duration=timedelta(seconds=op["duration"])
-        if op.get("duration") is not None
-        else None,
-        error=op.get("error") or "",
-    )
     if quiet:
-        print(row["uuid"])
-    else:
-        formatter(**row)
+        print(op["uuid"])
+        return
+    row = {
+        key: transform_field(key, value)
+        for key, value in op.items()
+        if key != "error" and not isinstance(value, (dict, list))
+    }
+    row["error"] = transform_field("error", op.get("error"))
+    formatter(**row)
 
 
 def cmd_ps(args: PsArgs) -> None:

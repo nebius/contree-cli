@@ -49,12 +49,15 @@ def _op_response(
     duration: float | None = 2.0,
     error: str | None = None,
     image: str = IMG_NEW,
+    state_extra: dict | None = None,
 ) -> FakeResponse:
-    state = {}
+    state: dict = {}
     if exit_code is not None:
         state["exit_code"] = exit_code
+    if state_extra:
+        state.update(state_extra)
     instance_result: dict | None = None
-    if stdout is not None or stderr is not None or exit_code is not None:
+    if stdout is not None or stderr is not None or state:
         instance_result = {
             "stdout": stdout,
             "stderr": stderr,
@@ -221,6 +224,61 @@ class TestPollLoop:
         rc = _run_cmd(contree_client, args, responses, store=session_store)
         assert rc == 137
 
+    def test_timed_out_logs_warning(self, contree_client, session_store, caplog):
+        """``state.timed_out=true`` triggers a WARNING regardless of status.
+
+        The API can report SUCCESS while still flagging the process as killed
+        by the user-set timeout (signal=9, exit_code=-1, timed_out=true).
+        """
+        session_store.set_image(IMG_UUID, kind="test")
+        args = _default_args(timeout=60)
+        responses = [
+            _spawn_response(),
+            _op_response(
+                status="SUCCESS",
+                exit_code=-1,
+                state_extra={"timed_out": True, "signal": 9},
+            ),
+        ]
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.run"):
+            _run_cmd(contree_client, args, responses, store=session_store)
+
+        records = [r for r in caplog.records if "timed out" in r.getMessage()]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert "60s" in records[0].getMessage()
+
+    def test_failed_without_timeout_still_fatal(
+        self, contree_client, session_store, caplog
+    ):
+        """A non-timeout FAILED keeps emitting at FATAL severity."""
+        session_store.set_image(IMG_UUID, kind="test")
+        args = _default_args()
+        responses = [
+            _spawn_response(),
+            _op_response(status="FAILED", exit_code=1, error="oom"),
+        ]
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.run"):
+            _run_cmd(contree_client, args, responses, store=session_store)
+
+        ended = [r for r in caplog.records if "ended with status" in r.getMessage()]
+        assert len(ended) == 1
+        assert ended[0].levelno == logging.CRITICAL
+
+    def test_success_without_timeout_logs_nothing(
+        self, contree_client, session_store, caplog
+    ):
+        """Plain SUCCESS does not emit a timeout warning."""
+        session_store.set_image(IMG_UUID, kind="test")
+        args = _default_args()
+        responses = [
+            _spawn_response(),
+            _op_response(status="SUCCESS", exit_code=0),
+        ]
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.run"):
+            _run_cmd(contree_client, args, responses, store=session_store)
+        assert [r for r in caplog.records if "timed out" in r.getMessage()] == []
+
     def test_exit_code_propagated(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
@@ -369,7 +427,7 @@ class TestFileUpload:
         # Verify dedup check then file upload
         req0 = contree_client.get_request(0)
         assert req0.method == "GET"
-        assert "/v1/files?sha256=" in req0.path
+        assert "/v1/files/" in req0.path
         req1 = contree_client.get_request(1)
         assert req1.method == "POST"
         assert "/v1/files" in req1.path
@@ -408,7 +466,7 @@ class TestFileUpload:
         assert body["files"]["/app/script.sh"]["uid"] == 1000
 
     def test_file_dedup_skips_upload(self, contree_client, session_store, tmp_path):
-        """GET /v1/files?sha256=... returns 200 -> no POST upload, UUID reused."""
+        """GET /v1/files/... returns 200 -> no POST upload, UUID reused."""
         session_store.set_image(IMG_UUID, kind="test")
         host_file = tmp_path / "data.txt"
         host_file.write_text("content")
@@ -433,7 +491,7 @@ class TestFileUpload:
         # Only GET (dedup), POST (spawn), GET (poll) -- no POST /v1/files
         req0 = contree_client.get_request(0)
         assert req0.method == "GET"
-        assert "/v1/files?sha256=" in req0.path
+        assert "/v1/files/" in req0.path
         assert methods.count("POST") == 1  # only the spawn POST
 
         # Spawn uses the existing UUID
@@ -464,7 +522,7 @@ class TestFileUpload:
         ]
         with caplog.at_level(logging.INFO):
             _run_cmd(contree_client, args, responses, store=session_store)
-        assert "Uploaded file:" in caplog.text
+        assert "File reused:" in caplog.text
         assert "existing-uuid" in caplog.text
 
     def test_file_dedup_non_404_raises(self, contree_client, session_store, tmp_path):
@@ -555,7 +613,7 @@ class TestFileUpload:
 
         req0 = contree_client.get_request(0)
         assert req0.method == "GET"
-        assert "/v1/files?sha256=" in req0.path
+        assert "/v1/files/" in req0.path
         spawn_req = contree_client.get_request(1)
         spawn_body = json.loads(spawn_req.body)
         assert spawn_body["files"]["/app/cached-change.txt"]["uuid"] == "new-uuid"
@@ -996,6 +1054,30 @@ class TestShellMode:
         spawn_req = contree_client.get_request(0)
         body = json.loads(spawn_req.body)
         assert body["command"] == "ls -la /etc"
+
+    def test_shell_passes_single_expression_verbatim(
+        self, contree_client, session_store
+    ):
+        """Single arg is treated as a pre-formed shell expression.
+
+        `contree run -s -- 'echo 1 ; echo 2'` produces command_args with one
+        element. Wrapping it via shlex.join would quote the whole string and
+        sh -c would try to exec the literal as a command name.
+        """
+        session_store.set_image(IMG_UUID, kind="test")
+        args = _default_args(
+            command_args=["echo 1 ; echo 2"],
+            shell=True,
+        )
+        responses = [
+            _spawn_response(),
+            _op_response(status="SUCCESS", exit_code=0),
+        ]
+        _run_cmd(contree_client, args, responses, store=session_store)
+        spawn_req = contree_client.get_request(0)
+        body = json.loads(spawn_req.body)
+        assert body["command"] == "echo 1 ; echo 2"
+        assert body["shell"] is True
 
 
 # ── Session update on success ────────────────────────────────────────────

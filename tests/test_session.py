@@ -771,6 +771,37 @@ class TestImageCache:
         cache2 = session_store.cache
         assert cache2["img-1", "files:/"] == ["root"]
 
+    def test_local_file_paths_returns_uuid_to_path(self, session_store: SessionStore):
+        cache = session_store.cache
+        cache[("", "local_file:a")] = {"uuid": "u-1", "local_path": "/host/a.txt"}
+        cache[("", "local_file:b")] = {"uuid": "u-2", "local_path": "/host/b.txt"}
+        cache[("img-x", "files:/etc")] = ["unrelated"]
+        result = cache.local_file_paths()
+        assert result == {"u-1": "/host/a.txt", "u-2": "/host/b.txt"}
+
+    def test_local_file_paths_skips_entries_without_source(
+        self, session_store: SessionStore
+    ):
+        cache = session_store.cache
+        cache[("", "local_file:old")] = {"uuid": "u-old"}
+        cache[("", "local_file:new")] = {"uuid": "u-new", "local_path": "/host/x"}
+        assert cache.local_file_paths() == {"u-new": "/host/x"}
+
+    def test_local_file_paths_returns_url_sources(self, session_store: SessionStore):
+        cache = session_store.cache
+        cache[("", "local_file:https://example.com/pkg.tgz")] = {
+            "uuid": "u-url",
+            "url": "https://example.com/pkg.tgz",
+        }
+        cache[("", "local_file:/home/u/x.txt")] = {
+            "uuid": "u-local",
+            "local_path": "/home/u/x.txt",
+        }
+        assert cache.local_file_paths() == {
+            "u-url": "https://example.com/pkg.tgz",
+            "u-local": "/home/u/x.txt",
+        }
+
     def test_global_image_list(self, session_store: SessionStore):
         """The image list cache uses empty-string UUID."""
         cache = session_store.cache
@@ -991,3 +1022,23 @@ class TestHistoryDepth:
         assert session_store.history_depth() == 2
         session_store.set_image("img-3", kind="run")
         assert session_store.history_depth() == 3
+
+
+class TestConcurrentStores:
+    def test_two_stores_on_same_db_do_not_lock(self, tmp_path: Path):
+        # Two `contree shell` tabs share one per-profile SQLite file.
+        # WAL + busy_timeout must let interleaved writes succeed.
+        db = tmp_path / "shared.db"
+        store_a = SessionStore(db, "sess-a")
+        store_b = SessionStore(db, "sess-b")
+        try:
+            for i in range(20):
+                store_a.set_image(f"img-a-{i}", kind="run")
+                store_b.set_image(f"img-b-{i}", kind="run")
+                store_a.cache[(f"img-a-{i}", "list:/etc")] = {"n": i}
+                store_b.cache[(f"img-b-{i}", "list:/etc")] = {"n": i}
+            assert store_a.history_depth() == 20
+            assert store_b.history_depth() == 20
+        finally:
+            store_a.close()
+            store_b.close()

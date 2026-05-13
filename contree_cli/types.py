@@ -70,6 +70,11 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "last": ("-l", "--last"),
         "prune": ("--prune",),
         "show_max": ("-M", "--show-max"),
+        # build
+        "dockerfile": ("--dockerfile",),
+        "tag_name": ("--tag",),
+        "build_arg": ("--build-arg",),
+        "no_cache": ("--no-cache",),
     }
 )
 
