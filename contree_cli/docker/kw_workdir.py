@@ -10,10 +10,13 @@ from .context import BuildContext
 from .keyword import DockerKeyword
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class WorkdirKeyword(DockerKeyword):
     NAME: ClassVar[str] = "WORKDIR"
     path: str = ""
+
+    def __repr__(self) -> str:
+        return f"WORKDIR {self.path}"
 
     @classmethod
     def parse(cls, args_text: str) -> WorkdirKeyword:

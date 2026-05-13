@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import logging
@@ -121,7 +120,6 @@ class BuildContext:
             return None
         self.store.switch_branch(branch_name)
         self.last_image = tip.image_uuid
-        logger.info("layer cache hit: %s -> %s", branch_name, tip.image_uuid)
         return tip.image_uuid
 
     def commit_layer(
@@ -133,33 +131,31 @@ class BuildContext:
         title: str,
         operation_uuid: str = "",
     ) -> None:
-        """Materialize a fresh layer branch pointing at ``image_uuid``.
+        """Materialize a layer branch pointing at ``image_uuid``.
 
-        Forks from the currently active branch (the parent layer). When the
-        session is brand-new and has no active branch, the first ``set_image``
-        bootstraps the implicit ``main`` branch before we fork.
+        Works whether the target branch is brand-new, stale from a prior
+        no-cache rebuild, or even the currently active branch -- in every
+        case ``set_image_on_branch`` appends a new history entry on it and
+        moves the branch pointer to the new tip. We then make it active.
         """
-        with contextlib.suppress(ValueError):
-            self.store.delete_branch(branch_name)
-
         if self.store.session is None:
+            # Bootstrap: set_image creates the implicit 'main' branch
+            # before we fork off the named layer.
             self.store.set_image(
                 image_uuid,
                 kind=kind,
                 title=title,
                 operation_uuid=operation_uuid,
             )
-            self.store.create_branch(branch_name)
-            self.store.switch_branch(branch_name)
-        else:
-            self.store.create_branch(branch_name)
-            self.store.switch_branch(branch_name)
-            self.store.set_image(
-                image_uuid,
-                kind=kind,
-                title=title,
-                operation_uuid=operation_uuid,
-            )
+
+        self.store.set_image_on_branch(
+            branch_name,
+            image_uuid,
+            kind=kind,
+            title=title,
+            operation_uuid=operation_uuid,
+        )
+        self.store.switch_branch(branch_name)
 
         self.last_image = image_uuid
         self.last_op_uuid = operation_uuid

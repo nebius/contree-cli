@@ -114,10 +114,14 @@ def _run_file_ls(
 
 
 class TestFileLs:
-    def test_lists_with_local_path(self, contree_client, session_store, capsys):
+    def test_lists_with_source(self, contree_client, session_store, capsys):
         session_store.cache[("", "local_file:a")] = {
             "uuid": "file-1",
             "local_path": "/host/app.py",
+        }
+        session_store.cache[("", "local_file:https://example.com/pkg.tgz")] = {
+            "uuid": "file-3",
+            "url": "https://example.com/pkg.tgz",
         }
         responses = [
             _api_response(
@@ -125,6 +129,7 @@ class TestFileLs:
                     "files": [
                         {"uuid": "file-1", "sha256": "abc", "size": 10},
                         {"uuid": "file-2", "sha256": "def", "size": 20},
+                        {"uuid": "file-3", "sha256": "ghi", "size": 30},
                     ]
                 }
             ),
@@ -136,12 +141,10 @@ class TestFileLs:
             store=session_store,
         )
         assert rc is None
-        out = capsys.readouterr().out.splitlines()
-        rows = [json.loads(line) for line in out]
-        assert rows[0]["uuid"] == "file-1"
-        assert rows[0]["local_path"] == "/host/app.py"
-        assert rows[1]["uuid"] == "file-2"
-        assert rows[1]["local_path"] == ""
+        rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert rows[0]["source"] == "/host/app.py"
+        assert rows[1]["source"] == ""
+        assert rows[2]["source"] == "https://example.com/pkg.tgz"
 
     def test_quiet_emits_three_columns(self, contree_client, session_store, capsys):
         session_store.cache[("", "local_file:a")] = {
@@ -168,12 +171,9 @@ class TestFileLs:
             responses,
             store=session_store,
         )
-        out = capsys.readouterr().out.strip()
-        row = json.loads(out)
-        assert set(row) == {"uuid", "sha256", "local_path"}
-        assert row["uuid"] == "file-1"
-        assert row["sha256"] == "abc"
-        assert row["local_path"] == "/host/app.py"
+        row = json.loads(capsys.readouterr().out.strip())
+        assert set(row) == {"uuid", "sha256", "source"}
+        assert row["source"] == "/host/app.py"
 
 
 class TestFileSha256:

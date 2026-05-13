@@ -21,11 +21,16 @@ logger = logging.getLogger(__name__)
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class FromKeyword(DockerKeyword):
     NAME: ClassVar[str] = "FROM"
     image_ref: str = ""
     alias: str = ""
+
+    def __repr__(self) -> str:
+        if self.alias:
+            return f"FROM {self.image_ref} AS {self.alias}"
+        return f"FROM {self.image_ref}"
 
     @classmethod
     def parse(cls, args_text: str) -> FromKeyword:
@@ -52,6 +57,7 @@ class FromKeyword(DockerKeyword):
         ctx.pending.clear()
         cached = ctx.try_cache_hit(branch_name)
         if cached is not None:
+            logger.info("CACHED: %r -> %s", self, cached)
             ctx.parent_hash = from_hash
             return
 

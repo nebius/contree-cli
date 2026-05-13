@@ -9,10 +9,13 @@ from .context import BuildContext
 from .keyword import DockerKeyword, parse_keyval_pairs
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class EnvKeyword(DockerKeyword):
     NAME: ClassVar[str] = "ENV"
     pairs: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+
+    def __repr__(self) -> str:
+        return "ENV " + " ".join(f"{k}={v}" for k, v in self.pairs)
 
     @classmethod
     def parse(cls, args_text: str) -> EnvKeyword:

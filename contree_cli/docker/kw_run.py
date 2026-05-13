@@ -19,11 +19,16 @@ logger = logging.getLogger(__name__)
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class RunKeyword(DockerKeyword):
     NAME: ClassVar[str] = "RUN"
     parts: tuple[str, ...] = field(default_factory=tuple)
     shell_form: bool = True
+
+    def __repr__(self) -> str:
+        if self.shell_form:
+            return f"RUN {self.parts[0] if self.parts else ''}"
+        return f"RUN {json.dumps(list(self.parts))}"
 
     @classmethod
     def parse(cls, args_text: str) -> RunKeyword:
@@ -48,6 +53,7 @@ class RunKeyword(DockerKeyword):
 
         cached = ctx.try_cache_hit(branch_name)
         if cached is not None:
+            logger.info("CACHED: %r -> %s", self, cached)
             ctx.parent_hash = chain
             ctx.pending.clear()
             return

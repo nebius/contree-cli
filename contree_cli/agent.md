@@ -201,24 +201,27 @@ Pending files are branch-aware.
 Listing uploaded files:
   contree file ls                 list all uploaded files in the project
   contree file ls --since 1d      narrow by upload time
-  contree file ls -q              uuid + sha256 + local_path only (quiet)
+  contree file ls -q              uuid + sha256 + source only (quiet)
   contree -f json file ls         JSON output for jq
 
   Output joins remote files (uuid, sha256, size, created_at) with the
-  local upload cache: when the CLI uploaded the file from this host
-  it shows the absolute LOCAL_PATH alongside the remote UUID.
+  local upload cache. The SOURCE column shows whatever this machine
+  used to produce the file:
+    - absolute host path for files uploaded via `run --file` / `COPY`;
+    - https://... URL for files fetched via `ADD URL`.
 
-  IMPORTANT: LOCAL_PATH is resolved ONLY for files uploaded from this
-  specific machine. The path-to-uuid mapping lives in the local SQLite
-  cache (per profile, under $CONTREE_HOME/cli/sessions/<profile>.db)
-  keyed by path+inode+mtime+size, and is NOT shared between hosts.
-  Rows show empty LOCAL_PATH when:
+  IMPORTANT: SOURCE is resolved ONLY for files uploaded from this
+  specific machine. The mapping lives in the local SQLite cache (per
+  profile, under $CONTREE_HOME/cli/sessions/<profile>.db) keyed by
+  path+inode+mtime+size (for host paths) or by the URL itself (for
+  URL fetches), and is NOT shared between hosts. Rows show empty
+  SOURCE when:
     - the file was uploaded from a different machine or by a teammate;
-    - the local file has been moved, renamed, or its inode/mtime/size
+    - the host file has been moved, renamed, or its inode/mtime/size
       changed since upload (the cache key no longer matches);
-    - the upload happened before path tracking landed (older entries
+    - the upload happened before tracking landed (older entries
       backfill on the next match).
-  An agent must not assume LOCAL_PATH is authoritative across hosts;
+  An agent must not assume SOURCE is authoritative across hosts;
   for cross-machine identity always use the remote UUID or sha256.
 
 More: contree run --help, contree file --help

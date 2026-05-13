@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=DockerKeyword)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class CopyKeyword(DockerKeyword):
     NAME: ClassVar[str] = "COPY"
     sources: tuple[str, ...] = field(default_factory=tuple)
@@ -27,6 +27,9 @@ class CopyKeyword(DockerKeyword):
     chown: str = ""
     chmod: str = ""
     from_stage: str = ""
+
+    def __repr__(self) -> str:
+        return format_copy_like("COPY", self)
 
     @classmethod
     def parse(cls, args_text: str) -> CopyKeyword:
@@ -157,3 +160,19 @@ def resolve_id(value: str) -> int:
         return int(value)
     except ValueError:
         return 0
+
+
+def format_copy_like(name: str, kw: object) -> str:
+    flags: list[str] = []
+    chown = getattr(kw, "chown", "")
+    chmod = getattr(kw, "chmod", "")
+    from_stage = getattr(kw, "from_stage", "")
+    if from_stage:
+        flags.append(f"--from={from_stage}")
+    if chown:
+        flags.append(f"--chown={chown}")
+    if chmod:
+        flags.append(f"--chmod={chmod}")
+    sources = list(getattr(kw, "sources", ()))
+    dest = getattr(kw, "dest", "")
+    return " ".join([name, *flags, *sources, dest])

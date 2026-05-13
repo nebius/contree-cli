@@ -9,11 +9,16 @@ from .context import BuildContext
 from .keyword import DockerKeyword
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class ArgKeyword(DockerKeyword):
     NAME: ClassVar[str] = "ARG"
     name: str = ""
     default: str | None = None
+
+    def __repr__(self) -> str:
+        if self.default is None:
+            return f"ARG {self.name}"
+        return f"ARG {self.name}={self.default}"
 
     @classmethod
     def parse(cls, args_text: str) -> ArgKeyword:

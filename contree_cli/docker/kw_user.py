@@ -9,10 +9,13 @@ from .context import BuildContext
 from .keyword import DockerKeyword
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class UserKeyword(DockerKeyword):
     NAME: ClassVar[str] = "USER"
     spec: str = ""
+
+    def __repr__(self) -> str:
+        return f"USER {self.spec}"
 
     @classmethod
     def parse(cls, args_text: str) -> UserKeyword:

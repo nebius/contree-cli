@@ -229,6 +229,60 @@ class TestCache:
         assert rc is None
         assert second.request_count == 3
 
+    def test_no_cache_when_from_layer_is_active_branch(self, context_dir, db_path):
+        """Regression: --no-cache must not blow up when the target layer
+        branch is currently the active one.
+
+        Reproduces the original failure where ``commit_layer`` tried to
+        delete an active branch and then re-create it, producing
+        ``Branch '...' already exists``. With ``set_image_on_branch`` we
+        update the pointer in place without touching the active flag.
+        """
+        write_dockerfile(context_dir, "FROM tag:ubuntu:latest\nRUN echo hi\n")
+
+        first = ContreeTestClient()
+        run_build(
+            first,
+            BuildArgs(context=str(context_dir)),
+            [
+                make_tag_lookup(BASE_IMG),
+                make_spawn(),
+                make_op_success(NEW_IMG),
+            ],
+            db_path,
+        )
+
+        # Force the active branch back to the FROM layer (simulates a user
+        # doing `session checkout layer:<from-hash>` between builds, or a
+        # prior build that ended on FROM only).
+        import hashlib
+
+        from contree_cli.cli.build import make_session_key
+
+        session_key = make_session_key(context_dir.resolve())
+        from_hash = hashlib.sha256(f"FROM:{BASE_IMG}".encode()).hexdigest()
+        from_branch = f"layer:{from_hash[:16]}"
+        store = SessionStore(db_path, session_key)
+        try:
+            store.switch_branch(from_branch)
+        finally:
+            store.close()
+
+        # Rebuild with --no-cache: this previously failed with
+        # "Branch 'layer:...' already exists".
+        second = ContreeTestClient()
+        rc = run_build(
+            second,
+            BuildArgs(context=str(context_dir), no_cache=True),
+            [
+                make_tag_lookup(BASE_IMG),
+                make_spawn("op-2"),
+                make_op_success(NEW_IMG_2, "op-2"),
+            ],
+            db_path,
+        )
+        assert rc is None
+
 
 class TestCopy:
     def test_copy_pending_attaches_to_next_run(self, context_dir, db_path):

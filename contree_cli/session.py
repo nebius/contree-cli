@@ -218,12 +218,13 @@ class ImageCache(MutableMapping[CacheKey, object]):
         return row[0]  # type: ignore[no-any-return]
 
     def local_file_paths(self) -> dict[str, str]:
-        """Map remote file UUID to the host path that uploaded it.
+        """Map remote file UUID to whatever this machine uploaded it from.
 
-        Reads every ``local_file:*`` cache entry, decodes its JSON
-        payload, and returns ``{remote_uuid: local_path}`` for entries
-        that have both fields. Older entries without ``local_path``
-        are silently skipped.
+        Reads every ``local_file:*`` cache entry. The value is either an
+        absolute host path (for files uploaded by ``run --file`` /
+        ``COPY``) or a ``https://...`` URL (for ``ADD URL``); both come
+        out of the same cache namespace so callers get a single mapping
+        regardless of upload source.
         """
         cur = self._conn.execute(
             "SELECT value FROM image_cache WHERE kind LIKE 'local_file:%'",
@@ -234,9 +235,11 @@ class ImageCache(MutableMapping[CacheKey, object]):
             if not isinstance(value, dict):
                 continue
             uuid_str = value.get("uuid")
-            local_path = value.get("local_path")
-            if isinstance(uuid_str, str) and isinstance(local_path, str):
-                result[uuid_str] = local_path
+            if not isinstance(uuid_str, str):
+                continue
+            origin = value.get("local_path") or value.get("url")
+            if isinstance(origin, str) and origin:
+                result[uuid_str] = origin
         return result
 
     def invalidate_prefix(

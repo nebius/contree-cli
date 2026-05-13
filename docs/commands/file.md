@@ -38,34 +38,38 @@ file is uploaded immediately but only applied to the sandbox on the next
 ### `file ls`
 
 Lists files uploaded to the project (`GET /v1/files`) and joins each row
-with the local upload cache so that the host path that produced the file
-is shown under `LOCAL_PATH` when known.
+with the local upload cache. The `SOURCE` column shows whatever this
+machine produced the file from:
+
+- absolute host path for files uploaded via `run --file` or `COPY`;
+- `https://...` URL for files fetched via `ADD URL`.
 
 :::{important}
-`local_path` resolves **only for files uploaded from this very machine**.
+`SOURCE` resolves **only for files uploaded from this very machine**.
 The mapping lives in the local SQLite cache (per-profile, under
-`$CONTREE_HOME/cli/sessions/<profile>.db`) and is keyed by
-`path + inode + mtime + size`. It is **not** synced anywhere, so a row
-will show an empty `LOCAL_PATH` whenever:
+`$CONTREE_HOME/cli/sessions/<profile>.db`) keyed by
+`path + inode + mtime + size` (host paths) or by the URL itself (URL
+fetches). It is **not** synced anywhere, so a row will show an empty
+`SOURCE` whenever:
 
 - the file was uploaded by a different machine, container, or teammate;
 - the file was uploaded by an earlier CLI version that did not yet
-  store the host path (those entries backfill the next time the file
-  is matched by the local cache);
-- the local file has been moved, renamed, or its inode/mtime/size has
+  track its origin (those entries backfill the next time the file is
+  matched by the local cache);
+- the host file has been moved, renamed, or its `inode/mtime/size` has
   changed since upload (the cache key no longer matches and the
   mapping is treated as missing until the next upload).
 
-There is no way to recover the host path of a file that was uploaded
-from another machine — the server stores only `uuid`, `sha256`, `size`,
+There is no way to recover the source of a file uploaded from another
+machine -- the server stores only `uuid`, `sha256`, `size`,
 `created_at`, and `updated_at`.
 :::
 
 ```bash
 contree file ls
 contree file ls --since 1d --limit 200
-contree file ls -q                # uuid + sha256 + local_path only
-contree -f json file ls | jq 'select(.local_path != "")'
+contree file ls -q                # uuid + sha256 + source only
+contree -f json file ls | jq 'select(.source != "")'
 ```
 
 ## Pending files

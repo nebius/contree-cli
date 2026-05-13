@@ -318,7 +318,7 @@ class TestStreamingBody:
             headers={"Content-Type": "application/octet-stream"},
         )
         sent = c.get_request(-1).body
-        assert sent is stream
+        assert sent == b"a" * 1024
 
     def test_retry_seeks_back_to_start(self):
         import io

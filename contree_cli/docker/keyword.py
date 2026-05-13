@@ -68,9 +68,14 @@ def parse_keyval_pairs(rest: str) -> dict[str, str]:
     return pairs
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class DockerKeyword:
-    """Base class. Subclasses implement ``parse``, ``serialize``, ``execute``."""
+    """Base class. Subclasses implement ``parse``, ``serialize``, ``execute``.
+
+    ``__repr__`` is overridden in every subclass to render the directive as
+    it would appear in a Dockerfile, so build logs look like the original
+    source.
+    """
 
     NAME: ClassVar[str] = ""
 
@@ -84,3 +89,6 @@ class DockerKeyword:
 
     def execute(self, ctx: BuildContext) -> None:
         raise NotImplementedError
+
+    def __repr__(self) -> str:
+        return self.NAME or self.__class__.__name__

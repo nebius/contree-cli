@@ -142,21 +142,23 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
         help="List uploaded files (joined with local cache)",
         description=(
             "List remote files uploaded to the project and, when present in"
-            " the local upload cache, show the host path that produced them.\n"
+            " the local upload cache, show what produced them under the"
+            " 'source' column: either an absolute host path (for run --file"
+            " / COPY uploads) or a URL (for ADD URL).\n"
             "\n"
-            "local_path is THIS-MACHINE ONLY: the mapping lives in the local"
-            " CLI cache ($CONTREE_HOME/cli/sessions/<profile>.db) keyed by"
-            " path+inode+mtime+size and is never synced. Files uploaded from"
-            " a different host, by a teammate, or before path tracking landed"
-            " will show an empty local_path -- that is expected, not a bug."
-            " Use the remote uuid or sha256 for cross-machine identity."
+            "source is THIS-MACHINE ONLY: the mapping lives in the local"
+            " CLI cache ($CONTREE_HOME/cli/sessions/<profile>.db) and is"
+            " never synced. Files uploaded from a different host, by a"
+            " teammate, or before tracking landed will show an empty source"
+            " -- that is expected, not a bug. Use the remote uuid or sha256"
+            " for cross-machine identity."
         ),
         epilog=(
             "examples:\n"
             "  contree file ls\n"
             "  contree file ls --since 1d\n"
             "  contree file ls --limit 5000\n"
-            "  contree file ls -q              # uuid + sha256 + local_path\n"
+            "  contree file ls -q              # uuid + sha256 + source\n"
             "  contree -f json file ls\n"
         ),
     )
@@ -180,8 +182,8 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
         *FLAGS["quiet"],
         action="store_true",
         help=(
-            "Emit only uuid, sha256, and local_path columns. local_path is"
-            " populated only for files uploaded from this very machine."
+            "Emit only uuid, sha256, and source columns. source is populated"
+            " only for files uploaded from this very machine."
         ),
     )
     ls_p.set_defaults(handler=cmd_file_ls, load_args=FileListArgs)
@@ -313,7 +315,7 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
     store = SESSION_STORE.get()
     formatter = FORMATTER.get()
 
-    local_paths = store.cache.local_file_paths()
+    sources = store.cache.local_file_paths()
 
     params: dict[str, str] = {}
     if args.since is not None:
@@ -333,14 +335,12 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
             return None
         for entry in files:
             uuid_str = entry.get("uuid")
-            local_path = (
-                local_paths.get(uuid_str, "") if isinstance(uuid_str, str) else ""
-            )
+            source = sources.get(uuid_str, "") if isinstance(uuid_str, str) else ""
             if args.quiet:
                 formatter(
                     uuid=uuid_str,
                     sha256=entry.get("sha256", ""),
-                    local_path=local_path,
+                    source=source,
                 )
                 continue
             row: dict[str, object] = {}
@@ -350,7 +350,7 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
                 if key in {"created_at", "updated_at"} and isinstance(value, str):
                     value = parse_datetime(value)
                 row[key] = value
-            row["local_path"] = local_path
+            row["source"] = source
             formatter(**row)
         emitted += len(files)
         if len(files) < page_size:

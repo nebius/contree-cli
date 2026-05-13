@@ -49,7 +49,7 @@ contree build . --no-cache --tag myapp:dev
 | `FROM ref[:tag] [AS name]` | Resolves the base image. If the tag is not found locally, the build auto-imports it via `POST /v1/images/import`. `AS name` is parsed but ignored (multi-stage is Phase 2). |
 | `RUN ...` | Shell-form (`RUN echo hi`) or JSON exec-form (`RUN ["echo","hi"]`). Spawns `POST /v1/instances`, polls until terminal status, captures the resulting image. |
 | `COPY [--chown=...] [--chmod=...] SRC... DEST` | Walks local sources relative to the build context, applies `.dockerignore`, uploads files (with SHA256 dedup), and stages them for the next `RUN`. |
-| `ADD ...` | Same as `COPY` for local files; URL/tar inputs emit a warning and are skipped. |
+| `ADD ...` | Local paths behave like `COPY`. `https://`/`http://` URLs are **streamed straight from the source socket into `POST /v1/files`** (no temp file on disk); the URL plus its `ETag`/`Last-Modified`/`Content-MD5` validators are cached so repeat builds skip the download via a conditional `HEAD`. Tar auto-extraction is not implemented. |
 | `WORKDIR /path` | Sets the working directory for subsequent directives. |
 | `ENV KEY=VALUE ...` | Accumulates environment variables passed to every `RUN`. |
 | `ARG NAME[=DEFAULT]` | Declares a build-time variable. Overridden by `--build-arg`. |
@@ -133,10 +133,19 @@ WORKDIR /app
 
 COPY hello.py /app/hello.py
 COPY src /app/src
+ADD https://github.com/nebius/contree-cli/archive/refs/heads/master.zip /tmp/contree-cli.zip
 
 RUN python -c "import sys; print('python', sys.version)"
+RUN python -m zipfile -e /tmp/contree-cli.zip /opt/
+RUN pip install --no-cache-dir /opt/contree-cli-master
+RUN contree --help | head -20
 RUN python /app/hello.py
 ```
+
+The `ADD` line streams the zip straight from GitHub into the contree
+API (no local temp file). The subsequent `RUN` steps unpack it,
+`pip install` the project, and prove the installed `contree` binary
+works inside the built image.
 
 ```dockerfile
 % docs/examples/build-demo/.dockerignore
@@ -170,8 +179,10 @@ IMAGE                                 TAG                            SESSION
 <uuid>                                contree-cli-build-demo:latest  build:<sha16>
 ```
 
-Re-running the same command without `--no-cache` produces three layer
-cache hits and no API instance spawns.
+Re-running the same command without `--no-cache` produces layer cache
+hits, and the `ADD URL` step short-circuits at the `HEAD` probe (look
+for `URL cache hit (HEAD validators match)` in the log) -- no body
+download, no upload.
 
 ## See also
 
