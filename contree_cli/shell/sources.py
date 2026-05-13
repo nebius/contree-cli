@@ -370,16 +370,20 @@ def complete_mapped_file(text: str, ctx: CompletionContext) -> list[str]:
     value. Each candidate must therefore replace the whole token, not just
     the trailing segment.
     """
-    parts = split_mapped_value(text)
+    # On Windows the host path may carry a drive prefix (``C:``) whose colon
+    # is part of the path, not the host/instance separator. Mirror the
+    # ``MappedFile.parse`` heuristic by peeling the drive off before splitting.
+    drive, rest = os.path.splitdrive(text)
+    parts = split_mapped_value(rest)
     head = parts[:-1]
     tail = parts[-1] if parts else ""
-    prefix = (":".join(head) + ":") if head else ""
+    prefix = drive + ((":".join(head) + ":") if head else "")
 
     # Segment 0: host path completion. Trailing "/" for dirs (no space) so the
     # user can keep typing "/foo" or ":m0" next.
     if not head:
-        host_candidates = complete_host_path(tail, ctx)
-        return [prefix + cand.rstrip(" ") for cand in host_candidates]
+        host_candidates = complete_host_path(drive + tail, ctx)
+        return [cand.rstrip(" ") for cand in host_candidates]
 
     # Subsequent segments.
     if tail.startswith("/") or tail == "":
