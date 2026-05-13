@@ -38,4 +38,4 @@ class ArgKeyword(DockerKeyword):
     def execute(self, ctx: BuildContext) -> None:
         ctx.declared_args.add(self.name)
         if self.default is not None and self.name not in ctx.arg_defaults:
-            ctx.arg_defaults[self.name] = self.default
+            ctx.arg_defaults[self.name] = ctx.substitute(self.default)

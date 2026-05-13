@@ -354,6 +354,53 @@ class TestBuildArgs:
         spawn_body = json.loads(tc.get_request(1).body.decode())
         assert spawn_body["command"] == "echo 2.5"
 
+    def test_arg_default_flows_into_env(self, context_dir, db_path):
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest\n"
+            "ARG APP_HOME=/opt/streamforge\n"
+            "ENV APP_HOME=${APP_HOME}\n"
+            "RUN echo $APP_HOME\n",
+        )
+        tc = ContreeTestClient()
+        run_build(
+            tc,
+            BuildArgs(context=str(context_dir)),
+            [
+                make_tag_lookup(BASE_IMG),
+                make_spawn(),
+                make_op_success(NEW_IMG),
+            ],
+            db_path,
+        )
+        spawn_body = json.loads(tc.get_request(1).body.decode())
+        assert spawn_body["command"] == "echo /opt/streamforge"
+        assert spawn_body["env"] == {"APP_HOME": "/opt/streamforge"}
+
+    def test_arg_default_referencing_earlier_arg(self, context_dir, db_path):
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest\n"
+            "ARG ROOT=/opt\n"
+            "ARG APP_HOME=${ROOT}/streamforge\n"
+            "ENV APP_HOME=${APP_HOME}\n"
+            "RUN echo $APP_HOME\n",
+        )
+        tc = ContreeTestClient()
+        run_build(
+            tc,
+            BuildArgs(context=str(context_dir)),
+            [
+                make_tag_lookup(BASE_IMG),
+                make_spawn(),
+                make_op_success(NEW_IMG),
+            ],
+            db_path,
+        )
+        spawn_body = json.loads(tc.get_request(1).body.decode())
+        assert spawn_body["command"] == "echo /opt/streamforge"
+        assert spawn_body["env"] == {"APP_HOME": "/opt/streamforge"}
+
 
 class TestSessionKey:
     def test_deterministic(self, tmp_path):
