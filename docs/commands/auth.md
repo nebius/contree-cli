@@ -83,12 +83,18 @@ export NEBIUS_AI_PROJECT=your-project-id
 contree auth -y      # no prompts, saves immediately
 ```
 
-## `auth ls` status column
+## `auth list`
 
-`contree auth ls` verifies each saved profile against the API
-with a 2-second timeout and adds a `status` column.
+`contree auth list` (alias `auth ls`, `profiles`) prints every saved
+profile from `auth.ini` and verifies each one against the API with a
+2-second timeout, adding a `status` column that tells you at a glance
+which profiles are usable. Pass `--offline` to suppress the probe
+entirely when you only want to inspect what is saved locally.
 
-Possible values:
+```{terminal-shell} contree auth list --help
+```
+
+Possible `status` values:
 
 - `ok` -- probe succeeded and the token has the `list` permission
 - `inactive` -- probe succeeded but the token lacks the `list`
@@ -98,9 +104,6 @@ Possible values:
   another network/API error
 - `offline` -- you passed `--offline`, so no probe was attempted
 
-Use `contree auth ls --offline` when you want to inspect saved
-profiles without any network traffic.
-
 For automation and agents, prefer:
 
 ```bash
@@ -108,18 +111,34 @@ contree -f json auth ls
 contree -f json auth ls --offline
 ```
 
+## `auth switch`
+
+`contree auth switch NAME` rewrites the `active` pointer in `auth.ini`
+so subsequent commands resolve credentials from that profile. The
+profile must already exist (created by `contree auth --profile=NAME`).
+Switching does not touch token data, so it is safe to run as often as
+you like to bounce between projects.
+
+```{terminal-shell} contree auth switch --help
+```
+
 ## `auth remove`
 
-Delete a saved profile from the config file.
+`contree auth remove NAME` (aliases `rm`, `del`) deletes the profile
+from `auth.ini` and removes its per-profile session database
+(`sessions-NAME.db`). If the deleted profile was the active one, the
+CLI promotes the first remaining profile to active (or falls back to
+`default` if none remain). Confirmation is required unless `-y` is
+passed.
+
+```{terminal-shell} contree auth remove --help
+```
 
 ```bash
 contree auth remove personal
 contree auth rm personal         # alias
 contree auth del personal -y     # skip confirmation
 ```
-
-If the removed profile was active, the CLI switches to the first
-remaining profile (or `default` if none remain).
 
 :::{warning}
 Avoid `--token=eyJ...` on the command line — the token is visible in

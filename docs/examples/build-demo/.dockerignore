@@ -1,0 +1,4 @@
+# Demo .dockerignore: keep build context lean
+**/*.log
+**/__pycache__
+.env*

@@ -41,19 +41,22 @@ contree op cancel --all
 
 ## Help output
 
+The top-level `op` command is a dispatcher: by itself it only prints
+usage and routes to the three subcommands described below.
+
 ```{terminal-shell} contree op --help
 ```
 
+## `op list` -- dynamic columns
+
+`contree op list` (alias `op ls`) accepts the same filter flags as
+`contree ps` (`-a`, `-S STATUS`, `-K KIND`, `--since`, `--until`,
+`-q`/`--quiet`) and shares its rendering pipeline. Reach for it when
+you want the operations namespace to feel symmetric with the
+multi-UUID `show` and `cancel`; otherwise `contree ps` is just as good.
+
 ```{terminal-shell} contree op list --help
 ```
-
-```{terminal-shell} contree op show --help
-```
-
-```{terminal-shell} contree op cancel --help
-```
-
-## `op list` -- dynamic columns
 
 The listing renders **every scalar top-level field** the API returns,
 not a hard-coded subset. When the server adds a new field (for example
@@ -81,6 +84,9 @@ work uniformly. On API errors (e.g. 404 for an unknown UUID), the
 command logs the failure and continues with the remaining UUIDs, exiting
 with status `1` at the end.
 
+```{terminal-shell} contree op show --help
+```
+
 :::{note}
 With table output (`-f table`) and several UUIDs, each operation
 currently renders as its own mini-table. Use `default` or `json` for a
@@ -94,6 +100,9 @@ operation (`PENDING`, `ASSIGNED`, `EXECUTING`). Combining both is allowed:
 `--all` wins, and the explicit UUIDs are ignored with a `WARNING`. As
 with `op show`, errors on individual UUIDs do not abort the run; the
 command exits `1` if any cancellation failed.
+
+```{terminal-shell} contree op cancel --help
+```
 
 ```bash
 # Mixed: --all still wins, "ignored-1" is not cancelled
