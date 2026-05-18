@@ -43,6 +43,30 @@ contree images --prefix=common/
 `--since` and `--until` accept either ISO timestamps or duration intervals
 like `1h`, `30m`, `7d`.
 
+## Subcommands
+
+### `images list`
+
+`contree images list` (alias `ls`) is the explicit form of the bare
+`contree images` invocation. Both share the same flag set -- pick the
+explicit form when you want a command that reads symmetrically with
+`images import`, or in scripts that already use the subcommand style
+everywhere.
+
+```{terminal-shell} contree images list --help
+```
+
+### `images import`
+
+`contree images import REF [REF ...]` pulls one or more images from an
+external OCI registry into the project and waits for the import
+operation to finish. Each reference may be a `docker://` URL or any
+form the platform accepts; multiple refs are imported sequentially with
+shared credentials, and Ctrl-C cancels the in-flight operation cleanly.
+
+```{terminal-shell} contree images import --help
+```
+
 ## See also
 
 - {doc}`tag` -- assign a tag to an image

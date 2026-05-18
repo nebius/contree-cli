@@ -150,4 +150,4 @@ contree images --prefix=python-dev
 
 ---
 
-Images are your checkpoints. Next: {doc}`workflows`.
+Images are your checkpoints. Next: {doc}`build`.

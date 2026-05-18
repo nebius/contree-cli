@@ -1,7 +1,7 @@
 # Tutorial
 
-Learn contree-cli by building a real workflow — from zero to automated
-scripting in six short sections.
+Learn contree-cli by building a real workflow -- from zero to automated
+scripting in nine short sections.
 
 ## What you'll build
 
@@ -72,7 +72,15 @@ Tag working images for reuse, import from registries, and search by
 prefix. Build reusable base environments.
 :::
 
-:::{grid-item-card} 7. Scripting & Automation
+:::{grid-item-card} 7. Building from a Dockerfile
+:link: build
+:link-type: doc
+
+Turn a `Dockerfile` into a tagged ConTree image. Layer caching,
+build args, `.dockerignore`, and URL streaming for `ADD`.
+:::
+
+:::{grid-item-card} 8. Scripting & Automation
 :link: workflows
 :link-type: doc
 
@@ -80,7 +88,7 @@ Shell mode, shebang scripts, detached runs, operation monitoring, and
 machine-readable output formats for pipelines.
 :::
 
-:::{grid-item-card} 8. Configuration & Profiles
+:::{grid-item-card} 9. Configuration & Profiles
 :link: configuration
 :link-type: doc
 
@@ -146,6 +154,7 @@ shell
 sessions
 files
 images
+build
 workflows
 configuration
 ```

@@ -25,21 +25,31 @@ contree run nginx -t
 
 ### `file edit`
 
-Downloads a file from the session image, opens it in `$EDITOR` (defaults to
-`vi`), and stages the changes if the file was modified. If the file does not
-exist in the image, an empty file is created.
+`contree file edit PATH` (alias `e`) downloads the file at `PATH` from
+the session image, opens it in `$EDITOR` (defaults to `vi`), and stages
+the modified buffer as a pending upload that will be injected into the
+next `contree run`. Missing files are created as empty buffers so the
+command doubles as `touch + open`.
+
+```{terminal-shell} contree file edit --help
+```
 
 ### `file cp`
 
-Copies a local file and stages it at the given path inside the image. The
-file is uploaded immediately but only applied to the sandbox on the next
-`contree run`.
+`contree file cp SRC DEST` (alias `f`) reads a local file at `SRC`, uploads
+it to the project's file store, and stages it for delivery at `DEST` inside
+the session image on the next `contree run`. Use this when you have a file
+ready on disk locally and just want it materialised inside the sandbox
+without spawning an instance first.
+
+```{terminal-shell} contree file cp --help
+```
 
 ### `file ls`
 
-Lists files uploaded to the project (`GET /v1/files`) and joins each row
-with the local upload cache. The `SOURCE` column shows whatever this
-machine produced the file from:
+`contree file ls` lists files uploaded to the project (`GET /v1/files`)
+and joins each row with the local upload cache. The `SOURCE` column shows
+whatever this machine produced the file from:
 
 - absolute host path for files uploaded via `run --file` or `COPY`;
 - `https://...` URL for files fetched via `ADD URL`.
@@ -70,6 +80,9 @@ contree file ls
 contree file ls --since 1d --limit 200
 contree file ls -q                # uuid + sha256 + source only
 contree -f json file ls | jq 'select(.source != "")'
+```
+
+```{terminal-shell} contree file ls --help
 ```
 
 ## Pending files
