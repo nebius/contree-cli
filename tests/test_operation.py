@@ -7,8 +7,8 @@ from conftest import ContreeTestClient
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.arguments import parser
-from contree_cli.cli.kill import ACTIVE_STATUSES
 from contree_cli.cli.operation import (
+    ACTIVE_STATUSES,
     CancelArgs,
     ShowMultiArgs,
     cmd_cancel,
@@ -108,18 +108,46 @@ class TestArgparseWiring:
         assert ns.all is True
         assert ns.uuids == []
 
-    def test_list_delegates_to_ps_handler(self):
-        from contree_cli.cli.ps import cmd_ps
+    def test_list_delegates_to_cmd_list(self):
+        from contree_cli.cli.operation import cmd_list
 
         ns = parser.parse_args(["op", "list", "-q"])
-        assert ns.handler is cmd_ps
+        assert ns.handler is cmd_list
         assert ns.quiet is True
 
     def test_list_ls_alias(self):
-        from contree_cli.cli.ps import cmd_ps
+        from contree_cli.cli.operation import cmd_list
 
         ns = parser.parse_args(["op", "ls"])
-        assert ns.handler is cmd_ps
+        assert ns.handler is cmd_list
+
+    def test_ps_shares_handler_with_op_list(self):
+        """`contree ps` is a top-level shortcut for `contree op list`."""
+        from contree_cli.cli.operation import cmd_list
+
+        ns = parser.parse_args(["ps"])
+        assert ns.handler is cmd_list
+
+    def test_show_sh_alias(self):
+        from contree_cli.cli.operation import cmd_show_multi
+
+        ns = parser.parse_args(["op", "sh", "uuid-1"])
+        assert ns.handler is cmd_show_multi
+        assert ns.uuids == ["uuid-1"]
+
+    def test_cancel_kill_alias(self):
+        from contree_cli.cli.operation import cmd_cancel
+
+        ns = parser.parse_args(["op", "kill", "uuid-1"])
+        assert ns.handler is cmd_cancel
+        assert ns.uuids == ["uuid-1"]
+
+    def test_cancel_k_alias(self):
+        from contree_cli.cli.operation import cmd_cancel
+
+        ns = parser.parse_args(["op", "k", "uuid-1"])
+        assert ns.handler is cmd_cancel
+        assert ns.uuids == ["uuid-1"]
 
 
 # ----------------------------------------------------------------------
@@ -290,7 +318,9 @@ class TestOperationCancel:
 
     def test_cancel_all_overrides_explicit_uuids(self, contree_client, caplog):
         """--all wins; explicit UUIDs are ignored with a WARNING."""
-        list_pages = [[{"uuid": "pending-0"}]] + [[] for _ in ACTIVE_STATUSES[1:]]
+        list_pages = [[{"uuid": "pending-0"}]] + [
+            [] for _ in range(len(ACTIVE_STATUSES) - 1)
+        ]
         with caplog.at_level("WARNING"):
             rc = run_cancel(
                 contree_client,

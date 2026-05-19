@@ -90,9 +90,9 @@ class TestAliasDispatch:
         result = walk(root_parser, ["op", "show"])
         assert lookup(result.command_path, "uuids") == "operation"
 
-    def test_kill_uuid_resolves_operation_source(self):
+    def test_kill_uuids_resolves_operation_source(self):
         result = walk(root_parser, ["kill"])
-        assert lookup(result.command_path, "uuid") == "operation"
+        assert lookup(result.command_path, "uuids") == "operation"
 
     def test_run_use_flag_resolves_image_source(self):
         # `--use` is a flag, walk just records it; positional/flag-value

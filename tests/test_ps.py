@@ -7,7 +7,16 @@ import pytest
 from conftest import ContreeTestClient
 
 from contree_cli import FORMATTER
-from contree_cli.cli.ps import PAGE_SIZE, STATUS_CHOICES, PsArgs, cmd_ps
+from contree_cli.cli.operation import (
+    PAGE_SIZE,
+    STATUS_CHOICES,
+)
+from contree_cli.cli.operation import (
+    ListArgs as PsArgs,
+)
+from contree_cli.cli.operation import (
+    cmd_list as cmd_ps,
+)
 from contree_cli.output import CSVFormatter, JSONFormatter, TableFormatter
 from contree_cli.types import parse_interval
 
@@ -398,7 +407,7 @@ class TestPsShowMax:
 
         FORMATTER.set(TableFormatter())
         ctx = copy_context()
-        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.ps"):
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.operation"):
             ctx.run(cmd_ps, PsArgs(show_max=3, all=True))
 
         out = capsys.readouterr().out

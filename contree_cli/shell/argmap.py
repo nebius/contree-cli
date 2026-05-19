@@ -25,7 +25,7 @@ ARG_SOURCES: dict[ArgKey, str] = {
     (("tag",), "args"): "image",
     # show / kill / wait -- operation UUIDs.
     (("show",), "uuid"): "operation",
-    (("kill",), "uuid"): "operation",
+    (("kill",), "uuids"): "operation",
     (("session", "wait"), "op_ids"): "operation",
     (("operation", "show"), "uuids"): "operation",
     (("operation", "cancel"), "uuids"): "operation",
@@ -56,6 +56,9 @@ ARG_SOURCES: dict[ArgKey, str] = {
     (("run",), "cwd"): "sandbox-dir",
     (("run",), "file"): "mapped-file",
     (("run",), "use"): "image",
+    # build -- Dockerfile build context and file paths on the host.
+    (("build",), "context"): "host-path",
+    (("build",), "dockerfile"): "host-path",
     # env / skill.
     (("env",), "vars"): "env-key",
     (("skill", "install"), "specs"): "skill-spec",

@@ -13,10 +13,8 @@ from contree_cli.cli import (
     env,
     file,
     images,
-    kill,
     ls,
     operation,
-    ps,
     run,
     session,
     show,
@@ -214,8 +212,16 @@ register("run", "Spawn a sandbox instance", run.setup_parser, aliases=["r"])
 register("build", "Build image from Dockerfile", build.setup_parser, aliases=["bd"])
 register("images", "List and import images", images.setup_parser, aliases=["i", "img"])
 register("tag", "Tag an image", tag.setup_parser, aliases=["t"])
-register("ps", "List operations/instances", ps.setup_parser)
-register("kill", "Cancel an operation", kill.setup_parser)
+register(
+    "ps",
+    "List operations (alias for `operation ls`)",
+    operation.setup_list_parser,
+)
+register(
+    "kill",
+    "Cancel operations (alias for `operation cancel`)",
+    operation.setup_cancel_parser,
+)
 register("show", "Show operation result", show.setup_parser)
 register(
     "operation",

@@ -37,7 +37,11 @@ def _sequential_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
     parallel fetches would race on it. Sequential keeps tests
     deterministic without affecting handler logic under test.
     """
-    for mod in ("contree_cli.cli.ps", "contree_cli.cli.images", "contree_cli.cli.file"):
+    for mod in (
+        "contree_cli.cli.operation",
+        "contree_cli.cli.images",
+        "contree_cli.cli.file",
+    ):
         monkeypatch.setattr(f"{mod}.CONTREE_CONCURRENCY", 1, raising=False)
 
 
