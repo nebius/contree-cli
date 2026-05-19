@@ -38,7 +38,7 @@ Key commands:
   contree session show            view history DAG
   contree session branch <name>   create branch
   contree session checkout <name> switch branch
-  contree session rollback [N]    undo N steps
+  contree session rollback [N]    jump to history id N (absolute); use -N for steps back
   contree session delete <key>    delete session
 
 Branch workflow:
@@ -271,10 +271,10 @@ All commands
   session list            List sessions (aliases: ls)
   session branch [NAME]   Create/list branches (aliases: br)
   session checkout BRANCH Switch branch (aliases: co)
-  session rollback [N]    Undo N steps (aliases: rb)
+  session rollback [N]    Jump to history id N (absolute); -N steps back (aliases: rb)
   session show            Show history DAG
   session delete KEY      Delete session (aliases: rm, del)
-  session wait [OPS]      Wait for operations
+  session wait [OPS]      Drain detached ops; no-arg form advances branch, UUID form polls only
   auth                    Save token
   auth ls                 List profiles (aliases: profiles)
   auth switch NAME        Switch profile

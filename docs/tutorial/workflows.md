@@ -279,8 +279,10 @@ When several independent steps can run at the same time, spawn each
 one detached and join them with `contree op wait` (alias `contree
 operation wait`). The wait command polls the API and prints one row
 per operation as soon as it reaches a terminal status, with columns
-`uuid`, `status`, `timed_out`, `duration`, and any other scalar field
-the API returns.
+`uuid`, `status`, `exit_code`, `timed_out`, `duration`, and any other
+scalar field the API returns. A `run` that the API marks `SUCCESS`
+with a non-zero `exit_code` is promoted to `FAILED` here and bumps the
+process exit status accordingly.
 
 :::{important}
 `op wait` is a **pure observer** — it polls completion status but

@@ -100,16 +100,18 @@ unified stream view across multiple UUIDs.
 
 Poll the given operations until each reaches a terminal status
 (`SUCCESS`, `FAILED`, `CANCELLED`) and print one row per completion
-with the columns `uuid`, `status`, `timed_out`, `duration` (and every
-other scalar field the API returns; `error` is pinned to the last
-column).
+with the columns `uuid`, `status`, `exit_code`, `timed_out`,
+`duration` (and every other scalar field the API returns; `error` is
+pinned to the last column).
 
 `--all` waits for every currently active operation in the project.
 `--timeout SECONDS` (default `60`) caps the wait — when the deadline
 hits, the command emits one extra row per unfinished operation with
 `timed_out=true` and the operation's last observed status (e.g.
 `EXECUTING`), then exits with status `1`. Any operation that finished
-non-`SUCCESS` also forces exit code `1`.
+non-`SUCCESS` also forces exit code `1`; a `run` that the API marks
+`SUCCESS` with a non-zero `exit_code` is promoted to `FAILED` and
+propagates that exit code.
 
 :::{important}
 `op wait` is a **pure observer**: it polls operation status and

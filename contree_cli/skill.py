@@ -117,7 +117,10 @@ BUNDLED_FIRST_STEP = """\
 1. Use `contree` from PATH — no bundled wrapper needed.
 2. Output formats (global `-f` flag BEFORE the subcommand):
    `-f json` (JSONL), `-f json-pretty`, `-f csv`, `-f tsv`,
-   `-f plain`, `-f table`, `-f toml`, `-f default`
+   `-f plain`, `-f table`, `-f default`, and `-f toml` on Python 3.11+.
+   The authoritative list is whatever `contree --help` shows on this
+   install — if `toml` is missing there, this Python lacks `tomllib`
+   and `-f toml` will fail with an argparse error.
 3. For the full built-in manual: `contree agent`\
 """
 
@@ -126,9 +129,19 @@ BUNDLED_FALLBACK = """\
 ## Quick reference
 
 ```bash
-contree -S <key> use tag:alpine:latest
-contree -S <key> run -s -- apt-get update
-contree -S <key> run -- make test
+# 1) Discover what images are available -- do NOT assume a tag exists.
+contree images --prefix ubuntu         # narrow listing
+contree -f plain images | grep -i ubuntu   # or grep the full list
+
+# 2) Bootstrap a session against a tag actually present in the listing.
+contree -S <key> use <image-or-tag-from-list>
+
+# 3) Run plain executables in direct mode; reach for -s only for
+#    pipes / redirects / && / ; / variable expansion.
+contree -S <key> run -- true
+contree -S <key> run -- uname -a
+
+# 4) See the full manual / per-command help.
 contree agent                          # full manual
 contree <command> --help               # per-command help
 ```\

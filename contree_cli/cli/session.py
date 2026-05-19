@@ -312,12 +312,24 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
 
     wait_p = sub.add_parser(
         "wait",
-        help="Wait for operations to reach terminal state",
+        help="Drain detached ops in the current session",
         description=(
-            "Wait for specific operations (by UUID). Without arguments, waits for "
-            "active operations of the current session only."
+            "Drain detached operations in the current session. With no "
+            "arguments, reads the session's pending-ops cache, polls each "
+            "to a terminal status, and advances the active branch to each "
+            "non-disposable result image (recording `disposable-<uuid>` "
+            "branches for disposable runs). With explicit UUIDs, this "
+            "command degrades to a plain polling loop: it prints completion "
+            "rows but does NOT touch the active branch, because the pending "
+            "metadata is not loaded for explicit UUIDs."
         ),
-        epilog="for coding agents: read-only command",
+        epilog=(
+            "for coding agents:\n"
+            "  no-arg form mutates session history (advances active branch)\n"
+            "  UUID form is a pure polling observer\n"
+            "  if you need result images from explicit UUIDs, use\n"
+            "    `op show UUID | jq -r .image` and `contree use`"
+        ),
     )
     wait_p.add_argument(
         "op_ids",

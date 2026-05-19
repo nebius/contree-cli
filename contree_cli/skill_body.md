@@ -31,8 +31,8 @@ and ask the user.
    Topics: `sessions`, `images`, `files`, `execution`, `output`, `profiles`,
    `core` (workflow), `command` / `command_safety`, `all_commands`,
    `all` (full manual).
-5. Agents must never run `contree auth`. If auth is missing or invalid, stop and ask the user to run `contree auth`.
-6. Choose an explicit session key before anything else and pass `-S <key>` on every **session-scoped** command, for example `agent_<task>` or `agent_<task>_<subagent>`. Session-scoped: `use`, `run`, `cd`, `env`, `ls`, `cat`, `cp`, `file`, `session ...`, `tag` (with a single TAG arg that targets the current session image). Project-scoped commands (`images`, `auth`, `op ls/show/cancel/wait` *unless* you also want the session view, `skill ...`, `agent`, `build`, `--help`) do not need `-S`.
+5. Agents must never run **bare** `contree auth` or mutating `auth switch` / `auth remove`. If auth is missing or invalid, stop and ask the user to run `contree auth`. Read-only `auth ls` / `auth profiles` (and `-f json auth ls` for health checks) are allowed and useful for verifying which profile is active.
+6. Choose an explicit session key before anything else and pass `-S <key>` on every **session-scoped** command, for example `agent_<task>` or `agent_<task>_<subagent>`. Session-scoped: `use`, `run`, `cd`, `env`, `ls`, `cat`, `cp`, `file`, `tag` (with a single TAG arg targeting the current session image), and the session subcommands that operate on the *current* session (`session show` with no positional, `session branch`, `session checkout`, `session rollback`, `session wait`). Project-scoped (no `-S` needed): `images`, `auth ls`, `op ls/show/cancel/wait`, `skill ...`, `agent`, `build`, `--help`, plus the discovery-style session commands `session list`, `session show NAME`, and `session delete NAME`.
 7. BEFORE choosing an image, list what is available.
    Projects can have thousands of images — always use `--prefix` to filter:
    `contree images --prefix python`
@@ -214,24 +214,30 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
 - `session branch`: create an experimental branch.
 - `session checkout`: switch active branch.
 - `session rollback`: move the active branch pointer backward.
-- `session wait`: wait for active operations, or specific operation UUIDs.
-  **Not** simply a session-scoped `op wait` -- with no UUIDs it
-  drains the local cache of detached operations spawned in *this*
-  session, advances the active branch with the result image of each
-  successful non-disposable run, and records disposable branches for
-  disposable detached runs. Use this when you want fan-out from a
-  single session to update the session's history DAG automatically.
+- `session wait`: drain detached operations spawned in *this* session.
+  **The advance-the-branch side effects only fire when you call it
+  with NO arguments** -- that form reads the local pending-ops cache,
+  so each completed non-disposable run advances the active branch to
+  its result image and disposable runs are recorded as
+  `disposable-<uuid>` branches. The `session wait UUID...` form is a
+  plain polling loop: it prints completion rows but does NOT update
+  the active branch, because the pending metadata is not loaded for
+  explicit UUIDs. For explicit-UUID workflows that need the result
+  image, use `op show UUID` and `contree use "$IMG"` (or tag it
+  yourself).
 - `ps` / `show` / `kill`: inspect, read, or cancel operations (top-level shortcuts; multi-UUID).
 - `operation` (alias `op`): grouped namespace. Use this when monitoring background work.
   - `op ls` -- same flags as `ps`, lists operations. Pipe to `-q` for UUIDs.
   - `op show UUID1 UUID2 ...` -- fetch several operation results in one call.
   - `op wait UUID1 UUID2 ...` -- block until each reaches a terminal status,
     print one operation record per completion. Default formatter
-    pins `uuid`, `status`, `timed_out`, `duration` first and `error`
-    last; every other scalar field the API returns is included
-    between them, so the column count is not fixed. For automation
-    use `-f json` (one object per line) or `-f tsv` and select
-    fields explicitly.
+    pins `uuid`, `status`, `exit_code`, `timed_out`, `duration` first
+    and `error` last; every other scalar field the API returns is
+    included between them, so the column count is not fixed. For
+    automation use `-f json` (one object per line) or `-f tsv` and
+    select fields explicitly. A `run` that the API marks `SUCCESS`
+    with a non-zero `exit_code` is promoted to `FAILED` and the exit
+    code propagates as the process exit status.
     `--all` waits for every active op; `--timeout SECONDS` (default 60)
     causes exit code 1 if not all complete in time. Pure observer:
     does NOT advance any session branch with result images. Pairs
@@ -403,27 +409,45 @@ Monitoring background operations:
 - `contree op wait UUID1 UUID2 ...` -- block until each of these ops
   reaches a terminal status; print one operation record per
   completion. The default formatter shows `uuid`, `status`,
-  `timed_out`, `duration` first, every other scalar API field after
-  that, and `error` last -- so do not parse by fixed column count.
-  For automation use `-f json` (line-delimited objects) or `-f tsv`.
-  Exit code 1 if any finished non-SUCCESS, or if `--timeout`
-  (default 60s) elapsed first.
+  `exit_code`, `timed_out`, `duration` first, every other scalar API
+  field after that, and `error` last -- so do not parse by fixed
+  column count. For automation use `-f json` (line-delimited objects)
+  or `-f tsv`. Exit code 1 if any finished non-SUCCESS, or if
+  `--timeout` (default 60s) elapsed first. A SUCCESS op with non-zero
+  `exit_code` (e.g. `run -- false`) is promoted to FAILED and the
+  exit code propagates to the process exit status.
+
+  **Use `op wait` ONLY outside-of-session scenarios** -- when the
+  UUIDs came from a different session, a different agent, an
+  `images import`, or any other place where you only need to know
+  "is it done yet?". `op wait` is a pure observer and will NOT
+  advance the active branch when the operation produced an image.
+  If you spawned the ops in *this* session, use `session wait`
+  instead (no-arg form) so the session DAG actually moves to the
+  result image.
 - `contree op wait --all` -- block until every active op completes.
   **Warning:** `--all` is project-wide. If another agent (or another
   shell in the same project) launched operations in parallel, you will
   block on those too -- and your wait may "complete" because of an op
-  you did not start. When several agents share a project, prefer the
-  explicit `op wait UUID1 UUID2 ...` form with the UUIDs you actually
-  spawned. Not catastrophic, just surprising; expect it.
-- `contree session wait` -- session-owned drain. Without arguments
-  waits for every detached op spawned in *this* session (from the
-  local cache); with UUIDs waits for those specific ops. Differs
-  from `op wait` in three ways:
+  you did not start. **For session-spawned fan-out the right tool is
+  `contree -S <key> session wait` (no UUIDs)**: it drains only this
+  session's pending detached ops, advances the active branch with
+  each result image, and never blocks on a sibling agent's work.
+  Use `op wait --all` only when you genuinely want a project-wide
+  observer (admin/cleanup tooling).
+- `contree session wait` -- session-owned drain. **Important: the
+  history-advancing side effects only happen with NO arguments**;
+  that form reads the local pending-ops cache. Passing explicit
+  UUIDs (`session wait UUID...`) turns it into a plain polling loop
+  with no branch movement, because the pending metadata is not
+  loaded for explicit UUIDs. Differs from `op wait` in three ways
+  (only on the no-arg form):
   1. **Scope**: limited to the active session's detached cache (not
      project-wide).
-  2. **Side effects**: on success it advances the active branch to
-     the result image of each non-disposable detached run, and
-     records `disposable-<uuid>` branches for disposable ones.
+  2. **Side effects (no-arg form only)**: on success it advances the
+     active branch to the result image of each non-disposable
+     detached run, and records `disposable-<uuid>` branches for
+     disposable ones. **The explicit-UUID form does NOT do this.**
   3. **Exit semantics**: like `op wait`, promotes SUCCESS+nonzero
      exit_code to FAILED. Propagates the actual sandbox exit code
      so `session wait && next-step` behaves correctly.
@@ -432,9 +456,13 @@ Monitoring background operations:
   - `op wait UUID...` -- you have UUIDs from any source (different
     sessions, different agents) and just want to know when they're
     done. Pure observer; does not mutate session history.
-  - `session wait` -- you spawned several detached runs in this
-    session and want session history to update to the chosen result
-    image. Use after `run -d` (non-disposable).
+  - `session wait` (no args) -- you spawned several detached runs
+    in this session and want session history to update to the
+    chosen result image. Use after `run -d` (non-disposable).
+  - `session wait UUID...` -- avoid for branch-advancing workflows;
+    use the no-arg form or, when you need a specific UUID, follow
+    `op wait UUID` with `op show UUID | jq -r .image` and
+    `contree use`.
 
 Cancelling:
 
@@ -462,35 +490,50 @@ table/plain, not JSON, so `jq -r .uuid` against the default output
 will fail. The global `-f json` must come BEFORE the subcommand.
 
 ```bash
-A=$(contree -S <key> -f json run -d --disposable -- pytest tests/a | jq -r .uuid)
-B=$(contree -S <key> -f json run -d --disposable -- pytest tests/b | jq -r .uuid)
-C=$(contree -S <key> -f json run -d --disposable -- pytest tests/c | jq -r .uuid)
-contree -S <key> op wait "$A" "$B" "$C"    # one row per op as they finish
-contree -S <key> op show "$A" "$B" "$C"    # stdout/stderr per op
+contree -S <key> -f json run -d --disposable -- pytest tests/a >/dev/null
+contree -S <key> -f json run -d --disposable -- pytest tests/b >/dev/null
+contree -S <key> -f json run -d --disposable -- pytest tests/c >/dev/null
+# session wait drains *this* session's pending detached ops and prints
+# one row per completion. Prefer this over `op wait` for anything you
+# spawned in the active session -- `op wait` is for ops owned by some
+# other session/agent.
+contree -S <key> session wait
+# Inspect stdout/stderr after the fact via `op show` (multi-UUID in one call):
+contree -S <key> -f json ps -a --status SUCCESS --since=1h | jq -r .uuid \
+  | xargs contree op show
 ```
 
-NON-DISPOSABLE fan-out works, but with caveats:
+NON-DISPOSABLE fan-out has two viable shapes:
 
-- Each `run -d` creates a `detached-<op-uuid>` branch in the session.
-  It points at the **starting** image, not at the eventual result.
-- `op wait` polls until completion but does **not** advance any
-  branch with the result image. After the wait, the session looks
-  exactly like it did before the wait, just with `detached-*`
-  branches accumulating.
-- The actual result images live only on the server. To use one,
-  extract it from `op wait` / `op show` output and attach it
-  explicitly:
+- **PREFERRED**: drain via `session wait` (no arguments). Each `run -d`
+  registers a pending op in this session, so the no-arg drain polls
+  every leg, advances the active branch to each result image, and
+  drops the cosmetic `detached-<op-uuid>` branches in favour of the
+  real history entries.
 
-```bash
-A=$(contree -S <key> -f json run -d -- apt-get install -y curl | jq -r .uuid)
-B=$(contree -S <key> -f json run -d -- apt-get install -y wget | jq -r .uuid)
-contree -S <key> op wait "$A" "$B"
-# Pick the winning leg and re-bind the active session image to it:
-IMG_A=$(contree -f json op show "$A" | jq -r .image)
-contree -S <key> use "$IMG_A"
-# Or tag a build artefact for reuse:
-contree -S <key> tag "$IMG_A" feature/curl-tools
-```
+  ```bash
+  contree -S <key> -f json run -d -- apt-get install -y curl >/dev/null
+  contree -S <key> -f json run -d -- apt-get install -y wget >/dev/null
+  contree -S <key> session wait    # drains both; advances active branch
+  ```
+
+- **ADVANCED**: only when you need to pick a single result image
+  (rare). `op wait UUID...` polls without advancing the branch, so
+  the result images live only on the server until you re-bind one
+  yourself:
+
+  ```bash
+  A=$(contree -S <key> -f json run -d -- apt-get install -y curl | jq -r .uuid)
+  B=$(contree -S <key> -f json run -d -- apt-get install -y wget | jq -r .uuid)
+  contree -S <key> op wait "$A" "$B"
+  IMG_A=$(contree -f json op show "$A" | jq -r .image)
+  contree -S <key> use "$IMG_A"
+  contree -S <key> tag "$IMG_A" feature/curl-tools  # or tag for reuse
+  ```
+
+  The `op wait`-inside-session form is the exception to the rule
+  "use `op wait` only for ops owned by another session". Reach for
+  it only when you specifically need to discard one or more legs.
 
 Other useful invocations:
 

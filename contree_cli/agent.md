@@ -288,8 +288,8 @@ Detached mode (-d):
   contree ps                                  check status
   contree ps -a --status FAILED --since=1h    recent failures
   contree show UUID                           view result
-  contree session wait                        block until done
-  contree session wait UUID1 UUID2            wait for specific ops
+  contree session wait                        block until done + advance branch
+  contree session wait UUID1 UUID2            poll only (NO branch advance)
 
   NOTE: status filtering uses --status, NOT -S. `-S` is the global
   session flag and only works BEFORE the subcommand. Also, the
@@ -317,13 +317,23 @@ Monitoring background operations:
 
   `op wait` is a pure observer: polls and prints one operation
   record per completion. Default formatter pins uuid, status,
-  timed_out, duration first and error last; every other scalar API
-  field appears between them, so column count is not fixed. For
-  scripts use `-f json` (one object per line) or `-f tsv` and
-  select fields explicitly. Exit code 1 if any op finishes
+  exit_code, timed_out, duration first and error last; every other
+  scalar API field appears between them, so column count is not
+  fixed. For scripts use `-f json` (one object per line) or `-f tsv`
+  and select fields explicitly. Exit code 1 if any op finishes
   non-SUCCESS, or if --timeout (default 60s) hits before every op
-  reaches a terminal status. Use --all to wait for every currently
-  active op in the project.
+  reaches a terminal status. A SUCCESS op with a non-zero exit_code
+  (e.g. `run -- false`) is promoted to FAILED and the underlying
+  exit code propagates as the process exit status. Use --all to wait
+  for every currently active op in the project.
+
+  Rule of thumb -- use `op wait` ONLY outside session context:
+    `op wait` is the right tool when the UUIDs came from somewhere
+    else (different session, different agent, `images import`,
+    raw API call) and you only need "is it done yet?". For ops you
+    spawned in *this* session, use `session wait` (no-arg form)
+    instead -- it polls AND advances the active branch to each
+    result image, which `op wait` will not do.
 
   Caveat 1 -- `op wait` does NOT advance session state:
     Each `run -d` (non-disposable) creates a `detached-<op-uuid>`
@@ -350,9 +360,12 @@ Monitoring background operations:
     If another agent (or another shell of yours) is running
     concurrently in the same project, your --all will block on its
     ops too. The result is still a valid wait, just possibly not
-    over the set you expected. When several agents share a project,
-    prefer the explicit form `op wait $A $B $C` with the UUIDs you
-    spawned yourself.
+    over the set you expected. For session-spawned fan-out the
+    correct alternative is `contree -S <key> session wait` (no
+    args): it drains only this session's pending detached ops and
+    advances the active branch with each result image. Reach for
+    `op wait --all` only when you really want a project-wide
+    observer (admin/cleanup tooling).
 
   Background checks are cheap: terminal results are cached locally,
   so repeated `op show` / `show` calls do not re-hit the API.
@@ -522,10 +535,10 @@ All commands
   session list            List sessions (aliases: ls)
   session branch [NAME]   Create/list branches (aliases: br)
   session checkout BRANCH Switch branch (aliases: co)
-  session rollback [N]    Undo N steps (aliases: rb)
+  session rollback [N]    Jump to history id N (absolute); -N steps back (aliases: rb)
   session show            Show history DAG
   session delete KEY      Delete session (aliases: rm, del)
-  session wait [OPS]      Wait for operations
+  session wait [OPS]      Drain detached ops; no-arg form advances branch, UUID form polls only
   auth                    Save token
   auth ls                 List profiles (aliases: profiles)
   auth switch NAME        Switch profile
