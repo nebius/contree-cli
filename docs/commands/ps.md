@@ -25,8 +25,8 @@ contree ps -a
 # UUIDs only (for scripting)
 contree ps -q
 
-# Filter by status
-contree ps -S FAILED
+# Filter by status (note: --status, not -S; -S is the global session flag)
+contree ps --status FAILED
 
 # Filter by kind
 contree ps -K instance

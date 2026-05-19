@@ -75,8 +75,13 @@ Branch workflow:
   contree -S <key> session branch -d experiment  # clean up
 
 Rollback:
-  contree -S <key> session rollback 1       undo last run
-  contree -S <key> session rollback 3       undo last 3 runs
+  contree -S <key> session rollback         back one entry (default)
+  contree -S <key> session rollback -- -3   back three entries (note `--`)
+  contree -S <key> session rollback +1      forward one entry
+  contree -S <key> session rollback 42      absolute jump to history id 42
+
+  WARNING: a bare positive N is an ABSOLUTE id, not "back N steps".
+  Use `--` plus a negative N for relative navigation.
   contree -S <key> session show             view history before rollback
 
 History DAG (contree session show output):
@@ -257,11 +262,16 @@ Piped stdin:
 
 Detached mode (-d):
   contree run -d -- long-running-task
-  contree ps                              check status
-  contree ps -a -S FAILED --since=1h      recent failures
-  contree show UUID                       view result
-  contree session wait                    block until done
-  contree session wait UUID1 UUID2        wait for specific ops
+  contree ps                                  check status
+  contree ps -a --status FAILED --since=1h    recent failures
+  contree show UUID                           view result
+  contree session wait                        block until done
+  contree session wait UUID1 UUID2            wait for specific ops
+
+  NOTE: status filtering uses --status, NOT -S. `-S` is the global
+  session flag and only works BEFORE the subcommand. Also, the
+  default `run -d` output is plain/table -- use `contree -f json
+  run -d ...` to capture the UUID via `jq -r .uuid` reliably.
 
 Monitoring background operations:
   Use the `operation` namespace (alias `op`) when juggling several
@@ -269,12 +279,12 @@ Monitoring background operations:
   its top-level shortcut. `op show` and `op cancel` accept multiple
   UUIDs in one call (`op cancel` has aliases `kill` and `k`).
 
-  contree op ls                           list operations (= contree ps)
-  contree op ls -a -S EXECUTING           filter active runs
-  contree op show UUID1 UUID2 UUID3       inspect a batch in one call
-  contree op cancel UUID1 UUID2           cancel selected operations
-  contree kill UUID1 UUID2                same -- top-level shortcut
-  contree op cancel --all                 cancel every active op (rare)
+  contree op ls                               list operations (= contree ps)
+  contree op ls -a --status EXECUTING         filter active runs
+  contree op show UUID1 UUID2 UUID3           inspect a batch in one call
+  contree op cancel UUID1 UUID2               cancel selected operations
+  contree kill UUID1 UUID2                    same -- top-level shortcut
+  contree op cancel --all                     cancel every active op (rare)
 
   `op wait` is a pure observer: polls and prints one row per
   operation as it completes (uuid|status|duration|timed_out).
@@ -291,16 +301,16 @@ Monitoring background operations:
     before the wait, just with `detached-*` branches accumulated.
 
   PREFERRED fan-out (--disposable, no image-tracking concerns):
-    A=$(contree run -d --disposable -- pytest tests/a | jq -r .uuid)
-    B=$(contree run -d --disposable -- pytest tests/b | jq -r .uuid)
-    C=$(contree run -d --disposable -- pytest tests/c | jq -r .uuid)
-    contree op wait "$A" "$B" "$C"          block until all complete
-    contree op show "$A" "$B" "$C"          stdout/stderr per op
+    A=$(contree -S <key> -f json run -d --disposable -- pytest tests/a | jq -r .uuid)
+    B=$(contree -S <key> -f json run -d --disposable -- pytest tests/b | jq -r .uuid)
+    C=$(contree -S <key> -f json run -d --disposable -- pytest tests/c | jq -r .uuid)
+    contree -S <key> op wait "$A" "$B" "$C"     block until all complete
+    contree -S <key> op show "$A" "$B" "$C"     stdout/stderr per op
 
   Non-disposable fan-out (must recover images manually):
-    A=$(contree run -d -- apt-get install -y curl | jq -r .uuid)
-    B=$(contree run -d -- apt-get install -y wget | jq -r .uuid)
-    contree op wait "$A" "$B"
+    A=$(contree -S <key> -f json run -d -- apt-get install -y curl | jq -r .uuid)
+    B=$(contree -S <key> -f json run -d -- apt-get install -y wget | jq -r .uuid)
+    contree -S <key> op wait "$A" "$B"
     IMG_A=$(contree -f json op show "$A" | jq -r .image)
     contree use "$IMG_A"                    bind chosen result back
 
@@ -326,7 +336,7 @@ Session-level environment variables:
   contree env PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin
   contree env DEBUG=1
   contree run -- cargo build         # injects PATH and DEBUG per-run
-  contree env -d DEBUG               # unset
+  contree env -U DEBUG               # unset
   contree env                        # list all
 
 Session env is injected on every run but NOT saved into the image
@@ -469,7 +479,7 @@ All commands
   cat PATH                Show file content (no VM)
   cp PATH DEST            Download file from image
   cd [PATH]               Change session working directory
-  env [KEY=VALUE ...]     Session env vars (-d to unset)
+  env [KEY=VALUE ...]     Session env vars (-U to unset)
   file edit PATH          Edit remote file via $EDITOR
   file cp SRC DEST        Stage local file for next run
   file ls [-q]            List uploaded files + local path (aliases: list)

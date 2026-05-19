@@ -8,22 +8,29 @@ Use `contree` from PATH. If not found, ask the user to install it:
 ## Sandbox requirements (Codex)
 
 `contree` requires network access (API calls) and write access to its
-data directory (`~/.config/contree-cli`). In Codex, add to `~/.codex/config.toml`:
+data directory (default: ``$XDG_CONFIG_HOME/contree`` — falls back to
+``~/.config/contree`` when ``XDG_CONFIG_HOME`` is unset; override via
+``$CONTREE_HOME``). In Codex, add to ``~/.codex/config.toml``:
 
 ```toml
 [sandbox_workspace_write]
 network_access = true
-writable_roots = ["~/.config/contree-cli"]
+writable_roots = ["~/.config/contree"]
 ```
 
-Without this, `contree` will fail with `sqlite3.OperationalError`.
-If sandbox cannot be configured, stop and ask the user.
+If the user sets ``$CONTREE_HOME`` or ``$XDG_CONFIG_HOME``, the
+writable root must point at the resolved data directory instead.
+Without write access, `contree` will fail with
+`sqlite3.OperationalError`. If sandbox cannot be configured, stop
+and ask the user.
 
 ## Quick start
 
 {first_step}
 4. If something fails or syntax is unclear, run `contree agent <topic>` BEFORE retrying.
-   Topics: sessions, images, files, execution, output, profiles, commands.
+   Topics: `sessions`, `images`, `files`, `execution`, `output`, `profiles`,
+   `core` (workflow), `command` / `command_safety`, `all_commands`,
+   `all` (full manual).
 5. Agents must never run `contree auth`. If auth is missing or invalid, stop and ask the user to run `contree auth`.
 5. Choose an explicit session key before anything else and pass it on every command with `-S`, for example `agent_<task>` or `agent_<task>_<subagent>`.
 6. BEFORE choosing an image, list what is available.
@@ -81,7 +88,7 @@ If sandbox cannot be configured, stop and ask the user.
 Sessions are the agent memory model. Reuse them deliberately instead of creating fresh state by default.
 
 1. `contree session list --filter <hint>`
-2. `contree session show --session <name>`
+2. `contree -S <name> session show` (or `contree session show <name>` -- positional, no `--session` flag)
 3. `contree -S <name> use <image-or-tag>`
 
 If nothing suitable exists, create a new explicit session key and keep using it throughout the task.
@@ -312,9 +319,13 @@ Use staged files when several edits should land together on the next run. Use `-
 - Create branches before risky work:
   `contree -S <key> session branch experiment`
   `contree -S <key> session checkout experiment`
-- Roll back small units:
-  `contree -S <key> session rollback 1`
-- `session rollback` supports absolute IDs and relative navigation; inspect with `session show` before destructive movement.
+- Roll back small units. **`rollback N` (positive) is an ABSOLUTE jump to history id N, not "back N steps".**
+  Use relative forms instead:
+  `contree -S <key> session rollback`           back one entry (default)
+  `contree -S <key> session rollback -- -3`     back three entries (`--` so argparse doesn't eat the `-3`)
+  `contree -S <key> session rollback +1`        forward one entry
+  `contree -S <key> session rollback 42`        absolute jump to history id 42 (use only after `session show`)
+- Always inspect with `session show` before destructive movement.
 - Use `contree session show` to inspect the history DAG.
 - `session show` defaults to the last 20 entries unless asked for the full history.
 
@@ -369,12 +380,16 @@ PREFERRED: fan-out + wait with `--disposable`. The result images of
 each leg are discarded, you only care about exit codes / stdout, and
 the session stays clean.
 
+**Capture UUIDs with `-f json`** — the default `run -d` formatter is
+table/plain, not JSON, so `jq -r .uuid` against the default output
+will fail. The global `-f json` must come BEFORE the subcommand.
+
 ```bash
-A=$(contree run -d --disposable -- pytest tests/a | jq -r .uuid)
-B=$(contree run -d --disposable -- pytest tests/b | jq -r .uuid)
-C=$(contree run -d --disposable -- pytest tests/c | jq -r .uuid)
-contree op wait "$A" "$B" "$C"             # one row per op as they finish
-contree op show "$A" "$B" "$C"             # stdout/stderr per op
+A=$(contree -S <key> -f json run -d --disposable -- pytest tests/a | jq -r .uuid)
+B=$(contree -S <key> -f json run -d --disposable -- pytest tests/b | jq -r .uuid)
+C=$(contree -S <key> -f json run -d --disposable -- pytest tests/c | jq -r .uuid)
+contree -S <key> op wait "$A" "$B" "$C"    # one row per op as they finish
+contree -S <key> op show "$A" "$B" "$C"    # stdout/stderr per op
 ```
 
 NON-DISPOSABLE fan-out works, but with caveats:
@@ -390,14 +405,14 @@ NON-DISPOSABLE fan-out works, but with caveats:
   explicitly:
 
 ```bash
-A=$(contree run -d -- apt-get install -y curl | jq -r .uuid)
-B=$(contree run -d -- apt-get install -y wget | jq -r .uuid)
-contree op wait "$A" "$B"
+A=$(contree -S <key> -f json run -d -- apt-get install -y curl | jq -r .uuid)
+B=$(contree -S <key> -f json run -d -- apt-get install -y wget | jq -r .uuid)
+contree -S <key> op wait "$A" "$B"
 # Pick the winning leg and re-bind the active session image to it:
 IMG_A=$(contree -f json op show "$A" | jq -r .image)
-contree use "$IMG_A"
+contree -S <key> use "$IMG_A"
 # Or tag a build artefact for reuse:
-contree tag "$IMG_A" feature/curl-tools
+contree -S <key> tag "$IMG_A" feature/curl-tools
 ```
 
 Other useful invocations:
@@ -413,8 +428,10 @@ contree op wait --timeout 300 "$A" "$B" "$C"
 # Snapshot what is running right now.
 contree -f json op ls | jq '.uuid'
 
-# Find recent failures across the project.
-contree -f json ps -a -S FAILED --since=1h
+# Find recent failures across the project. `--status` is the correct
+# filter; `-S` at this position is the global session flag, not a
+# status alias.
+contree -f json ps -a --status FAILED --since=1h
 ```
 
 ## Output and automation

@@ -1378,9 +1378,9 @@ class TestProfileNamespacing:
 
 
 class TestEnvKeySource:
-    """`env -d <TAB>` completes session env keys."""
+    """`env -U <TAB>` completes session env keys."""
 
-    def test_env_d_completes_existing_keys(self, image_cache):
+    def test_env_unset_completes_existing_keys(self, image_cache):
         store = MagicMock()
         store.cache = image_cache
         store.get_env.return_value = {"PATH": "/usr/bin", "DEBUG": "1"}
@@ -1388,7 +1388,7 @@ class TestEnvKeySource:
         results = _complete_line(
             completer,
             "",
-            "contree env -d ",
+            "contree env -U ",
             begidx=15,
         )
         assert "PATH " in results
@@ -1399,7 +1399,7 @@ class TestEnvKeySource:
         results = _complete_line(
             completer,
             "",
-            "contree env -d ",
+            "contree env -U ",
             begidx=15,
         )
         assert results == []

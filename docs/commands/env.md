@@ -17,8 +17,8 @@ contree env DEBUG=1 DB_HOST=localhost
 contree env
 
 # Unset variables
-contree env -d PATH
-contree env -d DEBUG DB_HOST
+contree env -U PATH
+contree env -U DEBUG DB_HOST
 
 # Per-run -e overrides session env
 contree run -e DEBUG=0 -- ./app

@@ -31,8 +31,14 @@ contree session branch
 # Undo last operation
 contree session rollback
 
-# Undo last 3 operations
-contree session rollback 3
+# Undo last 3 operations (`--` stops argparse from eating `-3` as a flag)
+contree session rollback -- -3
+
+# Forward one entry
+contree session rollback +1
+
+# Absolute jump to a specific history id (use `session show` first)
+contree session rollback 42
 
 # Import image from another session
 contree session use other-session

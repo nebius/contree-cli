@@ -292,13 +292,15 @@ the **starting** image and never get moved. See the non-disposable
 recovery example below.
 :::
 
-The preferred shape — disposable runs, parallel independent checks:
+The preferred shape — disposable runs, parallel independent checks.
+The global `-f json` must come BEFORE the subcommand so that `jq`
+gets JSON; the default `run -d` formatter is plain.
 
 ```bash
 # Three parallel test suites, results discarded after the runs
-A=$(contree run -d --disposable -- pytest tests/a | jq -r .uuid)
-B=$(contree run -d --disposable -- pytest tests/b | jq -r .uuid)
-C=$(contree run -d --disposable -- pytest tests/c | jq -r .uuid)
+A=$(contree -f json run -d --disposable -- pytest tests/a | jq -r .uuid)
+B=$(contree -f json run -d --disposable -- pytest tests/b | jq -r .uuid)
+C=$(contree -f json run -d --disposable -- pytest tests/c | jq -r .uuid)
 
 # Block until each one finishes (or 60 s elapses, whichever comes first)
 contree op wait "$A" "$B" "$C"
@@ -311,8 +313,8 @@ Non-disposable fan-out works too, but you have to recover the result
 images yourself — `op wait` will not bind them into the session:
 
 ```bash
-A=$(contree run -d -- apt-get install -y curl | jq -r .uuid)
-B=$(contree run -d -- apt-get install -y wget | jq -r .uuid)
+A=$(contree -f json run -d -- apt-get install -y curl | jq -r .uuid)
+B=$(contree -f json run -d -- apt-get install -y wget | jq -r .uuid)
 contree op wait "$A" "$B"
 
 # Pull the winning leg's image out of the operation result and

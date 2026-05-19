@@ -121,27 +121,44 @@ contree session branch
 
 ## Rollback
 
-Undo the last N operations on the current branch:
+Move the branch pointer in the history chain. The argument distinguishes
+absolute jumps from relative navigation:
+
+| Argument | Meaning |
+|---|---|
+| _(none)_ | Back one entry (default) |
+| `-- -N` | Back N entries (the `--` stops argparse from parsing `-N` as a flag) |
+| `+N` | Forward N entries |
+| `N` (bare positive) | **Absolute** jump to history id `N` |
 
 ::::{tab-set}
 :::{tab-item} CLI
 ```bash
-contree session rollback      # undo last 1
-contree session rollback 3    # undo last 3
+contree session rollback           # back one entry
+contree session rollback -- -3     # back three entries
+contree session rollback +1        # forward one entry
+contree session rollback 42        # absolute jump to history id 42
 ```
 :::
 
 :::{tab-item} Shell
 ```text
 contree session rollback
-contree session rollback 3
+contree session rollback -- -3
+contree session rollback +1
+contree session rollback 42
 ```
 :::
 ::::
 
-This moves the branch pointer backwards in the history chain. The history
-entries still exist and can be recovered by creating a branch at a specific
-point.
+:::{warning}
+A bare positive number is an **absolute** history id, not "back N steps".
+Use `--` followed by a negative number for relative back-navigation.
+Inspect with `contree session show` first to avoid surprise jumps.
+:::
+
+The history entries still exist and can be recovered by creating a branch at
+a specific point.
 
 ## Starting a fresh session
 

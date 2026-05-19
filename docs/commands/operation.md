@@ -21,7 +21,7 @@ Manage operations under a single namespace. Aggregates `ps` (list),
 # List active operations (same as `contree ps`)
 contree op list
 contree op ls
-contree op ls -a -S FAILED       # all flags from ps are accepted
+contree op ls -a --status FAILED # all flags from ps are accepted
 
 # Inspect a single operation
 contree op show 3f2a7b...
@@ -51,10 +51,12 @@ usage and routes to the three subcommands described below.
 ## `op list` -- dynamic columns
 
 `contree op list` (alias `op ls`) accepts the same filter flags as
-`contree ps` (`-a`, `-S STATUS`, `-K KIND`, `--since`, `--until`,
-`-q`/`--quiet`) and shares its rendering pipeline. Reach for it when
-you want the operations namespace to feel symmetric with the
-multi-UUID `show` and `cancel`; otherwise `contree ps` is just as good.
+`contree ps` (`-a`, `--status STATUS`, `-K KIND`, `--since`,
+`--until`, `-q`/`--quiet`) and shares its rendering pipeline. Reach
+for it when you want the operations namespace to feel symmetric with
+the multi-UUID `show` and `cancel`; otherwise `contree ps` is just
+as good. `-S` is the global session flag and only works BEFORE the
+subcommand.
 
 ```{terminal-shell} contree op list --help
 ```
@@ -133,12 +135,14 @@ might expect. For multi-agent setups, prefer the explicit
 ```{terminal-shell} contree op wait --help
 ```
 
-Preferred — `--disposable` fan-out, no image to track:
+Preferred — `--disposable` fan-out, no image to track. Note the
+global `-f json` before `run` so `jq` sees JSON; the default
+formatter is plain.
 
 ```bash
-A=$(contree run -d --disposable -- pytest tests/a | jq -r .uuid)
-B=$(contree run -d --disposable -- pytest tests/b | jq -r .uuid)
-C=$(contree run -d --disposable -- pytest tests/c | jq -r .uuid)
+A=$(contree -f json run -d --disposable -- pytest tests/a | jq -r .uuid)
+B=$(contree -f json run -d --disposable -- pytest tests/b | jq -r .uuid)
+C=$(contree -f json run -d --disposable -- pytest tests/c | jq -r .uuid)
 contree op wait "$A" "$B" "$C"
 contree op show "$A" "$B" "$C"          # stdout/stderr per leg
 ```
@@ -146,8 +150,8 @@ contree op show "$A" "$B" "$C"          # stdout/stderr per leg
 Non-disposable fan-out — must recover the chosen leg's image yourself:
 
 ```bash
-A=$(contree run -d -- apt-get install -y curl | jq -r .uuid)
-B=$(contree run -d -- apt-get install -y wget | jq -r .uuid)
+A=$(contree -f json run -d -- apt-get install -y curl | jq -r .uuid)
+B=$(contree -f json run -d -- apt-get install -y wget | jq -r .uuid)
 contree op wait "$A" "$B"
 
 # Pull the result image out and bind it back into the session,

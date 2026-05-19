@@ -13,7 +13,7 @@ contree run apt-get install -y curl     # builds on the previous snapshot
 contree session branch experiment       # branch the sandbox state
 contree run -- make test                # experiment freely
 contree session checkout main           # switch back instantly
-contree session rollback 2              # or rewind two steps
+contree session rollback -- -2          # or rewind two steps
 ```
 
 ## What is ConTree?
@@ -116,7 +116,7 @@ contree cp /app/output.log . # download to local machine
 contree session branch experiment     # create a branch
 contree run -- make test              # experiment on it
 contree session checkout main         # switch back
-contree session rollback 1            # undo last run
+contree session rollback              # undo last run (default: back 1 entry)
 ```
 
 ## Interactive Shell
@@ -241,7 +241,7 @@ contree session                       # show current state
 contree session show                  # display history DAG
 contree session branch feature        # create branch from HEAD
 contree session checkout feature      # switch to it
-contree session rollback 3            # go back 3 steps
+contree session rollback -- -3        # go back 3 steps (note `--`; bare `3` is absolute id)
 contree session use other-session     # import image from another session
 ```
 
@@ -263,7 +263,7 @@ Pipe JSON output into `jq`, feed CSV into spreadsheets, or parse programmaticall
 
 ### Config file
 
-`~/.config/contree-cli/config.ini`:
+`$XDG_CONFIG_HOME/contree/auth.ini` (default: `~/.config/contree/auth.ini`; override via `$CONTREE_HOME`):
 
 ```ini
 [DEFAULT]

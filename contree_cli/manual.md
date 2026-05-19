@@ -49,8 +49,14 @@ Branch workflow:
   contree session branch -d experiment   clean up
 
 Rollback:
-  contree session rollback 1             undo last run
+  contree session rollback               back one entry (default)
+  contree session rollback -- -3         back three entries (note `--`)
+  contree session rollback +1            forward one entry
+  contree session rollback 42            absolute jump to history id 42
   contree session show                   inspect before rollback
+
+  WARNING: a bare positive N is an ABSOLUTE history id, not "back N steps".
+  Use `--` plus a negative N for relative back-navigation.
 
 More: contree session --help
 
@@ -155,9 +161,9 @@ Detached workflow:
   contree show UUID                      view result
   contree op wait UUID                   block until terminal
 
-Fan-out + join:
-  A=$(contree run -d -- make a | jq -r .uuid)
-  B=$(contree run -d -- make b | jq -r .uuid)
+Fan-out + join (use -f json BEFORE run so jq sees JSON):
+  A=$(contree -f json run -d -- make a | jq -r .uuid)
+  B=$(contree -f json run -d -- make b | jq -r .uuid)
   contree op wait "$A" "$B"              wait for both; one row each
   contree op wait --all --timeout 600    or block on every active op
 
@@ -259,7 +265,7 @@ All commands
   cat PATH                Show file content (no VM)
   cp PATH DEST            Download file from image
   cd [PATH]               Change session working directory
-  env [KEY=VALUE ...]     Session env vars (-d to unset)
+  env [KEY=VALUE ...]     Session env vars (-U to unset)
   file edit PATH          Edit remote file via $EDITOR
   file cp SRC DEST        Stage local file for next run
   session list            List sessions (aliases: ls)
