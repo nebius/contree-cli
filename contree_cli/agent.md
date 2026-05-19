@@ -22,10 +22,14 @@ Agent protocol — follow this sequence for every task:
      contree images --prefix=...
      contree session show
 
-5. Execute in small steps — one mutating step per run:
-     contree -S <key> run -- sh -lc 'apt-get update -qq'
-     contree -S <key> run -- sh -lc 'apt-get install -y curl'
+5. Execute in small steps — one mutating step per run. Pick the run
+   mode by the command's needs, not by category. `apt-get install`
+   and `pip install` are plain executables; direct mode is fine.
+   `-s` is for shell features (pipes, redirects, `&&`, `;`, `$`):
+     contree -S <key> run -- apt-get update -qq
+     contree -S <key> run -- apt-get install -y curl
      contree -S <key> run -- make -C /work test
+     contree -S <key> run -s -- 'apt list --installed 2>/dev/null | wc -l'
 
 6. Tag useful results immediately:
      contree -S <key> tag my-env:latest
@@ -72,7 +76,7 @@ Branch workflow:
   contree -S <key> session checkout experiment
   contree -S <key> run -- risky-command
   contree -S <key> session checkout main     # abandon if failed
-  contree -S <key> session branch -d experiment  # clean up
+  contree -S <key> session branch --delete experiment  # clean up
 
 Rollback:
   contree -S <key> session rollback         back one entry (default)
@@ -117,7 +121,7 @@ Tagging:
   contree tag my-app:v1.0                tag current session image
   contree tag UUID my-app:v1.0           tag specific image by UUID
   contree tag tag:alpine:latest my-copy  re-tag by reference
-  contree tag -d UUID my-tag             remove tag
+  contree tag -U UUID my-tag             remove tag (or --delete/--rm)
 
 Tag rules:
   - Tags are unique per project — assigning moves the tag
@@ -152,13 +156,21 @@ Building from a Dockerfile:
     contree build . --build-arg VERSION=1.2
     contree build . --no-cache          force rebuild
 
-  Supported directives: FROM, RUN, COPY, ADD (local paths only),
+  Supported directives: FROM, RUN, COPY, ADD (local files/dirs and http(s) URLs; no tar auto-extract),
   WORKDIR, ENV, ARG, USER. CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/etc.
   are parsed but skipped with a warning. Multi-stage (AS / --from)
   is not yet supported.
 
   .dockerignore is applied to every COPY/ADD walk on top of the
   default exclude list (.git, __pycache__, node_modules, etc.).
+
+  build runs in its own session keyed by abspath(CONTEXT) (visible
+  as "session": "build:<hash>" in -f json output). `-S <agent_key>`
+  on `build` is harmless but does not bind the build to your agent
+  session. Verify the resulting image from a normal session:
+    contree build . --tag myapp:dev
+    contree -S agent_verify use tag:myapp:dev
+    contree -S agent_verify run -D -- myapp --version
 
 More: contree build --help, contree images --help, contree tag --help
 
@@ -199,9 +211,10 @@ Staging files for next run:
   contree file edit /etc/nginx/nginx.conf    download, edit, stage
   contree file cp ./config.yaml /etc/app/    upload and stage
 
-Pending files are injected into the next non-disposable run.
-Explicit --file takes priority over pending files at same path.
-Pending files are branch-aware.
+Pending files are injected into the next run, including disposable
+ones (the run sees them; the active branch only commits them after
+a successful non-disposable run). Explicit --file takes priority
+over pending files at the same path. Pending files are branch-aware.
 
 Listing uploaded files:
   contree file ls                 list all uploaded files in the project
@@ -234,20 +247,30 @@ More: contree run --help, contree file --help
 Execution modes
 ===============
 
-Direct command (default) — each arg is a separate argv entry:
+Direct command (default) — each arg is a separate argv entry. Use
+this for plain executables that do not need shell features:
   contree run -- uname -a
   contree run -- make -C /app test
-  contree run -- sh -lc 'pip install flask'   (login shell)
+  contree run -- python /app/script.py
 
-Shell mode (-s) — joins args, passes to sh -c:
+Shell mode (-s) — joins args and passes to sh -c. Use when you need
+pipes, redirects, &&, ;, or variable expansion. Do not wrap manually
+in `sh -c '...'`; -s already does that for you. For working directory
+use `-C /path` or `contree cd /path`, NOT `cd` inside `-s`:
   contree run -s -- 'echo hello && ls /'
-  contree run -s -- 'cd /app && make test'
+  contree run -C /app -s -- 'echo $PWD && make test'
   contree run -s -- 'cat /etc/passwd | grep root'
+  contree run -- apt-get install -y curl      (direct mode is fine)
+
+Login shell (`run -- sh -lc '…'`) — only when /etc/profile.d behavior
+is explicitly required, e.g. PATH set by `agent` provisioning. Prefer
+`contree env` / `-e` and `cd` / `-C` over login-shell magic:
+  contree run -- sh -lc 'cargo build'   (only if PATH needs profile)
 
 When to use which:
-  Direct: contree run -- make test         (no shell features needed)
-  Shell:  contree run -s -- 'cd /app && make'  (need cd/pipes/&&)
-  Login:  contree run -- sh -lc 'cargo build'  (need PATH from profile)
+  Direct: contree run -- make test                (no shell features needed)
+  Shell:  contree run -C /app -s -- 'a | grep b'  (need pipes/&&/$expand)
+  Login:  contree run -- sh -lc 'cargo build'     (rare; PATH from profile)
 
 Interpreter mode (-I) — shebang scripts:
   #!/usr/bin/env -S contree run -I
@@ -279,19 +302,28 @@ Monitoring background operations:
   its top-level shortcut. `op show` and `op cancel` accept multiple
   UUIDs in one call (`op cancel` has aliases `kill` and `k`).
 
-  contree op ls                               list operations (= contree ps)
-  contree op ls -a --status EXECUTING         filter active runs
+  contree op ls                               EXECUTING only (default)
+  contree op ls -a                            every status
+  contree op ls --status PENDING              list PENDING ops
+  contree op ls --status FAILED --since 1h    recent failures
   contree op show UUID1 UUID2 UUID3           inspect a batch in one call
   contree op cancel UUID1 UUID2               cancel selected operations
   contree kill UUID1 UUID2                    same -- top-level shortcut
   contree op cancel --all                     cancel every active op (rare)
 
-  `op wait` is a pure observer: polls and prints one row per
-  operation as it completes (uuid|status|duration|timed_out).
-  Exit code 1 if any operation finishes non-SUCCESS, or if --timeout
-  (default 60s) is hit before every operation reaches a terminal
-  status. Use --all to wait for every currently active operation
-  in the project.
+  Default `op ls`/`ps` lists only `EXECUTING`; `PENDING` and
+  `ASSIGNED` are hidden until `-a` or an explicit `--status`. For a
+  full active snapshot, fetch with `-a` and filter client-side.
+
+  `op wait` is a pure observer: polls and prints one operation
+  record per completion. Default formatter pins uuid, status,
+  timed_out, duration first and error last; every other scalar API
+  field appears between them, so column count is not fixed. For
+  scripts use `-f json` (one object per line) or `-f tsv` and
+  select fields explicitly. Exit code 1 if any op finishes
+  non-SUCCESS, or if --timeout (default 60s) hits before every op
+  reaches a terminal status. Use --all to wait for every currently
+  active op in the project.
 
   Caveat 1 -- `op wait` does NOT advance session state:
     Each `run -d` (non-disposable) creates a `detached-<op-uuid>`
@@ -377,7 +409,7 @@ Rules for reliable agent workflows:
 
 2. One mutating step per run. Each run = one history entry.
    Wrong:  contree run -s -- 'apt install curl && make test'
-   Right:  contree run -- sh -lc 'apt install -y curl'
+   Right:  contree run -s -- apt install -y curl
            contree run -- make test
 
 3. Why split? Chained runs collapse into one checkpoint.
@@ -404,12 +436,16 @@ Rules for reliable agent workflows:
 Output formats
 ==============
 
-Global -f flag goes before the subcommand:
+Global -f flag goes before the subcommand. Always available formats:
 
   contree -f json images           one JSON object per line (JSONL)
   contree -f json-pretty ps        pretty-printed JSON array
   contree -f csv images            CSV with header row
   contree -f tsv ps                tab-separated values
+  contree -f plain images          key: value blocks
+
+`-f toml` is available only on Python 3.11+ (it relies on stdlib
+`tomllib`). On Python 3.10 it is silently absent from --help.
 
 Scripting examples:
   contree -f json images --prefix=python | jq -r '.uuid'

@@ -19,6 +19,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
@@ -334,6 +335,32 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
 CANCEL_ACTIVE_PAGE_SIZE = 100
 
 
+def effective_terminal_status(op: dict[str, Any]) -> tuple[str, int | None]:
+    """Return (status, exit_code) with SUCCESS+nonzero-exit promoted to FAILED.
+
+    Instance operations can complete with API status ``SUCCESS`` while the
+    sandbox process returned a non-zero exit code (e.g. ``run -- false``).
+    This mirrors the effective-status logic used by :func:`show.cmd_show`
+    and :func:`session.cmd_wait` so callers that use ``op wait`` as a test
+    gate see the underlying failure.
+    """
+    metadata = op.get("metadata") or {}
+    instance_result = metadata.get("result") if isinstance(metadata, dict) else None
+    state = instance_result.get("state") if isinstance(instance_result, dict) else None
+    raw = state.get("exit_code") if isinstance(state, dict) else None
+    if raw is None:
+        result = op.get("result")
+        raw = result.get("exit_code") if isinstance(result, dict) else None
+    try:
+        exit_code: int | None = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        exit_code = None
+    status = op.get("status", "")
+    if status == "SUCCESS" and exit_code not in (None, 0):
+        status = "FAILED"
+    return status, exit_code
+
+
 def list_active(client: ContreeClient) -> list[str]:
     """Collect UUIDs of all active (PENDING/ASSIGNED/EXECUTING) operations."""
     uuids: list[str] = []
@@ -464,10 +491,11 @@ def cmd_cancel(args: CancelArgs) -> int | None:
 def cmd_wait(args: WaitArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
-    # Pin uuid/status/timed_out/duration up front for the typical eyeball
-    # scan ("did it finish? how long?"); `error` stays in the trailing slot.
+    # Pin uuid/status/exit_code/timed_out/duration up front for the typical
+    # eyeball scan ("did it finish? how long? what was the exit?"); `error`
+    # stays in the trailing slot.
     formatter.configure(
-        head=("uuid", "status", "timed_out", "duration"),
+        head=("uuid", "status", "exit_code", "timed_out", "duration"),
         tail=("error",),
     )
 
@@ -495,9 +523,19 @@ def cmd_wait(args: WaitArgs) -> int | None:
             op = json.loads(resp.read())
             if op.get("status") in TERMINAL_STATUSES:
                 pending.discard(uuid)
-                formatter(**{**op, "timed_out": False})
-                if op.get("status") != "SUCCESS":
+                effective_status, exit_code = effective_terminal_status(op)
+                formatter(
+                    **{
+                        **op,
+                        "status": effective_status,
+                        "exit_code": exit_code,
+                        "timed_out": False,
+                    }
+                )
+                if effective_status != "SUCCESS":
                     exit_status = max(exit_status, 1)
+                if exit_code is not None and exit_code != 0:
+                    exit_status = max(exit_status, exit_code)
         formatter.flush()
         if not pending:
             break

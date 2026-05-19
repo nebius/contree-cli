@@ -6,10 +6,11 @@ the absolute path of the context directory. Successful layers are
 materialised as branches named ``layer:<chain-hash>`` so that
 re-running the same Dockerfile reuses prior work.
 
-Supported directives (MVP): FROM, RUN, COPY, ADD (without URL/tar),
-WORKDIR, ENV, ARG, USER. Other Dockerfile directives parse cleanly
-but are skipped with a warning (CMD, ENTRYPOINT, LABEL, EXPOSE,
-VOLUME, STOPSIGNAL, MAINTAINER, HEALTHCHECK, ONBUILD, SHELL).
+Supported directives (MVP): FROM, RUN, COPY, ADD (local files/dirs
+and http(s) URLs; no tar auto-extraction), WORKDIR, ENV, ARG, USER.
+Other Dockerfile directives parse cleanly but are skipped with a
+warning (CMD, ENTRYPOINT, LABEL, EXPOSE, VOLUME, STOPSIGNAL,
+MAINTAINER, HEALTHCHECK, ONBUILD, SHELL).
 """
 
 from __future__ import annotations

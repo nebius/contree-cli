@@ -79,6 +79,19 @@ contree session list --filter build:
 contree session show
 ```
 
+:::{note}
+`build` is **project-scoped from the user's point of view**: it does
+not bind to the agent's `-S <key>` session. Passing `-S` is harmless
+but does not move that key's image. After a successful build, attach
+the result to your normal agent session by tag:
+
+```bash
+contree build . --tag myapp:dev
+contree -S agent_verify use tag:myapp:dev
+contree -S agent_verify run -D -- myapp --version
+```
+:::
+
 ## `.dockerignore`
 
 `contree build` reads `<CONTEXT>/.dockerignore` and filters every

@@ -32,54 +32,59 @@ and ask the user.
    `core` (workflow), `command` / `command_safety`, `all_commands`,
    `all` (full manual).
 5. Agents must never run `contree auth`. If auth is missing or invalid, stop and ask the user to run `contree auth`.
-5. Choose an explicit session key before anything else and pass it on every command with `-S`, for example `agent_<task>` or `agent_<task>_<subagent>`.
-6. BEFORE choosing an image, list what is available.
+6. Choose an explicit session key before anything else and pass `-S <key>` on every **session-scoped** command, for example `agent_<task>` or `agent_<task>_<subagent>`. Session-scoped: `use`, `run`, `cd`, `env`, `ls`, `cat`, `cp`, `file`, `session ...`, `tag` (with a single TAG arg that targets the current session image). Project-scoped commands (`images`, `auth`, `op ls/show/cancel/wait` *unless* you also want the session view, `skill ...`, `agent`, `build`, `--help`) do not need `-S`.
+7. BEFORE choosing an image, list what is available.
    Projects can have thousands of images — always use `--prefix` to filter:
    `contree images --prefix python`
    `contree images --prefix compiler/ubuntu`
    Without prefix, use `-f plain` and grep: `contree -f plain images | grep tag`
    Do NOT assume `ubuntu:latest` or any other tag exists. Pick from the actual list.
-7. Bootstrap the session with:
+8. Bootstrap the session with:
    `contree -S <key> use <image-or-tag>`
    `contree -S <key> cd /root`
-8. Inspect first with read-only commands, then mutate in small rollbackable steps.
-9. After installing tools or setting up an environment, TAG the image for reuse.
-   Convention: `PURPOSE/OS:TAG` — designed for search with `--prefix`.
-   Examples:
-     `contree -S <key> tag compiler/ubuntu:gcc`      (build-essential)
-     `contree -S <key> tag compiler/ubuntu:go`       (golang)
-     `contree -S <key> tag compiler/alpine:rust`     (rustup + cargo)
-     `contree -S <key> tag python/ubuntu:3.12-ml`    (python + numpy + pandas)
-     `contree -S <key> tag node/alpine:20`           (node.js 20)
-   ALWAYS search before building a new environment:
-     `contree images --prefix compiler/`   find all compiler images
-     `contree images --prefix python/`     find python environments
-   If a matching image exists, use it instead of rebuilding:
-     `contree -S <key> use tag:compiler/ubuntu:gcc`
-10. If no suitable image exists, import from any Docker registry:
-   `contree images import ubuntu:noble`            (Docker Hub)
-   `contree images import --timeout 600 ubuntu:noble`
-   `contree images import python:3.12-slim`        (Docker Hub)
-   `contree images import golang:1.22-alpine`      (Docker Hub)
-   `contree images import ghcr.io/org/image:tag`   (GitHub Container Registry)
-   `contree images import registry.example.com/img:tag`  (private)
-   Import is async — the CLI polls until complete. Press Ctrl+C to cancel.
-   Use `--timeout <seconds>` to raise or lower the import operation timeout.
-   After import, the image is available as `tag:<name>`.
-   For private registries, use `--username` (password is prompted).
-   TIP: importing a ready-made image is faster than installing from scratch.
-   For example, `images import rust:1.79-slim` gives you a full Rust
-   toolchain in seconds, vs minutes of `curl rustup | sh`.
-11. To inspect whether saved auth profiles actually work, run:
-   `contree -f json auth ls`
-   Use `-O` / `--offline` to skip network probes.
+9. Inspect first with read-only commands, then mutate in small rollbackable steps.
+10. After installing tools or setting up an environment, TAG the image for reuse.
+    Convention: `PURPOSE/OS:TAG` — designed for search with `--prefix`.
+    Examples (use one that fits your env):
+      `contree -S <key> tag compiler/ubuntu:gcc`      (build-essential)
+      `contree -S <key> tag compiler/ubuntu:go`       (golang)
+      `contree -S <key> tag compiler/alpine:rust`     (rustup + cargo)
+      `contree -S <key> tag python/ubuntu:3.12-ml`    (python + numpy + pandas)
+      `contree -S <key> tag node/alpine:20`           (node.js 20)
+    ALWAYS search before building a new environment:
+      `contree images --prefix compiler/`   find all compiler images
+      `contree images --prefix python/`     find python environments
+    If a matching image exists, use it instead of rebuilding:
+      `contree -S <key> use <tag-from-list>`
+11. If no suitable image exists, import from any Docker registry:
+    `contree images import ubuntu:noble`            (Docker Hub)
+    `contree images import --timeout 600 ubuntu:noble`
+    `contree images import python:3.12-slim`        (Docker Hub)
+    `contree images import golang:1.22-alpine`      (Docker Hub)
+    `contree images import ghcr.io/org/image:tag`   (GitHub Container Registry)
+    `contree images import registry.example.com/img:tag`  (private)
+    Import is async — the CLI polls until complete. Press Ctrl+C to cancel.
+    Use `--timeout <seconds>` to raise or lower the import operation timeout.
+    After import, the image is available as `tag:<name>`.
+    For private registries, use `--username` (password is prompted).
+    TIP: importing a ready-made image is faster than installing from scratch.
+    For example, `images import rust:1.79-slim` gives you a full Rust
+    toolchain in seconds, vs minutes of `curl rustup | sh`.
+12. To inspect whether saved auth profiles actually work, run:
+    `contree -f json auth ls`
+    Use `-O` / `--offline` to skip network probes.
 
 ## Session bootstrap details
 
 - In normal CLI use, `contree use IMAGE` prints a `CONTREE_SESSION` export line. Humans often use:
   `eval $(contree use tag:ubuntu:latest)`
 - Agents should prefer passing `-S <key>` on every command instead of depending on exported shell state.
-- `contree use --new IMAGE` creates a fresh session key. Use it when you explicitly want new state instead of resuming an old session.
+- `contree use --new IMAGE` is for **humans**: it allocates a random
+  session key, prints the export line, and switches to it. Agents
+  should instead pick an explicit fresh key and pass it on every
+  command: `contree -S agent_<task>_<id> use <image-or-tag>`. The
+  `--new` random key cannot be predicted ahead of time and conflicts
+  with the explicit-key workflow used everywhere else in this skill.
 - `contree use` without an image is read-only and prints current session state.
 - Inside `contree shell`, no `eval` is needed because the shell manages the active session internally.
 
@@ -100,34 +105,50 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
    `contree --help`
    `contree <command> --help`
    `contree session --help`
-2. Bind the task to an image or tag:
-   `contree -S <key> use tag:ubuntu:latest`
+2. Bind the task to an image or tag (pick one that actually exists
+   in the project -- `contree images --prefix <hint>` first, do not
+   assume `ubuntu:latest`):
+   `contree -S <key> use <image-or-tag-from-list>`
 3. Set the session working directory early:
    `contree -S <key> cd /root`
 4. Inspect current state with:
    `images`, `ls`, `cat`, `ps`, `show`, `session`, `session show`
 5. Build environments in separate operations:
    install -> verify -> build -> test
-6. Tag useful results immediately:
-   `contree tag <result-uuid> <tag>`
+6. Tag useful results immediately. `tag` expects an **image**
+   reference, not an operation UUID. From an operation, extract the
+   image first:
+   ```bash
+   IMG=$(contree -f json op show <op-uuid> | jq -r .image)
+   contree -S <key> tag "$IMG" <tag>
+   ```
+   For the current session image, drop the IMAGE positional:
+   `contree -S <key> tag <tag>`.
 7. Use `session branch`, `session checkout`, and `session rollback` around risky changes.
 
 ## Non-negotiable rules
 
-- Always pass `-S/--session` on agent-driven commands. Do not rely on auto-generated sessions.
+- Always pass `-S/--session` on **session-scoped** agent commands
+  (`use`, `run`, `cd`, `env`, `ls`, `cat`, `cp`, `file ...`,
+  `session ...`, and `tag` when the implicit current-session image
+  is the target). Do not rely on auto-generated session keys.
+  Project-scoped commands (`images`, `op ls/show/cancel/wait`,
+  `auth`, `skill ...`, `agent`, `build`) do not bind to a session
+  and `-S` there is a no-op -- harmless but noisy.
 - `contree run` is remote execution. Host files are not visible unless attached with `--file` or staged with `contree file cp`.
 - Every `run` spawns a NEW isolated microVM. There is no way to exec into a running instance, attach to a process, or connect to a server started in a previous run. If you need a server response, start the server AND make the request in the same run using `-s`.
 - Keep one mutating step per `contree run`.
 - Do not chain stateful steps with `&&`, long shell expressions, or pipelines when the result should remain rollbackable.
-- ALWAYS use `-s` (shell mode) when passing shell commands as strings. Do NOT wrap in `sh -lc '...'` or `sh -c '...'` manually:
-  WRONG: `contree run -- sh -lc 'apt-get update -qq'`
-  RIGHT: `contree run -s -- apt-get update -qq`
-  The `-s` flag joins all args and passes to `sh -c` automatically.
-  Quotes are only needed for shell metacharacters like `&&`, `|`, `$`:
-    `contree run -s -- apt-get install -y curl`  (no quotes needed)
-    `contree run -s -- 'echo $HOME && ls /'`     (quotes needed for && and $)
-  Use direct mode (no `-s`) for simple executables: `contree run -- make test`
-  Unsure? Run `contree run --help` or `contree agent execution`
+- Pick the run mode by what the command needs, not by habit:
+  - **Direct mode** (no `-s`, no manual `sh`) for plain executables: `contree run -- make test`.
+  - **`-s` shell mode** when you need shell features (pipes, redirects, `&&`, `;`, `$` expansion). The flag joins args and passes them to `sh -c` for you, so do NOT wrap in `sh -c '...'` yourself:
+    PREFER:  `contree run -s -- 'echo $HOME && ls /'`
+    AVOID:   `contree run -- sh -c 'echo $HOME && ls /'`
+    Quotes are only needed around args that contain metacharacters:
+      `contree run -s -- apt-get install -y curl`  (no quotes)
+      `contree run -s -- 'echo $HOME && ls /'`     (quotes for `&&`/`$`)
+  - **`run -- sh -lc '…'`** only when a login shell is explicitly required (sourcing `/etc/profile.d`, agent-provisioned PATH, etc.). It is a niche exception, not the default.
+  Unsure? Run `contree run --help` or `contree agent execution`.
 - Prefer non-disposable runs when you want the environment to persist; use `--disposable` only for throwaway checks.
 - Prefer `--file` over `file cp` when you need files for a single run.
   `file cp` stages files in the session for ALL future runs.
@@ -159,7 +180,11 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
   Unsure about tagging? Run `contree tag --help` or `contree agent images`
 - Stay inside `contree ...` when the task specifically wants sandboxed execution rather than host-local commands.
 - If auth is missing, the CLI raises an API error that effectively means "No token configured. Run `contree auth` first." Treat that as a user action item, not something the agent should self-fix.
-- `contree auth profiles` is the default profile health check and shows `status` values `ok`, `timeout`, `error`, or `offline`.
+- `contree auth profiles` is the default profile health check. Possible
+  `status` values: `ok`, `timeout`, `error`, `offline mode`, `no url`,
+  `inactive`. `inactive` means the token is valid but lacks the required
+  sandbox permission for the configured project -- not a generic auth
+  failure. `offline mode` only appears with `-O`/`--offline`.
 - `contree auth profiles --offline` is only for explicit no-network situations.
 - For automation, prefer `contree -f json auth profiles` over table output.
 
@@ -190,12 +215,23 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
 - `session checkout`: switch active branch.
 - `session rollback`: move the active branch pointer backward.
 - `session wait`: wait for active operations, or specific operation UUIDs.
+  **Not** simply a session-scoped `op wait` -- with no UUIDs it
+  drains the local cache of detached operations spawned in *this*
+  session, advances the active branch with the result image of each
+  successful non-disposable run, and records disposable branches for
+  disposable detached runs. Use this when you want fan-out from a
+  single session to update the session's history DAG automatically.
 - `ps` / `show` / `kill`: inspect, read, or cancel operations (top-level shortcuts; multi-UUID).
 - `operation` (alias `op`): grouped namespace. Use this when monitoring background work.
   - `op ls` -- same flags as `ps`, lists operations. Pipe to `-q` for UUIDs.
   - `op show UUID1 UUID2 ...` -- fetch several operation results in one call.
   - `op wait UUID1 UUID2 ...` -- block until each reaches a terminal status,
-    print one row per completion (uuid|status|duration|timed_out).
+    print one operation record per completion. Default formatter
+    pins `uuid`, `status`, `timed_out`, `duration` first and `error`
+    last; every other scalar field the API returns is included
+    between them, so the column count is not fixed. For automation
+    use `-f json` (one object per line) or `-f tsv` and select
+    fields explicitly.
     `--all` waits for every active op; `--timeout SECONDS` (default 60)
     causes exit code 1 if not all complete in time. Pure observer:
     does NOT advance any session branch with result images. Pairs
@@ -207,19 +243,22 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
 
 ## Execution patterns
 
-Good:
+Good (pick `<base-tag>` after `contree images --prefix ubuntu` or
+similar; do not assume a specific tag exists):
 
 ```bash
-contree -S agent_build use tag:ubuntu:latest
+contree -S agent_build use <base-tag>
 contree -S agent_build cd /root
-contree -S agent_build run -s -- apt-get update -qq
-contree -S agent_build run -s -- apt-get install -y build-essential
+contree -S agent_build run -- apt-get update -qq
+contree -S agent_build run -- apt-get install -y build-essential
 contree -S agent_build run -- make -C /work build
 contree -S agent_build run -- make -C /work test
 ```
 
-Note: use `-s` for shell commands (apt-get, pip, etc.) and direct mode
-for simple executables (make, cargo, python).
+Note: pick the run mode by the command's needs, not by category.
+`apt-get install -y foo` and `pip install foo` are plain executables
+and run fine in direct mode. Reach for `-s` only when you need pipes,
+redirects, `&&`, `;`, or variable expansion.
 
 Bad — chaining multiple steps:
 
@@ -283,9 +322,14 @@ to child processes. Use `env` or `-e` to set PATH instead.
   `echo 'uname -a' | contree run /bin/sh`
 
 When to use shell mode vs direct:
-- Direct: `run -- make test` — clearer, no shell escaping issues
-- Shell: `run -s -- 'cd /app && make test'` — when you need shell features
-- Prefer `sh -lc` in direct mode for login shell: `run -- sh -lc 'command'`
+- **Direct**: `run -- make test` — clearer, no shell escaping issues.
+- **`-s`**: `run -s -- 'echo $HOME && ls /'` — when you need pipes,
+  redirects, `&&`, `;`, or variable expansion. Do not wrap manually
+  in `sh -c '...'`; `-s` already does that. For working directory
+  use `-C /path` or `contree cd /path` (NOT `cd` inside `-s`).
+- **`run -- sh -lc '…'`**: only when a login shell is explicitly
+  required (e.g. you depend on `/etc/profile.d/*.sh` setting PATH).
+  Prefer `cd` + `-C` + explicit `env`/`-e` over login-shell magic.
 
 ## Interactive shell behavior
 
@@ -304,7 +348,11 @@ This means shell transcripts are convenient, but agent instructions should still
 - Inline injection: `contree run --file ./app.py:/app/app.py -- python /app/app.py`
 - Stage for next run: `contree file cp ./config.yaml /etc/app/config.yaml`
 - Edit an existing remote file: `contree file edit /etc/app/config.ini`
-- Pending files are merged automatically into the next non-disposable `run`.
+- Pending files are merged into the next `run` -- including
+  `--disposable` runs. A disposable run sees the files in its
+  sandbox but does not bake them into the active branch. The
+  pending queue is only cleared after a successful non-disposable
+  run baking them into the next image.
 - Explicit `--file` mappings win over pending files on the same destination path.
 - Directory attachments recurse and exclude common junk by default: `.*`, `.git`, `*.pyc`, `__pycache__`, `.venv`, `.mypy_cache`, `.pytest_cache`, `node_modules`, `dist`, `build`.
 - Add more directory exclusion patterns with `--file-excludes`.
@@ -340,8 +388,12 @@ monitoring is then a polling problem rather than a blocking one.
 
 Monitoring background operations:
 
-- `contree ps` -- active operations (PENDING, ASSIGNED, EXECUTING).
-- `contree ps -a` -- include completed/failed/cancelled.
+- `contree ps` -- **EXECUTING operations only** (the default). Note
+  this does **not** include `PENDING` or `ASSIGNED`; for a full
+  active snapshot use `contree -f json ps -a` and filter client-side,
+  or one of `--status PENDING` / `--status ASSIGNED`.
+- `contree ps -a` -- include every status (completed, failed, cancelled).
+- `contree ps --status FAILED` -- filter to a single status.
 - `contree ps -q` -- UUIDs only, pipe-friendly.
 - `contree op ls` -- alias for `ps`, identical flags.
 - `contree show UUID` -- single-operation detail (status, duration,
@@ -349,9 +401,13 @@ Monitoring background operations:
 - `contree op show UUID1 UUID2 UUID3` -- fetch several operations in
   one shot. Convenient when fanning out runs and checking the batch.
 - `contree op wait UUID1 UUID2 ...` -- block until each of these ops
-  reaches a terminal status; print one row per completion
-  (uuid|status|duration|timed_out). Exit code 1 if any finished
-  non-SUCCESS, or if `--timeout` (default 60s) elapsed first.
+  reaches a terminal status; print one operation record per
+  completion. The default formatter shows `uuid`, `status`,
+  `timed_out`, `duration` first, every other scalar API field after
+  that, and `error` last -- so do not parse by fixed column count.
+  For automation use `-f json` (line-delimited objects) or `-f tsv`.
+  Exit code 1 if any finished non-SUCCESS, or if `--timeout`
+  (default 60s) elapsed first.
 - `contree op wait --all` -- block until every active op completes.
   **Warning:** `--all` is project-wide. If another agent (or another
   shell in the same project) launched operations in parallel, you will
@@ -359,8 +415,26 @@ Monitoring background operations:
   you did not start. When several agents share a project, prefer the
   explicit `op wait UUID1 UUID2 ...` form with the UUIDs you actually
   spawned. Not catastrophic, just surprising; expect it.
-- `contree session wait` -- session-scoped variant; waits for active
-  ops of the current session.
+- `contree session wait` -- session-owned drain. Without arguments
+  waits for every detached op spawned in *this* session (from the
+  local cache); with UUIDs waits for those specific ops. Differs
+  from `op wait` in three ways:
+  1. **Scope**: limited to the active session's detached cache (not
+     project-wide).
+  2. **Side effects**: on success it advances the active branch to
+     the result image of each non-disposable detached run, and
+     records `disposable-<uuid>` branches for disposable ones.
+  3. **Exit semantics**: like `op wait`, promotes SUCCESS+nonzero
+     exit_code to FAILED. Propagates the actual sandbox exit code
+     so `session wait && next-step` behaves correctly.
+
+  When to use which:
+  - `op wait UUID...` -- you have UUIDs from any source (different
+    sessions, different agents) and just want to know when they're
+    done. Pure observer; does not mutate session history.
+  - `session wait` -- you spawned several detached runs in this
+    session and want session history to update to the chosen result
+    image. Use after `run -d` (non-disposable).
 
 Cancelling:
 
@@ -378,7 +452,10 @@ important consequences for whether fan-out is disposable or not.
 
 PREFERRED: fan-out + wait with `--disposable`. The result images of
 each leg are discarded, you only care about exit codes / stdout, and
-the session stays clean.
+**the active branch is not advanced**. The session history DAG still
+records a `run-disposable` entry and a `disposable-<op-uuid>` branch
+per spawn -- this is cosmetic, but if you fan out a lot you can prune
+them with `contree -S <key> session branch --prune`.
 
 **Capture UUIDs with `-f json`** — the default `run -d` formatter is
 table/plain, not JSON, so `jq -r .uuid` against the default output
@@ -425,8 +502,9 @@ contree op wait --all
 # Bound the wait (default is 60s); fail fast if jobs take too long.
 contree op wait --timeout 300 "$A" "$B" "$C"
 
-# Snapshot what is running right now.
-contree -f json op ls | jq '.uuid'
+# Snapshot what is running right now. `op ls` default is EXECUTING
+# only; pass `-a` to see every status, or add `--status PENDING` etc.
+contree -f json op ls -a | jq -r 'select(.status == "PENDING" or .status == "ASSIGNED" or .status == "EXECUTING") | .uuid'
 
 # Find recent failures across the project. `--status` is the correct
 # filter; `-S` at this position is the global session flag, not a
@@ -452,25 +530,31 @@ or a top-level agent policy.
 
 ### Wiring a subagent for contree
 
-Subagents do NOT inherit skills automatically. You MUST either:
+The exact wiring mechanism depends on the host:
 
-1. Preload the skill in subagent frontmatter:
-   ```yaml
-   ---
-   name: build-agent
-   tools: Bash, Read, Grep
-   skills:
-     - contree
-   ---
-   ```
+**Codex** (`spawn_agent` API): there are no frontmatter files in the
+prompt to edit. Restate the critical ConTree rules directly inside
+the spawned agent's prompt:
+- Always use a unique `-S <subagent_key>` on every session-scoped
+  command.
+- Bash (or whatever command-execution tool the host exposes) must be
+  in the spawn's allowed tools.
+- Reference `contree agent` for the full built-in manual.
 
-2. Or restate the critical rules directly in the subagent prompt:
-   - Always use `-S <key>` on every command
-   - Use `contree agent` for the full built-in manual
-   - Bash must be in the subagent's allowed tools
+**Claude-style hosts** (subagent frontmatter files): preload the
+skill explicitly or restate the rules in the prompt.
 
-The subagent's `allowed-tools` MUST include `Bash` — without it,
-contree cannot execute.
+```yaml
+---
+name: build-agent
+tools: Bash, Read, Grep
+skills:
+  - contree
+---
+```
+
+In every host, the subagent's command-execution tool MUST be allowed
+— without it, `contree` cannot run.
 
 ### Session isolation (mandatory)
 
@@ -491,34 +575,52 @@ experiments), launch one subagent per concern with isolated sessions:
    Do NOT assume any tag exists. Pick from the actual list.
 3. **Use `--file` to inject local source** into the sandbox:
    `contree -S agent_task_go run --file ./src:/work/src -- go build /work/src/...`
-4. **Use `contree cp` to retrieve outputs** back to the host:
-   `contree -S agent_task_go cp /work/output ./results/go/`
+4. **Retrieve outputs back to the host.** `contree cp` is a
+   **single-file** download (no directories). For multi-file
+   outputs, archive in the sandbox first, then copy the archive:
+   ```bash
+   contree -S agent_task_go run -C /work -s -- 'tar -cf /tmp/out.tar output/'
+   contree -S agent_task_go cp /tmp/out.tar ./results/go.tar
+   ```
+   For a single binary, `cp` directly works:
+   `contree -S agent_task_go cp /work/main ./results/go/main`.
 5. **Verify after every run** — check with `contree ls` or content inspection
    that the expected output actually exists before proceeding.
 6. **Save deterministic output paths** so the parent agent can collect results.
 
-Example — build & test in three languages simultaneously:
+Example — build & test in three languages simultaneously. The
+`tag:compiler/ubuntu:*` references below are illustrative; in a real
+project list with `contree images --prefix compiler/` first and pick
+an actual tag, or `contree images import golang:1.22-alpine` etc.
+
+
 
 ```bash
-# Subagent 1 (Go):
+# Subagent 1 (Go) -- single binary, cp the file directly:
 contree -S agent_task_go use tag:compiler/ubuntu:go
 contree -S agent_task_go cd /work
-contree -S agent_task_go run --file ./project:/work/project -- go build ./project/...
+contree -S agent_task_go run --file ./project:/work/project -- \
+  go build -o /work/bin/app ./project/...
 contree -S agent_task_go run -- go test ./project/...
-contree -S agent_task_go cp /work/project/output ./results/go/
+contree -S agent_task_go cp /work/bin/app ./results/go/app
 
-# Subagent 2 (Rust):
+# Subagent 2 (Rust) -- target/ is a directory, archive then cp:
 contree -S agent_task_rust use tag:compiler/ubuntu:rust
 contree -S agent_task_rust cd /work
-contree -S agent_task_rust run --file ./project:/work/project -- cargo build --manifest-path /work/project/Cargo.toml
-contree -S agent_task_rust run -- cargo test --manifest-path /work/project/Cargo.toml
-contree -S agent_task_rust cp /work/project/target ./results/rust/
+contree -S agent_task_rust run --file ./project:/work/project -- \
+  cargo build --manifest-path /work/project/Cargo.toml
+contree -S agent_task_rust run -- \
+  cargo test --manifest-path /work/project/Cargo.toml
+contree -S agent_task_rust run -s -- \
+  'tar -cf /tmp/target.tar -C /work/project target/'
+contree -S agent_task_rust cp /tmp/target.tar ./results/rust/target.tar
 
-# Subagent 3 (Nim):
+# Subagent 3 (Nim) -- single binary:
 contree -S agent_task_nim use tag:compiler/ubuntu:nim
 contree -S agent_task_nim cd /work
-contree -S agent_task_nim run --file ./project:/work/project -- nim compile /work/project/main.nim
-contree -S agent_task_nim cp /work/project/main ./results/nim/
+contree -S agent_task_nim run --file ./project:/work/project -- \
+  nim compile /work/project/main.nim
+contree -S agent_task_nim cp /work/project/main ./results/nim/main
 ```
 
 Each subagent works in complete isolation. The parent agent collects
@@ -538,10 +640,12 @@ contree build . --no-cache
 
 - Cache is keyed by `abspath(CONTEXT)`. Same context + same Dockerfile
   + same build args = full layer cache hit on re-runs.
-- Supported directives: `FROM`, `RUN`, `COPY`, `ADD` (local paths
-  only), `WORKDIR`, `ENV`, `ARG`, `USER`. `CMD`/`ENTRYPOINT`/`LABEL`
-  /`EXPOSE`/`VOLUME`/`STOPSIGNAL`/`MAINTAINER`/`HEALTHCHECK`/`ONBUILD`
-  /`SHELL` are parsed but skipped with a warning.
+- Supported directives: `FROM`, `RUN`, `COPY`, `ADD` (local files,
+  directories, **and** `http://` / `https://` URLs; tar
+  auto-extraction is not implemented), `WORKDIR`, `ENV`, `ARG`,
+  `USER`. `CMD`/`ENTRYPOINT`/`LABEL`/`EXPOSE`/`VOLUME`/`STOPSIGNAL`
+  /`MAINTAINER`/`HEALTHCHECK`/`ONBUILD`/`SHELL` are parsed but
+  skipped with a warning.
 - Multi-stage (`FROM ... AS x`, `COPY --from=x`) is not yet supported;
   use a single linear pipeline for now.
 - `<CONTEXT>/.dockerignore` filters `COPY`/`ADD` walks. Globs `*` /
@@ -549,7 +653,16 @@ contree build . --no-cache
   everything below it; lines starting with `!` re-include.
 - Tag the resulting image with `--tag NAME[:TAG]` to make it
   reusable.
-
+- **`build` runs in its own session**, keyed by `abspath(CONTEXT)`
+  (visible in the success output as `"session": "build:<hash>"`).
+  Passing `-S <your-agent-key>` to `build` is harmless but does not
+  bind it to that key. To use the resulting image, verify it from a
+  normal agent session:
+  ```bash
+  contree build . --tag myapp:dev
+  contree -S agent_verify use tag:myapp:dev
+  contree -S agent_verify run -D -- myapp --version
+  ```
 Use `contree build --help` for the full flag list.
 
 ## Built-in manual

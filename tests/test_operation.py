@@ -392,6 +392,44 @@ class TestOperationWait:
         assert data["status"] == "FAILED"
         assert data["timed_out"] is False
 
+    def test_wait_success_with_nonzero_exit_code_is_failed(
+        self, contree_client, monkeypatch, capsys
+    ):
+        """Operation status SUCCESS + process exit_code != 0 must surface
+        as FAILED, so `op wait` is safe to use as a test gate. Matches
+        `session wait` and `op show` semantics."""
+        monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
+        op = _wait_op("op-false", status="SUCCESS")
+        op["metadata"] = {"result": {"state": {"exit_code": 1}}}
+        contree_client.respond_json(op)
+
+        FORMATTER.set(JSONFormatter())
+        CLIENT.set(contree_client)
+        ctx = copy_context()
+        rc = ctx.run(cmd_wait, WaitArgs(uuids=["op-false"], timeout=60))
+        assert rc == 1
+        import json as _json
+
+        data = _json.loads(capsys.readouterr().out)
+        assert data["status"] == "FAILED"
+        assert data["exit_code"] == 1
+        assert data["timed_out"] is False
+
+    def test_wait_propagates_specific_exit_code(self, contree_client, monkeypatch):
+        """Like `session wait`, propagate the actual process exit code so
+        `op wait foo && next-step` composes correctly with the underlying
+        sandbox command's status."""
+        monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
+        op = _wait_op("op-42", status="SUCCESS")
+        op["metadata"] = {"result": {"state": {"exit_code": 42}}}
+        contree_client.respond_json(op)
+
+        FORMATTER.set(JSONFormatter())
+        CLIENT.set(contree_client)
+        ctx = copy_context()
+        rc = ctx.run(cmd_wait, WaitArgs(uuids=["op-42"], timeout=60))
+        assert rc == 42
+
     def test_wait_emits_timed_out_column(
         self, contree_client, monkeypatch, capsys, caplog
     ):

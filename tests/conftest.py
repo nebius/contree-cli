@@ -1,20 +1,34 @@
 from __future__ import annotations
 
+import atexit
 import http.client
 import json
 import os
+import shutil
+import tempfile
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 
-import pytest
+# Redirect CONTREE_HOME to a throwaway directory BEFORE importing
+# contree_cli.config (which reads the variable at import time). Without
+# this, tests would write SQLite databases under the user's real
+# ~/.config/contree -- which also breaks inside sandboxes that block
+# writes to $HOME.
+CONTREE_HOME_TMP = Path(tempfile.mkdtemp(prefix="contree-pytest-"))
+os.environ["CONTREE_HOME"] = str(CONTREE_HOME_TMP)
+atexit.register(shutil.rmtree, CONTREE_HOME_TMP, ignore_errors=True)
 
-import contree_cli.arguments  # noqa: F401  populates COMMAND_REGISTRY
-import contree_cli.config as config_mod
-from contree_cli import CLIENT, PROFILE
-from contree_cli.client import ContreeClient, ContreeIAMClient
-from contree_cli.config import ConfigProfile
-from contree_cli.session import ImageCache, SessionStore
+# The CONTREE_HOME override above MUST run before any contree_cli import
+# touches contree_cli.config, hence the deferred import block below.
+import pytest  # noqa: E402
+
+import contree_cli.arguments  # noqa: E402, F401  populates COMMAND_REGISTRY
+import contree_cli.config as config_mod  # noqa: E402
+from contree_cli import CLIENT, PROFILE  # noqa: E402
+from contree_cli.client import ContreeClient, ContreeIAMClient  # noqa: E402
+from contree_cli.config import ConfigProfile  # noqa: E402
+from contree_cli.session import ImageCache, SessionStore  # noqa: E402
 
 for var in (
     "CONTREE_TOKEN",
@@ -30,7 +44,7 @@ for var in (
 
 
 @pytest.fixture(autouse=True)
-def _sequential_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
+def sequential_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force PaginatedFetcher to use concurrency=1 in tests.
 
     The mock client's response queue is FIFO and not thread-safe;
