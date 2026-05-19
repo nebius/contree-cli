@@ -198,6 +198,15 @@ Operations
   contree op wait --all      wait for every active operation
   contree op wait --timeout SECONDS   bound the wait (default 60s)
 
+Every positional shown as UUID_OR_REF in --help (op show, op cancel,
+op wait, top-level show/kill, session wait) also accepts session-
+history references against the active session:
+  HEAD / @ / :          latest op on the active branch tip
+  HEAD~N / @-N          N steps back from the tip
+  HEAD~                 shorthand for HEAD~1
+  @+N                   N steps forward (latest child)
+  @N / :N / bare N      absolute history id
+
 More: contree ps --help, contree op wait --help
 
 Profiles

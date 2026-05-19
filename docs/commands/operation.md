@@ -82,10 +82,20 @@ otherwise push the rest of the row out of alignment.
 ## `op show` -- multiple UUIDs
 
 Each UUID is fetched and rendered through the same code path as
-`contree show`, so cached terminal results and `@N` history references
-work uniformly. On API errors (e.g. 404 for an unknown UUID), the
-command logs the failure and continues with the remaining UUIDs, exiting
-with status `1` at the end.
+`contree show`, so cached terminal results and history references work
+uniformly. Accepted reference forms (mirroring `session rollback`
+syntax with a git-style alias):
+
+- `@`, `:`, or `HEAD` -- the operation at the active branch tip.
+- `@N` (or `:N`, bare `N`) -- absolute history id.
+- `@-N`, `:-N`, or `HEAD~N` -- walk N steps back from the tip.
+- `HEAD~` -- shorthand for `HEAD~1`.
+- `@+N` (or `:+N`) -- walk N steps forward from the tip, picking the
+  latest child at each branch point.
+
+On API errors (e.g. 404 for an unknown UUID), the command logs the
+failure and continues with the remaining UUIDs, exiting with status
+`1` at the end.
 
 ```{terminal-shell} contree op show --help
 ```
@@ -108,10 +118,15 @@ pinned to the last column).
 `--timeout SECONDS` (default `60`) caps the wait — when the deadline
 hits, the command emits one extra row per unfinished operation with
 `timed_out=true` and the operation's last observed status (e.g.
-`EXECUTING`), then exits with status `1`. Any operation that finished
-non-`SUCCESS` also forces exit code `1`; a `run` that the API marks
-`SUCCESS` with a non-zero `exit_code` is promoted to `FAILED` and
-propagates that exit code.
+`EXECUTING`), then exits with status `1`.
+
+`status` is the server's word: it reflects orchestration (did the
+API run the job?), not what the sandbox process did with its exit
+code. The exit code is a separate column. The CLI's own exit status
+is `1` whenever any operation finished non-`SUCCESS`, or the actual
+`exit_code` when a `SUCCESS` op exited non-zero — so
+`op wait UUID && next-step` composes correctly with sandbox commands
+like `run -- false`.
 
 :::{important}
 `op wait` is a **pure observer**: it polls operation status and

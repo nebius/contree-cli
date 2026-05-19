@@ -20,12 +20,16 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
-from uuid import UUID
 
 from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
 from contree_cli.cli.show import ShowArgs, cmd_show
 from contree_cli.client import ApiError, ContreeClient, PaginatedFetcher
 from contree_cli.output import OutputFormatter
+from contree_cli.refs import (
+    history_spec_from_ref,
+    looks_like_history_ref,
+    resolve_operation_uuids,
+)
 from contree_cli.session import CONTREE_CONCURRENCY
 from contree_cli.types import (
     FLAGS,
@@ -34,57 +38,19 @@ from contree_cli.types import (
     positive_int,
 )
 
+# Re-exported for backwards compatibility with code/tests that historically
+# pulled these helpers from `contree_cli.cli.operation`.
+__all__ = [
+    "history_spec_from_ref",
+    "looks_like_history_ref",
+    "resolve_operation_uuids",
+]
+
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 1000
 # Hard cap on pages fetched when --show-max is omitted (1M operations).
 UNLIMITED_PAGE_CAP = 1000
-
-
-def looks_like_history_ref(value: str) -> bool:
-    """True for ``@N``, ``:N`` or bare ``N`` session-history references."""
-    stripped = value[1:] if value.startswith(("@", ":")) else value
-    return bool(stripped) and stripped.isdigit()
-
-
-def split_uuid_args(
-    items: list[str],
-    *,
-    allow_history_ref: bool = False,
-) -> list[str]:
-    """Flatten positional UUID arguments on whitespace and validate each.
-
-    Agents and users sometimes pass several UUIDs as one quoted string
-    (e.g. ``op wait "$UUIDS"`` where ``$UUIDS`` is a multi-line value
-    in fish or careless bash), which gives argparse a single positional
-    with embedded spaces or newlines. Each item is split into tokens
-    and parsed via :class:`uuid.UUID`. Tokens that fail to parse — and
-    are not ``@N``/``:N``/``N`` session-history references when those
-    are allowed — raise :class:`ValueError` listing every bad token.
-    """
-    out: list[str] = []
-    invalid: list[str] = []
-    for item in items:
-        for token in item.split():
-            if not token:
-                continue
-            try:
-                UUID(token)
-            except ValueError:
-                if allow_history_ref and looks_like_history_ref(token):
-                    out.append(token)
-                else:
-                    invalid.append(token)
-                continue
-            out.append(token)
-    if invalid:
-        raise ValueError(
-            "Invalid operation UUID"
-            + ("s" if len(invalid) > 1 else "")
-            + ": "
-            + " ".join(repr(u) for u in invalid),
-        )
-    return out
 
 
 ACTIVE_STATUSES = frozenset({"PENDING", "ASSIGNED", "EXECUTING"})
@@ -133,10 +99,14 @@ class ListArgs(ArgumentsProtocol):
 @dataclass(frozen=True)
 class ShowMultiArgs(ArgumentsProtocol):
     uuids: list[str] = field(default_factory=list)
+    raw: bool = False
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> ShowMultiArgs:
-        return cls(uuids=split_uuid_args(list(ns.uuids), allow_history_ref=True))
+        return cls(
+            uuids=resolve_operation_uuids(list(ns.uuids)),
+            raw=getattr(ns, "raw", False),
+        )
 
 
 @dataclass(frozen=True)
@@ -146,7 +116,7 @@ class CancelArgs(ArgumentsProtocol):
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> CancelArgs:
-        return cls(uuids=split_uuid_args(list(ns.uuids or [])), all=ns.all)
+        return cls(uuids=resolve_operation_uuids(list(ns.uuids or [])), all=ns.all)
 
 
 @dataclass(frozen=True)
@@ -158,7 +128,7 @@ class WaitArgs(ArgumentsProtocol):
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> WaitArgs:
         return cls(
-            uuids=split_uuid_args(list(ns.uuids or [])),
+            uuids=resolve_operation_uuids(list(ns.uuids or [])),
             all=ns.all,
             timeout=ns.timeout,
         )
@@ -169,8 +139,11 @@ def setup_cancel_parser(p: argparse.ArgumentParser) -> SetupResult:
     p.add_argument(
         "uuids",
         nargs="*",
-        metavar="UUID",
-        help="Operation UUIDs to cancel",
+        metavar="UUID_OR_REF",
+        help=(
+            "Operations to cancel. Accepts UUIDs and session-history "
+            "references (HEAD, HEAD~N, @, @N, @-N, @+N, :N, bare N)."
+        ),
     )
     p.add_argument(
         *FLAGS["all"],
@@ -185,8 +158,24 @@ def setup_show_parser(p: argparse.ArgumentParser) -> SetupResult:
     p.add_argument(
         "uuids",
         nargs="+",
-        metavar="UUID",
-        help="One or more operation UUIDs (or @N history references)",
+        metavar="UUID_OR_REF",
+        help=(
+            "Operations to inspect. Accepts UUIDs and session-history "
+            "references: @ or HEAD for the active branch tip, @N for "
+            "an absolute history id, @-N or HEAD~N for N steps back, "
+            "@+N for N steps forward."
+        ),
+    )
+    p.add_argument(
+        *FLAGS["raw"],
+        action="store_true",
+        help=(
+            "Print each operation's full server payload as JSONL "
+            "(one JSON object per line) to stdout, verbatim. Skips "
+            "formatter routing and derived columns; streams cleanly "
+            "into `jq -c`. Useful for debugging or for fields the "
+            "table view omits."
+        ),
     )
     return cmd_show_multi, ShowMultiArgs
 
@@ -196,8 +185,11 @@ def setup_wait_parser(p: argparse.ArgumentParser) -> SetupResult:
     p.add_argument(
         "uuids",
         nargs="*",
-        metavar="UUID",
-        help="Operation UUIDs to wait for",
+        metavar="UUID_OR_REF",
+        help=(
+            "Operations to wait for. Accepts UUIDs and session-history "
+            "references (HEAD, HEAD~N, @, @N, @-N, @+N, :N, bare N)."
+        ),
     )
     p.add_argument(
         *FLAGS["all"],
@@ -335,14 +327,14 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
 CANCEL_ACTIVE_PAGE_SIZE = 100
 
 
-def effective_terminal_status(op: dict[str, Any]) -> tuple[str, int | None]:
-    """Return (status, exit_code) with SUCCESS+nonzero-exit promoted to FAILED.
+def extract_exit_code(op: dict[str, Any]) -> int | None:
+    """Pull the sandbox-process exit code out of an operation payload.
 
-    Instance operations can complete with API status ``SUCCESS`` while the
-    sandbox process returned a non-zero exit code (e.g. ``run -- false``).
-    This mirrors the effective-status logic used by :func:`show.cmd_show`
-    and :func:`session.cmd_wait` so callers that use ``op wait`` as a test
-    gate see the underlying failure.
+    Operation ``status`` reflects orchestration -- whether the API ran the
+    job to completion -- and is left as-is. The sandbox process's own
+    exit code lives in ``metadata.result.state.exit_code`` (newer API
+    shape) or ``result.exit_code`` (older shape); this helper returns
+    whichever is present, or ``None`` if neither.
     """
     metadata = op.get("metadata") or {}
     instance_result = metadata.get("result") if isinstance(metadata, dict) else None
@@ -352,13 +344,9 @@ def effective_terminal_status(op: dict[str, Any]) -> tuple[str, int | None]:
         result = op.get("result")
         raw = result.get("exit_code") if isinstance(result, dict) else None
     try:
-        exit_code: int | None = int(raw) if raw is not None else None
+        return int(raw) if raw is not None else None
     except (TypeError, ValueError):
-        exit_code = None
-    status = op.get("status", "")
-    if status == "SUCCESS" and exit_code not in (None, 0):
-        status = "FAILED"
-    return status, exit_code
+        return None
 
 
 def list_active(client: ContreeClient) -> list[str]:
@@ -451,7 +439,7 @@ def cmd_show_multi(args: ShowMultiArgs) -> int | None:
     exit_code = 0
     for uuid in args.uuids:
         try:
-            result = cmd_show(ShowArgs(uuid=uuid))
+            result = cmd_show(ShowArgs(uuid=uuid, raw=args.raw))
         except ApiError as exc:
             logger.error("Failed to fetch %s: %s", uuid, exc)
             exit_code = max(exit_code, 1)
@@ -523,16 +511,21 @@ def cmd_wait(args: WaitArgs) -> int | None:
             op = json.loads(resp.read())
             if op.get("status") in TERMINAL_STATUSES:
                 pending.discard(uuid)
-                effective_status, exit_code = effective_terminal_status(op)
+                exit_code = extract_exit_code(op)
                 formatter(
                     **{
                         **op,
-                        "status": effective_status,
                         "exit_code": exit_code,
                         "timed_out": False,
                     }
                 )
-                if effective_status != "SUCCESS":
+                # The operation status reflects orchestration (did the job
+                # run?), not what the sandbox process did with its exit
+                # code. Both feed the CLI's own exit status independently:
+                # non-SUCCESS ops fail the wait; SUCCESS ops with non-zero
+                # exit codes propagate that code so `op wait && next` does
+                # the right thing.
+                if op.get("status") != "SUCCESS":
                     exit_status = max(exit_status, 1)
                 if exit_code is not None and exit_code != 0:
                     exit_status = max(exit_status, exit_code)

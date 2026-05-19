@@ -578,6 +578,84 @@ class SessionStore:
             raise ValueError("Rollback steps must be >= 1")
         return self.navigate(-n)
 
+    def tip_history_id(self) -> int:
+        cur = self._conn.execute(
+            """
+            SELECT b.history_id
+            FROM session_state s
+            JOIN session_branches b
+                ON b.session_key = s.session_key
+               AND b.branch_name = s.active_branch
+            WHERE s.session_key = ?
+            """,
+            (self._session_key,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError("No active session")
+        return int(row["history_id"])
+
+    def resolve_history_spec(self, spec: str) -> HistoryEntry:
+        """Resolve a non-mutating history reference.
+
+        Accepted forms (mirrors ``session rollback`` semantics):
+
+        - ``""`` (empty)     -- the active branch tip (current entry).
+        - ``"N"`` (positive) -- absolute history id.
+        - ``"-N"``           -- walk N steps back from the active branch tip.
+        - ``"+N"``           -- walk N steps forward from the tip, picking the
+          latest child at each branch point.
+
+        ``"0"`` is rejected because it is ambiguous (matches both
+        "absolute 0" and "no movement"). Raises :class:`ValueError` if
+        the spec is malformed, the resulting entry does not exist in
+        this session, or the requested walk exceeds the available
+        ancestors/children.
+        """
+        if spec == "":
+            tip_id = self.tip_history_id()
+            return self._get_history_entry(tip_id)
+
+        if spec[:1] in ("+", "-"):
+            sign = spec[0]
+            digits = spec[1:]
+        else:
+            sign = ""
+            digits = spec
+        if not digits.isdigit():
+            raise ValueError(f"Invalid history reference: {spec!r}")
+        n = int(digits)
+        if n == 0:
+            raise ValueError("History reference must be a non-zero number")
+
+        if sign == "":
+            return self._get_history_entry(n)
+
+        current_id = self.tip_history_id()
+
+        if sign == "-":
+            for i in range(n):
+                entry = self._get_history_entry(current_id)
+                if entry.parent_id is None:
+                    raise ValueError(
+                        f"Cannot go back {n} steps: only {i} ancestors available"
+                    )
+                current_id = entry.parent_id
+        else:
+            for i in range(n):
+                child = self._conn.execute(
+                    "SELECT id FROM session_history "
+                    "WHERE parent_id = ? AND session_key = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (current_id, self._session_key),
+                ).fetchone()
+                if child is None:
+                    raise ValueError(
+                        f"Cannot go forward {n} steps: only {i} children available"
+                    )
+                current_id = child["id"]
+        return self._get_history_entry(current_id)
+
     def create_branch(
         self,
         name: str,

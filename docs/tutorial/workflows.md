@@ -280,9 +280,12 @@ one detached and join them with `contree op wait` (alias `contree
 operation wait`). The wait command polls the API and prints one row
 per operation as soon as it reaches a terminal status, with columns
 `uuid`, `status`, `exit_code`, `timed_out`, `duration`, and any other
-scalar field the API returns. A `run` that the API marks `SUCCESS`
-with a non-zero `exit_code` is promoted to `FAILED` here and bumps the
-process exit status accordingly.
+scalar field the API returns. The `status` column is the server's
+verdict (did the API run the job?) and is reported verbatim; the
+sandbox process's own exit code is in the separate `exit_code` column.
+The CLI exit status is `1` when any op finished non-`SUCCESS`, or the
+actual `exit_code` when a `SUCCESS` op exited non-zero, so the wait
+still composes naturally with `&&`.
 
 :::{important}
 `op wait` is a **pure observer** — it polls completion status but

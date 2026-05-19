@@ -236,6 +236,29 @@ class TestOperationShow:
         assert contree_client.request_count == 1
         assert contree_client.get_request(0).path == "/v1/operations/op-from-history"
 
+    def test_show_raw_multi_uuid_emits_jsonl(
+        self, contree_client, session_store, capsys
+    ):
+        # Multi-UUID `op show --raw` should produce one JSON line per
+        # operation so the output streams cleanly into `jq -c`.
+        import json as _json
+
+        ops = [make_op("op-a"), make_op("op-b"), make_op("op-c")]
+        for op in ops:
+            contree_client.respond_json(op)
+        FORMATTER.set(JSONFormatter())
+        SESSION_STORE.set(session_store)
+        ctx = copy_context()
+        rc = ctx.run(
+            cmd_show_multi,
+            ShowMultiArgs(uuids=[op["uuid"] for op in ops], raw=True),
+        )
+        assert rc is None
+        lines = capsys.readouterr().out.strip().splitlines()
+        assert len(lines) == 3
+        parsed = [_json.loads(line) for line in lines]
+        assert [p["uuid"] for p in parsed] == ["op-a", "op-b", "op-c"]
+
 
 # ----------------------------------------------------------------------
 # op cancel
@@ -392,12 +415,13 @@ class TestOperationWait:
         assert data["status"] == "FAILED"
         assert data["timed_out"] is False
 
-    def test_wait_success_with_nonzero_exit_code_is_failed(
+    def test_wait_success_with_nonzero_exit_code_preserves_status(
         self, contree_client, monkeypatch, capsys
     ):
-        """Operation status SUCCESS + process exit_code != 0 must surface
-        as FAILED, so `op wait` is safe to use as a test gate. Matches
-        `session wait` and `op show` semantics."""
+        """Operation status is the server's word; it is NOT promoted to
+        FAILED when the sandbox process exited non-zero. The exit_code
+        is shown separately and propagated to the CLI's exit code so
+        `op wait && next-step` still composes correctly."""
         monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
         op = _wait_op("op-false", status="SUCCESS")
         op["metadata"] = {"result": {"state": {"exit_code": 1}}}
@@ -411,7 +435,7 @@ class TestOperationWait:
         import json as _json
 
         data = _json.loads(capsys.readouterr().out)
-        assert data["status"] == "FAILED"
+        assert data["status"] == "SUCCESS"
         assert data["exit_code"] == 1
         assert data["timed_out"] is False
 
@@ -483,7 +507,10 @@ class TestOperationWait:
 
 
 # ----------------------------------------------------------------------
-# split_uuid_args -- normalise whitespace-joined positional UUIDs
+# argparse + from_args integration -- the parsing/resolution itself is
+# tested exhaustively in tests/test_refs.py; here we just verify each
+# subcommand's argparse Namespace flows through resolve_operation_uuids() so it
+# accepts whitespace-joined UUID strings (a common agent quoting bug).
 # ----------------------------------------------------------------------
 
 
@@ -492,92 +519,37 @@ UUID_B = "019e3fb6-e447-760d-b7ab-62ef51f91b1f"
 UUID_C = "019e3fb6-e5c3-7184-96f1-f7d56453a193"
 
 
-class TestSplitUUIDArgs:
-    def test_already_split_passes_through(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        assert split_uuid_args([UUID_A, UUID_B]) == [UUID_A, UUID_B]
-
-    def test_space_joined_single_arg_is_split(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        joined = f"{UUID_A} {UUID_B} {UUID_C}"
-        assert split_uuid_args([joined]) == [UUID_A, UUID_B, UUID_C]
-
-    def test_newline_joined_is_split(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        joined = f"{UUID_A}\n      {UUID_B}\n      {UUID_C}"
-        assert split_uuid_args([joined]) == [UUID_A, UUID_B, UUID_C]
-
-    def test_mixed_args_and_joined(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        assert split_uuid_args([f"{UUID_A} {UUID_B}", UUID_C, f"\t{UUID_A}"]) == [
-            UUID_A,
-            UUID_B,
-            UUID_C,
-            UUID_A,
-        ]
-
-    def test_empty_list(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        assert split_uuid_args([]) == []
-
-    def test_invalid_uuid_raises_value_error(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        with pytest.raises(ValueError, match="Invalid operation UUID"):
-            split_uuid_args(["not-a-uuid"])
-
-    def test_invalid_lists_every_bad_token(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        with pytest.raises(ValueError) as exc:
-            split_uuid_args([f"{UUID_A} bogus garbage {UUID_B}"])
-        msg = str(exc.value)
-        assert "bogus" in msg
-        assert "garbage" in msg
-
-    def test_history_ref_allowed_when_requested(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        assert split_uuid_args(["@5 :12 7"], allow_history_ref=True) == [
-            "@5",
-            ":12",
-            "7",
-        ]
-
-    def test_history_ref_rejected_by_default(self):
-        from contree_cli.cli.operation import split_uuid_args
-
-        with pytest.raises(ValueError):
-            split_uuid_args(["@5"])
-
-
-class TestWaitArgsSplits:
-    def test_argparse_wait_one_quoted_string_of_uuids(self):
+class TestArgsFromNamespace:
+    def test_wait_one_quoted_string_of_uuids(self, session_store):
         ns = parser.parse_args(["op", "wait", f"{UUID_A} {UUID_B} {UUID_C}"])
-        args = WaitArgs.from_args(ns)
+        SESSION_STORE.set(session_store)
+        args = copy_context().run(WaitArgs.from_args, ns)
         assert args.uuids == [UUID_A, UUID_B, UUID_C]
 
-    def test_argparse_cancel_one_quoted_string_of_uuids(self):
+    def test_cancel_one_quoted_string_of_uuids(self, session_store):
         ns = parser.parse_args(["op", "cancel", f"{UUID_A} {UUID_B}"])
-        args = CancelArgs.from_args(ns)
+        SESSION_STORE.set(session_store)
+        args = copy_context().run(CancelArgs.from_args, ns)
         assert args.uuids == [UUID_A, UUID_B]
 
-    def test_argparse_show_one_quoted_string_of_uuids(self):
+    def test_show_one_quoted_string_of_uuids(self, session_store):
         ns = parser.parse_args(["op", "show", f"{UUID_A} {UUID_B}"])
-        args = ShowMultiArgs.from_args(ns)
+        SESSION_STORE.set(session_store)
+        args = copy_context().run(ShowMultiArgs.from_args, ns)
         assert args.uuids == [UUID_A, UUID_B]
 
-    def test_argparse_show_accepts_history_ref(self):
-        ns = parser.parse_args(["op", "show", "@5"])
-        args = ShowMultiArgs.from_args(ns)
-        assert args.uuids == ["@5"]
+    def test_show_resolves_history_ref_to_real_uuid(self, session_store):
+        # @N is no longer passed through verbatim -- from_args resolves
+        # it against the active session and returns the real UUID.
+        session_store.set_image("img-1", kind="use")
+        session_store.set_image("img-2", kind="run", operation_uuid=UUID_A)
+        ns = parser.parse_args(["op", "show", "@2"])
+        SESSION_STORE.set(session_store)
+        args = copy_context().run(ShowMultiArgs.from_args, ns)
+        assert args.uuids == [UUID_A]
 
-    def test_wait_with_garbage_uuid_raises(self):
+    def test_wait_with_garbage_uuid_raises(self, session_store):
         ns = parser.parse_args(["op", "wait", "definitely-not-uuid"])
-        with pytest.raises(ValueError, match="Invalid operation UUID"):
-            WaitArgs.from_args(ns)
+        SESSION_STORE.set(session_store)
+        with pytest.raises(ValueError, match="Invalid operation reference"):
+            copy_context().run(WaitArgs.from_args, ns)

@@ -20,7 +20,16 @@ from typing import Any, cast
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol
 from contree_cli.client import decode_stream
 from contree_cli.output import DefaultFormatter, JSONFormatter, JSONPrettyFormatter
-from contree_cli.session import SessionStore
+from contree_cli.refs import history_spec_from_ref, resolve_operation_uuid
+
+# Re-exported for backwards compatibility with anything that historically
+# imported these helpers from `contree_cli.cli.show`.
+__all__ = [
+    "ShowArgs",
+    "cmd_show",
+    "history_spec_from_ref",
+    "resolve_operation_uuid",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -28,32 +37,14 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class ShowArgs(ArgumentsProtocol):
     uuid: str
+    raw: bool = False
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> ShowArgs:
-        return cls(uuid=ns.uuid)
+        return cls(uuid=ns.uuid, raw=getattr(ns, "raw", False))
 
 
-def _resolve_operation_uuid(raw: str, store: SessionStore) -> str:
-    # Support @N, :N, or bare numeric history IDs for current session
-    prefix_stripped = raw[1:] if raw.startswith(("@", ":")) else raw
-    if prefix_stripped.isdigit():
-        session = store.session
-        if session is None:
-            raise ValueError(
-                "No active session; cannot resolve history entry. "
-                "Run `contree use` first.",
-            )
-        entry_id = int(prefix_stripped)
-        entry = store._get_history_entry(entry_id)
-        op_uuid = entry.operation_uuid
-        if not op_uuid:
-            raise ValueError(f"History entry {entry_id} has no operation UUID")
-        return op_uuid
-    return raw
-
-
-_TERMINAL = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
+TERMINAL = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 
 
 def cmd_show(args: ShowArgs) -> int | None:
@@ -63,7 +54,7 @@ def cmd_show(args: ShowArgs) -> int | None:
     store = SESSION_STORE.get()
 
     try:
-        op_uuid = _resolve_operation_uuid(args.uuid, store)
+        op_uuid = resolve_operation_uuid(args.uuid, store)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -75,8 +66,17 @@ def cmd_show(args: ShowArgs) -> int | None:
     else:
         resp = client.get(f"/v1/operations/{op_uuid}")
         op = json.loads(resp.read())
-        if op.get("status") in _TERMINAL:
+        if op.get("status") in TERMINAL:
             store.cache[cache_key] = op
+
+    if args.raw:
+        # Pass through the server payload verbatim, one operation per
+        # line (JSONL), so multi-UUID `op show --raw` streams cleanly
+        # into `jq -c`, `awk`, etc. Skips formatter routing, derived
+        # columns, and stdout/stderr decoding -- the user asked for raw.
+        json.dump(op, sys.stdout)
+        sys.stdout.write("\n")
+        return None
 
     result = op.get("result") or {}
     metadata = op.get("metadata") or {}
@@ -87,14 +87,9 @@ def cmd_show(args: ShowArgs) -> int | None:
     if state:
         exit_code = state.get("exit_code")
 
-    status = op.get("status", "")
-    if status == "SUCCESS" and exit_code not in (None, 0):
-        status = "FAILED"
-
     formatter(
         **{
             **op,
-            "status": status,
             "exit_code": exit_code,
             "image": result.get("image") or "",
             "tag": result.get("tag") or "",

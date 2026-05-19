@@ -612,7 +612,10 @@ class TestWait:
         assert rc == 1
         out = capsys.readouterr().out.strip().splitlines()
         data = json.loads(out[0])
-        assert data["status"] == "FAILED"
+        # status is the server's word; exit_code is reported separately
+        # and propagated to the CLI rc. Branch is not advanced because
+        # the sandbox process failed (non-zero exit).
+        assert data["status"] == "SUCCESS"
         assert data["exit_code"] == 1
         assert session_store.current_image == "img-1"
 
@@ -642,7 +645,7 @@ class TestWait:
         assert rc == 2
         out = capsys.readouterr().out.strip().splitlines()
         data = json.loads(out[0])
-        assert data["status"] == "FAILED"
+        assert data["status"] == "SUCCESS"
         assert data["exit_code"] == 2
         assert data["title"] == "sleep 1"
         assert session_store.current_image == "img-1"
@@ -882,7 +885,7 @@ class TestFromArgs:
 
     def test_wait_args_rejects_invalid_uuid(self) -> None:
         ns = argparse.Namespace(op_ids=["definitely-not-uuid"])
-        with pytest.raises(ValueError, match="Invalid operation UUID"):
+        with pytest.raises(ValueError, match="Invalid operation reference"):
             WaitArgs.from_args(ns)
 
     def test_show_args(self) -> None:

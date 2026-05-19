@@ -130,8 +130,9 @@ BUNDLED_FALLBACK = """\
 
 ```bash
 # 1) Discover what images are available -- do NOT assume a tag exists.
-contree images --prefix ubuntu         # narrow listing
-contree -f plain images | grep -i ubuntu   # or grep the full list
+contree images --prefix ubuntu         # narrow listing (preferred)
+# Fallback for when you don't know the prefix shape -- much slower:
+# contree -f plain images | grep -i ubuntu
 
 # 2) Bootstrap a session against a tag actually present in the listing.
 contree -S <key> use <image-or-tag-from-list>
