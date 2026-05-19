@@ -393,31 +393,29 @@ def cmd_list(args: ListArgs) -> None:
         base_params["until"] = isoformat_datetime(args.until)
 
     limit = args.show_max
-    fetcher = PaginatedFetcher(
+    emitted = 0
+    hit_limit = False
+    with PaginatedFetcher(
         client,
         "/v1/operations",
         base_params,
         json.loads,
         limit=limit,
         concurrency=CONTREE_CONCURRENCY,
-    )
-
-    emitted = 0
-    hit_limit = False
-    for page in fetcher:
-        for op in page:
-            if limit is not None and emitted >= limit:
-                hit_limit = True
+    ) as fetcher:
+        for page in fetcher:
+            for op in page:
+                if limit is not None and emitted >= limit:
+                    hit_limit = True
+                    break
+                if args.quiet:
+                    print(op["uuid"])
+                else:
+                    formatter(**op)
+                emitted += 1
+            formatter.flush()
+            if hit_limit:
                 break
-            if args.quiet:
-                print(op["uuid"])
-            else:
-                formatter(**op)
-            emitted += 1
-        formatter.flush()
-        if hit_limit:
-            fetcher.stop()
-            break
 
     if hit_limit:
         logger.warning(
