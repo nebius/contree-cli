@@ -273,6 +273,95 @@ contree kill --all
 :::
 ::::
 
+### Fan-out + wait
+
+When several independent steps can run at the same time, spawn each
+one detached and join them with `contree op wait` (alias `contree
+operation wait`). The wait command polls the API and prints one row
+per operation as soon as it reaches a terminal status, with columns
+`uuid`, `status`, `timed_out`, `duration`, and any other scalar field
+the API returns.
+
+:::{important}
+`op wait` is a **pure observer** — it polls completion status but
+**does not touch local session state**. That makes the pattern most
+natural with `--disposable` (no image to track). For non-disposable
+fan-out, the result images live only on the server; the
+`detached-<op-uuid>` branches created at spawn time still point at
+the **starting** image and never get moved. See the non-disposable
+recovery example below.
+:::
+
+The preferred shape — disposable runs, parallel independent checks:
+
+```bash
+# Three parallel test suites, results discarded after the runs
+A=$(contree run -d --disposable -- pytest tests/a | jq -r .uuid)
+B=$(contree run -d --disposable -- pytest tests/b | jq -r .uuid)
+C=$(contree run -d --disposable -- pytest tests/c | jq -r .uuid)
+
+# Block until each one finishes (or 60 s elapses, whichever comes first)
+contree op wait "$A" "$B" "$C"
+
+# Inspect stdout/stderr per leg
+contree op show "$A" "$B" "$C"
+```
+
+Non-disposable fan-out works too, but you have to recover the result
+images yourself — `op wait` will not bind them into the session:
+
+```bash
+A=$(contree run -d -- apt-get install -y curl | jq -r .uuid)
+B=$(contree run -d -- apt-get install -y wget | jq -r .uuid)
+contree op wait "$A" "$B"
+
+# Pull the winning leg's image out of the operation result and
+# attach it to the active session.
+IMG_A=$(contree -f json op show "$A" | jq -r .image)
+contree use "$IMG_A"
+
+# Or tag it for reuse later.
+contree tag "$IMG_A" feature/curl-tools
+```
+
+After fan-out + wait the session retains a `detached-<op-uuid>`
+branch per spawn. They all point at the image that existed when the
+fan-out started, so they are mostly cosmetic — feel free to delete
+them with `contree session branch --prune` when you no longer need
+them.
+
+Useful flags:
+
+- `--timeout SECONDS` — cap on the wait (default 60). If the deadline
+  hits before every operation reaches a terminal status, `op wait`
+  emits one extra row per unfinished op with `timed_out=true` and the
+  operation's last observed status (e.g. `EXECUTING`), then exits
+  with status `1`.
+- `--all` — wait for every currently active operation in the project,
+  not just the ones you passed.
+
+```bash
+# Block on every active op, up to 5 minutes
+contree op wait --all --timeout 300
+```
+
+:::{warning}
+`--all` is **project-scoped**. If multiple agents or shell sessions
+share the same project, `op wait --all` will block on every active
+operation across all of them — not just the ones you launched. For
+multi-agent or multi-shell setups prefer the explicit
+`op wait UUID1 UUID2 ...` form with the UUIDs you actually own.
+:::
+
+`op wait` exits non-zero whenever any operation finished with a
+non-`SUCCESS` status (so it composes naturally with shell `&&`
+chains), even when no `--timeout` was hit.
+
+```bash
+# Run fan-out + tests; bail if any leg failed
+contree op wait "$A" "$B" "$C" && echo "all green" || echo "some failed"
+```
+
 ### Scripting patterns
 
 :::{note}

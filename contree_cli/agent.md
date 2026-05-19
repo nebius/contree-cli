@@ -276,26 +276,41 @@ Monitoring background operations:
   contree kill UUID1 UUID2                same -- top-level shortcut
   contree op cancel --all                 cancel every active op (rare)
 
-  Fan-out + join pattern (preferred — spawn detached, wait all at once):
-    A=$(contree run -d -- make -C /work/a build | jq -r .uuid)
-    B=$(contree run -d -- make -C /work/b build | jq -r .uuid)
-    C=$(contree run -d -- make -C /work/c build | jq -r .uuid)
-    contree op wait "$A" "$B" "$C"        block until all reach terminal status
-    contree op show "$A" "$B" "$C"        inspect results
+  `op wait` is a pure observer: polls and prints one row per
+  operation as it completes (uuid|status|duration|timed_out).
+  Exit code 1 if any operation finishes non-SUCCESS, or if --timeout
+  (default 60s) is hit before every operation reaches a terminal
+  status. Use --all to wait for every currently active operation
+  in the project.
 
-  `op wait` prints one row per operation as it completes
-  (uuid|status|duration|timed_out). Exit code 1 if any operation
-  finishes non-SUCCESS, or if --timeout (default 60s) is hit before
-  every operation reaches a terminal status. Use --all to wait for
-  every currently active operation in the project.
+  Caveat 1 -- `op wait` does NOT advance session state:
+    Each `run -d` (non-disposable) creates a `detached-<op-uuid>`
+    branch pointing at the START image. `op wait` does not move
+    those branches to the result image; the result lives only on
+    the server. After fan-out + wait the session looks the same as
+    before the wait, just with `detached-*` branches accumulated.
 
-  Caveat for parallel agents:
-    `op wait --all` is project-wide. If another agent (or another
-    shell of yours) is running concurrently in the same project, your
-    `--all` will block on its ops too. The result is still a valid
-    wait, just possibly not over the set you expected. When several
-    agents share a project, prefer the explicit form
-    `op wait $A $B $C` with the UUIDs you spawned yourself.
+  PREFERRED fan-out (--disposable, no image-tracking concerns):
+    A=$(contree run -d --disposable -- pytest tests/a | jq -r .uuid)
+    B=$(contree run -d --disposable -- pytest tests/b | jq -r .uuid)
+    C=$(contree run -d --disposable -- pytest tests/c | jq -r .uuid)
+    contree op wait "$A" "$B" "$C"          block until all complete
+    contree op show "$A" "$B" "$C"          stdout/stderr per op
+
+  Non-disposable fan-out (must recover images manually):
+    A=$(contree run -d -- apt-get install -y curl | jq -r .uuid)
+    B=$(contree run -d -- apt-get install -y wget | jq -r .uuid)
+    contree op wait "$A" "$B"
+    IMG_A=$(contree -f json op show "$A" | jq -r .image)
+    contree use "$IMG_A"                    bind chosen result back
+
+  Caveat 2 -- `op wait --all` is project-wide:
+    If another agent (or another shell of yours) is running
+    concurrently in the same project, your --all will block on its
+    ops too. The result is still a valid wait, just possibly not
+    over the set you expected. When several agents share a project,
+    prefer the explicit form `op wait $A $B $C` with the UUIDs you
+    spawned yourself.
 
   Background checks are cheap: terminal results are cached locally,
   so repeated `op show` / `show` calls do not re-hit the API.

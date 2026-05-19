@@ -190,7 +190,11 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
   - `op wait UUID1 UUID2 ...` -- block until each reaches a terminal status,
     print one row per completion (uuid|status|duration|timed_out).
     `--all` waits for every active op; `--timeout SECONDS` (default 60)
-    causes exit code 1 if not all complete in time.
+    causes exit code 1 if not all complete in time. Pure observer:
+    does NOT advance any session branch with result images. Pairs
+    best with `run -d --disposable`; for non-disposable fan-out,
+    extract result images via `op show` and `contree use` them
+    yourself.
   - `op cancel UUID1 UUID2 ...` -- cancel several operations, or `--all`
     to cancel every active one.
 
@@ -355,26 +359,61 @@ Cancelling:
 
 Common patterns:
 
-```bash
-# Fan out: spawn several detached runs, wait for all, inspect each.
-# This is the canonical parallel pattern -- start jobs cheaply with
-# `run -d` and join them with `op wait` instead of polling by hand.
-A=$(contree run -d -- make -C /work/a build | jq -r .uuid)
-B=$(contree run -d -- make -C /work/b build | jq -r .uuid)
-C=$(contree run -d -- make -C /work/c build | jq -r .uuid)
-contree op wait "$A" "$B" "$C"            # one row per op as they finish
-contree op show "$A" "$B" "$C"            # detailed results
+**Fan-out + wait** — the canonical parallel pattern.
 
-# Same pattern, but block on every active op in the project
+`op wait` is a pure observer: it polls the API and prints
+completions, but it **does not touch session state**. That has
+important consequences for whether fan-out is disposable or not.
+
+PREFERRED: fan-out + wait with `--disposable`. The result images of
+each leg are discarded, you only care about exit codes / stdout, and
+the session stays clean.
+
+```bash
+A=$(contree run -d --disposable -- pytest tests/a | jq -r .uuid)
+B=$(contree run -d --disposable -- pytest tests/b | jq -r .uuid)
+C=$(contree run -d --disposable -- pytest tests/c | jq -r .uuid)
+contree op wait "$A" "$B" "$C"             # one row per op as they finish
+contree op show "$A" "$B" "$C"             # stdout/stderr per op
+```
+
+NON-DISPOSABLE fan-out works, but with caveats:
+
+- Each `run -d` creates a `detached-<op-uuid>` branch in the session.
+  It points at the **starting** image, not at the eventual result.
+- `op wait` polls until completion but does **not** advance any
+  branch with the result image. After the wait, the session looks
+  exactly like it did before the wait, just with `detached-*`
+  branches accumulating.
+- The actual result images live only on the server. To use one,
+  extract it from `op wait` / `op show` output and attach it
+  explicitly:
+
+```bash
+A=$(contree run -d -- apt-get install -y curl | jq -r .uuid)
+B=$(contree run -d -- apt-get install -y wget | jq -r .uuid)
+contree op wait "$A" "$B"
+# Pick the winning leg and re-bind the active session image to it:
+IMG_A=$(contree -f json op show "$A" | jq -r .image)
+contree use "$IMG_A"
+# Or tag a build artefact for reuse:
+contree tag "$IMG_A" feature/curl-tools
+```
+
+Other useful invocations:
+
+```bash
+# Wait for every active op in the project (warning: project-scoped,
+# see below).
 contree op wait --all
 
-# Bound the wait (default is 60s); fail fast if jobs take too long
+# Bound the wait (default is 60s); fail fast if jobs take too long.
 contree op wait --timeout 300 "$A" "$B" "$C"
 
-# Snapshot what is running right now
+# Snapshot what is running right now.
 contree -f json op ls | jq '.uuid'
 
-# Find recent failures across the project
+# Find recent failures across the project.
 contree -f json ps -a -S FAILED --since=1h
 ```
 

@@ -109,6 +109,18 @@ hits, the command emits one extra row per unfinished operation with
 `EXECUTING`), then exits with status `1`. Any operation that finished
 non-`SUCCESS` also forces exit code `1`.
 
+:::{important}
+`op wait` is a **pure observer**: it polls operation status and
+prints rows, but it **never updates session state**. In particular,
+the `detached-<op-uuid>` branch created when you ran
+`contree run -d` keeps pointing at the **starting** image — `op
+wait` does not advance it to the result image. The pattern therefore
+fits non-image-producing runs (`--disposable`) most cleanly; for
+non-disposable fan-out, the result image of each leg lives only on
+the server and you must recover it explicitly (see the non-disposable
+example below).
+:::
+
 :::{warning}
 `--all` is **project-scoped**. If multiple agents (or multiple shell
 sessions) share the same project, `op wait --all` will block on every
@@ -121,14 +133,33 @@ might expect. For multi-agent setups, prefer the explicit
 ```{terminal-shell} contree op wait --help
 ```
 
-```bash
-# Fan-out + join: spawn detached runs, wait for all
-A=$(contree run -d -- make a | jq -r .uuid)
-B=$(contree run -d -- make b | jq -r .uuid)
-C=$(contree run -d -- make c | jq -r .uuid)
-contree op wait "$A" "$B" "$C"
+Preferred — `--disposable` fan-out, no image to track:
 
-# Block until every active op in the project finishes (5 min cap)
+```bash
+A=$(contree run -d --disposable -- pytest tests/a | jq -r .uuid)
+B=$(contree run -d --disposable -- pytest tests/b | jq -r .uuid)
+C=$(contree run -d --disposable -- pytest tests/c | jq -r .uuid)
+contree op wait "$A" "$B" "$C"
+contree op show "$A" "$B" "$C"          # stdout/stderr per leg
+```
+
+Non-disposable fan-out — must recover the chosen leg's image yourself:
+
+```bash
+A=$(contree run -d -- apt-get install -y curl | jq -r .uuid)
+B=$(contree run -d -- apt-get install -y wget | jq -r .uuid)
+contree op wait "$A" "$B"
+
+# Pull the result image out and bind it back into the session,
+# or tag it for later reuse.
+IMG_A=$(contree -f json op show "$A" | jq -r .image)
+contree use "$IMG_A"
+contree tag "$IMG_A" feature/curl-tools
+```
+
+Block on the whole project (5 min cap):
+
+```bash
 contree op wait --all --timeout 300
 ```
 
