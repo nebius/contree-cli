@@ -12,6 +12,7 @@ Manage operations under a single namespace. Aggregates `ps` (list),
 |------------|---------|-------------|
 | `list` | `ls` | List operations. Same flags as `contree ps`. |
 | `show UUID [UUID...]` | `sh` | Show one or more operation results. |
+| `wait UUID [UUID...]` | `w` | Wait for operations to reach a terminal status (or `--all`). |
 | `cancel UUID [UUID...]` | `kill`, `k` | Cancel one or more operations (or `--all`). |
 
 ## Examples
@@ -93,6 +94,44 @@ currently renders as its own mini-table. Use `default` or `json` for a
 unified stream view across multiple UUIDs.
 :::
 
+## `op wait` -- block until completion
+
+Poll the given operations until each reaches a terminal status
+(`SUCCESS`, `FAILED`, `CANCELLED`) and print one row per completion
+with the columns `uuid`, `status`, `timed_out`, `duration` (and every
+other scalar field the API returns; `error` is pinned to the last
+column).
+
+`--all` waits for every currently active operation in the project.
+`--timeout SECONDS` (default `60`) caps the wait — when the deadline
+hits, the command emits one extra row per unfinished operation with
+`timed_out=true` and the operation's last observed status (e.g.
+`EXECUTING`), then exits with status `1`. Any operation that finished
+non-`SUCCESS` also forces exit code `1`.
+
+:::{warning}
+`--all` is **project-scoped**. If multiple agents (or multiple shell
+sessions) share the same project, `op wait --all` will block on every
+active operation across all of them — not just the ones you launched.
+The wait still completes correctly; it just waits for more than you
+might expect. For multi-agent setups, prefer the explicit
+`op wait UUID1 UUID2 ...` form with the UUIDs you actually own.
+:::
+
+```{terminal-shell} contree op wait --help
+```
+
+```bash
+# Fan-out + join: spawn detached runs, wait for all
+A=$(contree run -d -- make a | jq -r .uuid)
+B=$(contree run -d -- make b | jq -r .uuid)
+C=$(contree run -d -- make c | jq -r .uuid)
+contree op wait "$A" "$B" "$C"
+
+# Block until every active op in the project finishes (5 min cap)
+contree op wait --all --timeout 300
+```
+
 ## `op cancel` -- multiple UUIDs or `--all`
 
 Either pass UUIDs explicitly or use `--all` to cancel every active
@@ -121,6 +160,8 @@ keeps its own single-UUID handler (the multi-UUID `op show` wraps it).
 | List active operations | `contree ps` *or* `contree op ls` |
 | Inspect one operation | `contree show UUID` *or* `contree op show UUID` |
 | Inspect multiple | `contree op show UUID1 UUID2 ...` |
+| Block on multiple | `contree op wait UUID1 UUID2 ...` |
+| Block on everything active | `contree op wait --all` |
 | Cancel one operation | `contree kill UUID` *or* `contree op cancel UUID` |
 | Cancel multiple | `contree kill UUID1 UUID2 ...` *or* `contree op cancel UUID1 UUID2 ...` |
 | Cancel everything active | `contree kill --all` *or* `contree op cancel --all` |

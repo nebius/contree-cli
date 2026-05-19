@@ -99,6 +99,11 @@ def main() -> None:
         except ApiError as exc:
             log.error("%s", exc)
             exit(1)
+        except ValueError as exc:
+            # Raised by loader.from_args for malformed user input
+            # (invalid UUIDs, etc.); the message is already user-facing.
+            log.error("%s", exc)
+            exit(1)
         except (OSError, http.client.HTTPException) as exc:
             log.error("Network error: %s", exc)
             exit(1)

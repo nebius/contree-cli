@@ -11,8 +11,10 @@ from contree_cli.cli.operation import (
     ACTIVE_STATUSES,
     CancelArgs,
     ShowMultiArgs,
+    WaitArgs,
     cmd_cancel,
     cmd_show_multi,
+    cmd_wait,
 )
 from contree_cli.output import CSVFormatter, JSONFormatter
 from contree_cli.session import SessionStore
@@ -335,3 +337,209 @@ class TestOperationCancel:
         deletes = [r for r in contree_client.fake.requests if r.method == "DELETE"]
         assert len(deletes) == 1
         assert deletes[0].path == "/v1/operations/pending-0"
+
+
+# ----------------------------------------------------------------------
+# op wait
+# ----------------------------------------------------------------------
+
+
+def _wait_op(uuid: str, status: str = "SUCCESS", duration: float = 1.0) -> dict:
+    return {
+        "uuid": uuid,
+        "kind": "instance",
+        "status": status,
+        "duration": duration,
+        "error": None,
+    }
+
+
+class TestOperationWait:
+    def test_argparse_wait_alias(self):
+        ns = parser.parse_args(["op", "w", "op-1"])
+        assert ns.handler is cmd_wait
+        assert ns.uuids == ["op-1"]
+
+    def test_argparse_wait_default_timeout(self):
+        ns = parser.parse_args(["op", "wait", "op-1"])
+        assert ns.timeout == 60
+
+    def test_wait_returns_none_on_terminal_success(self, contree_client, monkeypatch):
+        monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
+        contree_client.respond_json(_wait_op("op-1", status="SUCCESS"))
+
+        FORMATTER.set(JSONFormatter())
+        CLIENT.set(contree_client)
+        ctx = copy_context()
+        rc = ctx.run(cmd_wait, WaitArgs(uuids=["op-1"], timeout=60))
+        assert rc is None
+        assert contree_client.request_count == 1
+
+    def test_wait_failed_op_returns_exit_code_one(
+        self, contree_client, monkeypatch, capsys
+    ):
+        monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
+        contree_client.respond_json(_wait_op("op-fail", status="FAILED"))
+
+        FORMATTER.set(JSONFormatter())
+        CLIENT.set(contree_client)
+        ctx = copy_context()
+        rc = ctx.run(cmd_wait, WaitArgs(uuids=["op-fail"], timeout=60))
+        assert rc == 1
+        import json as _json
+
+        data = _json.loads(capsys.readouterr().out)
+        assert data["status"] == "FAILED"
+        assert data["timed_out"] is False
+
+    def test_wait_emits_timed_out_column(
+        self, contree_client, monkeypatch, capsys, caplog
+    ):
+        # `time.monotonic` returns a value past the deadline on the second
+        # call, simulating a real-world timeout without sleeping.
+        clock = iter([0.0, 0.0, 0.5, 100.0, 100.0, 100.0, 100.0])
+        monkeypatch.setattr(
+            "contree_cli.cli.operation.time.monotonic", lambda: next(clock)
+        )
+        monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
+        # Poll: returns EXECUTING (not terminal). Second fetch (post-deadline)
+        # picks up the same op for the timed-out row.
+        contree_client.respond_json(_wait_op("op-slow", status="EXECUTING"))
+        contree_client.respond_json(_wait_op("op-slow", status="EXECUTING"))
+
+        FORMATTER.set(JSONFormatter())
+        CLIENT.set(contree_client)
+        ctx = copy_context()
+        with caplog.at_level("WARNING"):
+            rc = ctx.run(cmd_wait, WaitArgs(uuids=["op-slow"], timeout=1))
+
+        assert rc == 1
+        import json as _json
+
+        data = _json.loads(capsys.readouterr().out)
+        assert data["uuid"] == "op-slow"
+        assert data["status"] == "EXECUTING"
+        assert data["timed_out"] is True
+        assert "Timeout" in caplog.text
+
+    def test_wait_no_args_no_all_errors(self, contree_client, caplog):
+        CLIENT.set(contree_client)
+        ctx = copy_context()
+        with caplog.at_level("ERROR"):
+            rc = ctx.run(cmd_wait, WaitArgs(uuids=[], all=False, timeout=60))
+        assert rc == 1
+        assert "at least one UUID" in caplog.text
+
+    def test_wait_all_with_no_active(self, contree_client, monkeypatch, caplog):
+        # list_active returns no UUIDs after polling each ACTIVE_STATUS once.
+        for _ in ACTIVE_STATUSES:
+            contree_client.respond_json([])
+
+        FORMATTER.set(JSONFormatter())
+        CLIENT.set(contree_client)
+        ctx = copy_context()
+        with caplog.at_level("INFO"):
+            rc = ctx.run(cmd_wait, WaitArgs(uuids=[], all=True, timeout=60))
+        assert rc is None
+        assert "No active operations to wait for" in caplog.text
+
+
+# ----------------------------------------------------------------------
+# split_uuid_args -- normalise whitespace-joined positional UUIDs
+# ----------------------------------------------------------------------
+
+
+UUID_A = "019e3fb6-e2d8-7350-a8f9-8b2b5ebfda7f"
+UUID_B = "019e3fb6-e447-760d-b7ab-62ef51f91b1f"
+UUID_C = "019e3fb6-e5c3-7184-96f1-f7d56453a193"
+
+
+class TestSplitUUIDArgs:
+    def test_already_split_passes_through(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        assert split_uuid_args([UUID_A, UUID_B]) == [UUID_A, UUID_B]
+
+    def test_space_joined_single_arg_is_split(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        joined = f"{UUID_A} {UUID_B} {UUID_C}"
+        assert split_uuid_args([joined]) == [UUID_A, UUID_B, UUID_C]
+
+    def test_newline_joined_is_split(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        joined = f"{UUID_A}\n      {UUID_B}\n      {UUID_C}"
+        assert split_uuid_args([joined]) == [UUID_A, UUID_B, UUID_C]
+
+    def test_mixed_args_and_joined(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        assert split_uuid_args([f"{UUID_A} {UUID_B}", UUID_C, f"\t{UUID_A}"]) == [
+            UUID_A,
+            UUID_B,
+            UUID_C,
+            UUID_A,
+        ]
+
+    def test_empty_list(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        assert split_uuid_args([]) == []
+
+    def test_invalid_uuid_raises_value_error(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        with pytest.raises(ValueError, match="Invalid operation UUID"):
+            split_uuid_args(["not-a-uuid"])
+
+    def test_invalid_lists_every_bad_token(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        with pytest.raises(ValueError) as exc:
+            split_uuid_args([f"{UUID_A} bogus garbage {UUID_B}"])
+        msg = str(exc.value)
+        assert "bogus" in msg
+        assert "garbage" in msg
+
+    def test_history_ref_allowed_when_requested(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        assert split_uuid_args(["@5 :12 7"], allow_history_ref=True) == [
+            "@5",
+            ":12",
+            "7",
+        ]
+
+    def test_history_ref_rejected_by_default(self):
+        from contree_cli.cli.operation import split_uuid_args
+
+        with pytest.raises(ValueError):
+            split_uuid_args(["@5"])
+
+
+class TestWaitArgsSplits:
+    def test_argparse_wait_one_quoted_string_of_uuids(self):
+        ns = parser.parse_args(["op", "wait", f"{UUID_A} {UUID_B} {UUID_C}"])
+        args = WaitArgs.from_args(ns)
+        assert args.uuids == [UUID_A, UUID_B, UUID_C]
+
+    def test_argparse_cancel_one_quoted_string_of_uuids(self):
+        ns = parser.parse_args(["op", "cancel", f"{UUID_A} {UUID_B}"])
+        args = CancelArgs.from_args(ns)
+        assert args.uuids == [UUID_A, UUID_B]
+
+    def test_argparse_show_one_quoted_string_of_uuids(self):
+        ns = parser.parse_args(["op", "show", f"{UUID_A} {UUID_B}"])
+        args = ShowMultiArgs.from_args(ns)
+        assert args.uuids == [UUID_A, UUID_B]
+
+    def test_argparse_show_accepts_history_ref(self):
+        ns = parser.parse_args(["op", "show", "@5"])
+        args = ShowMultiArgs.from_args(ns)
+        assert args.uuids == ["@5"]
+
+    def test_wait_with_garbage_uuid_raises(self):
+        ns = parser.parse_args(["op", "wait", "definitely-not-uuid"])
+        with pytest.raises(ValueError, match="Invalid operation UUID"):
+            WaitArgs.from_args(ns)

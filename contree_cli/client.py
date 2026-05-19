@@ -273,6 +273,10 @@ class ContreeClient(ABC):
                 resp = conn.getresponse()
             except TimeoutError as exc:
                 raise TimeoutError(f"Request timed out: {method} {full_path}") from exc
+            except http.client.InvalidURL:
+                # Malformed URL is a permanent caller-side error — retrying
+                # would just spin through the back-off ladder for nothing.
+                raise
             except RETRYABLE_NETWORK_ERRORS as exc:
                 last_network_error = exc
                 last_error = None

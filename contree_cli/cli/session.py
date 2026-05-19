@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
+from contree_cli.cli.operation import split_uuid_args
 from contree_cli.output import DefaultFormatter
 from contree_cli.types import FLAGS, parse_datetime, parse_interval
 
@@ -135,7 +136,7 @@ class WaitArgs(ArgumentsProtocol):
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> WaitArgs:
-        return cls(op_ids=ns.op_ids)
+        return cls(op_ids=split_uuid_args(list(ns.op_ids)))
 
 
 @dataclass(frozen=True)

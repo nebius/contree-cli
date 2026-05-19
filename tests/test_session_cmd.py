@@ -874,9 +874,16 @@ class TestFromArgs:
         assert args.forward == 0
 
     def test_wait_args(self) -> None:
-        ns = argparse.Namespace(op_ids=["a", "b"])
+        uuid_a = "019e3fb6-e2d8-7350-a8f9-8b2b5ebfda7f"
+        uuid_b = "019e3fb6-e447-760d-b7ab-62ef51f91b1f"
+        ns = argparse.Namespace(op_ids=[uuid_a, uuid_b])
         args = WaitArgs.from_args(ns)
-        assert args.op_ids == ["a", "b"]
+        assert args.op_ids == [uuid_a, uuid_b]
+
+    def test_wait_args_rejects_invalid_uuid(self) -> None:
+        ns = argparse.Namespace(op_ids=["definitely-not-uuid"])
+        with pytest.raises(ValueError, match="Invalid operation UUID"):
+            WaitArgs.from_args(ns)
 
     def test_show_args(self) -> None:
         ns = argparse.Namespace(

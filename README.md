@@ -156,6 +156,7 @@ The shell provides tab completion for commands, paths, image tags, and operation
 | `show UUID` | | Show operation result |
 | `operation list` | `op`, `ls` | Same as `ps` (canonical) |
 | `operation show UUID...` | `sh` | Multi-UUID inspect |
+| `operation wait UUID...` | `w` | Block until each op finishes (or `--all`; `--timeout`) |
 | `operation cancel UUID...` | `kill`, `k` | Multi-UUID cancel (or `--all`) |
 | `ls [PATH]` | | List files in session image (no VM) |
 | `cat PATH` | | Show file content from session image (no VM) |

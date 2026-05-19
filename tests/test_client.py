@@ -223,6 +223,28 @@ class TestRetry:
         ):
             c.request("GET", "/v1/images")
 
+    def test_invalid_url_is_not_retried(self):
+        """InvalidURL is a permanent caller-side error — should raise immediately."""
+        import http.client
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+
+        call_count = {"n": 0}
+
+        def fail_with_invalid_url():
+            call_count["n"] += 1
+            raise http.client.InvalidURL("control characters in URL")
+
+        c._connect = fail_with_invalid_url  # type: ignore[method-assign]
+
+        with (
+            patch("contree_cli.client.time.sleep") as mock_sleep,
+            pytest.raises(http.client.InvalidURL),
+        ):
+            c.request("GET", "/v1/images")
+        assert call_count["n"] == 1
+        mock_sleep.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Convenience methods

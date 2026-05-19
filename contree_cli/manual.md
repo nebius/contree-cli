@@ -153,7 +153,13 @@ Detached workflow:
   contree run -d -- long-task
   contree ps                             check status
   contree show UUID                      view result
-  contree session wait                   block until done
+  contree op wait UUID                   block until terminal
+
+Fan-out + join:
+  A=$(contree run -d -- make a | jq -r .uuid)
+  B=$(contree run -d -- make b | jq -r .uuid)
+  contree op wait "$A" "$B"              wait for both; one row each
+  contree op wait --all --timeout 600    or block on every active op
 
 More: contree run --help
 
@@ -182,9 +188,11 @@ Operations
   contree show UUID          show operation result
   contree kill UUID          cancel operation
   contree kill -a            cancel all active
-  contree session wait       wait for active operations
+  contree op wait UUID...    wait for given operations to finish
+  contree op wait --all      wait for every active operation
+  contree op wait --timeout SECONDS   bound the wait (default 60s)
 
-More: contree ps --help, contree show --help
+More: contree ps --help, contree op wait --help
 
 Profiles
 ========
@@ -243,6 +251,9 @@ All commands
   show UUID               Show operation result
   operation list          List operations (aliases: ls)
   operation show UUID...  Show multiple operation results (aliases: sh)
+  operation wait UUID...  Block until operations finish (aliases: w);
+                          `--all` waits for every active op; `--timeout
+                          SECONDS` fails if not all complete (default: 60)
   operation cancel UUID.. Cancel multiple operations (aliases: kill, k); `--all` cancels every active
   ls [PATH]               List files in image (no VM)
   cat PATH                Show file content (no VM)

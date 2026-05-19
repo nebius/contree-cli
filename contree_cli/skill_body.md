@@ -183,11 +183,14 @@ Unsure about sessions? Run `contree session --help` or `contree agent sessions`
 - `session checkout`: switch active branch.
 - `session rollback`: move the active branch pointer backward.
 - `session wait`: wait for active operations, or specific operation UUIDs.
-- `ps` / `show` / `kill`: inspect, read, or cancel a single operation.
-- `operation` (alias `op`): grouped namespace for the same actions plus
-  multi-UUID variants. Use this when monitoring background work.
+- `ps` / `show` / `kill`: inspect, read, or cancel operations (top-level shortcuts; multi-UUID).
+- `operation` (alias `op`): grouped namespace. Use this when monitoring background work.
   - `op ls` -- same flags as `ps`, lists operations. Pipe to `-q` for UUIDs.
   - `op show UUID1 UUID2 ...` -- fetch several operation results in one call.
+  - `op wait UUID1 UUID2 ...` -- block until each reaches a terminal status,
+    print one row per completion (uuid|status|duration|timed_out).
+    `--all` waits for every active op; `--timeout SECONDS` (default 60)
+    causes exit code 1 if not all complete in time.
   - `op cancel UUID1 UUID2 ...` -- cancel several operations, or `--all`
     to cancel every active one.
 
@@ -330,9 +333,19 @@ Monitoring background operations:
   exit code, stdout/stderr, resulting image).
 - `contree op show UUID1 UUID2 UUID3` -- fetch several operations in
   one shot. Convenient when fanning out runs and checking the batch.
-- `contree session wait` -- block until all active ops of the current
-  session reach terminal state.
-- `contree session wait UUID1 UUID2` -- block on specific UUIDs.
+- `contree op wait UUID1 UUID2 ...` -- block until each of these ops
+  reaches a terminal status; print one row per completion
+  (uuid|status|duration|timed_out). Exit code 1 if any finished
+  non-SUCCESS, or if `--timeout` (default 60s) elapsed first.
+- `contree op wait --all` -- block until every active op completes.
+  **Warning:** `--all` is project-wide. If another agent (or another
+  shell in the same project) launched operations in parallel, you will
+  block on those too -- and your wait may "complete" because of an op
+  you did not start. When several agents share a project, prefer the
+  explicit `op wait UUID1 UUID2 ...` form with the UUIDs you actually
+  spawned. Not catastrophic, just surprising; expect it.
+- `contree session wait` -- session-scoped variant; waits for active
+  ops of the current session.
 
 Cancelling:
 
@@ -343,12 +356,20 @@ Cancelling:
 Common patterns:
 
 ```bash
-# Fan out: start three builds, wait for all, inspect each
+# Fan out: spawn several detached runs, wait for all, inspect each.
+# This is the canonical parallel pattern -- start jobs cheaply with
+# `run -d` and join them with `op wait` instead of polling by hand.
 A=$(contree run -d -- make -C /work/a build | jq -r .uuid)
 B=$(contree run -d -- make -C /work/b build | jq -r .uuid)
 C=$(contree run -d -- make -C /work/c build | jq -r .uuid)
-contree session wait "$A" "$B" "$C"
-contree op show "$A" "$B" "$C"
+contree op wait "$A" "$B" "$C"            # one row per op as they finish
+contree op show "$A" "$B" "$C"            # detailed results
+
+# Same pattern, but block on every active op in the project
+contree op wait --all
+
+# Bound the wait (default is 60s); fail fast if jobs take too long
+contree op wait --timeout 300 "$A" "$B" "$C"
 
 # Snapshot what is running right now
 contree -f json op ls | jq '.uuid'

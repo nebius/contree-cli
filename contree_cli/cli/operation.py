@@ -16,8 +16,10 @@ import argparse
 import itertools
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from uuid import UUID
 
 from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
 from contree_cli.cli.show import ShowArgs, cmd_show
@@ -36,7 +38,57 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 1000
 # Hard cap on pages fetched when --show-max is omitted (1M operations).
 UNLIMITED_PAGE_CAP = 1000
+
+
+def looks_like_history_ref(value: str) -> bool:
+    """True for ``@N``, ``:N`` or bare ``N`` session-history references."""
+    stripped = value[1:] if value.startswith(("@", ":")) else value
+    return bool(stripped) and stripped.isdigit()
+
+
+def split_uuid_args(
+    items: list[str],
+    *,
+    allow_history_ref: bool = False,
+) -> list[str]:
+    """Flatten positional UUID arguments on whitespace and validate each.
+
+    Agents and users sometimes pass several UUIDs as one quoted string
+    (e.g. ``op wait "$UUIDS"`` where ``$UUIDS`` is a multi-line value
+    in fish or careless bash), which gives argparse a single positional
+    with embedded spaces or newlines. Each item is split into tokens
+    and parsed via :class:`uuid.UUID`. Tokens that fail to parse — and
+    are not ``@N``/``:N``/``N`` session-history references when those
+    are allowed — raise :class:`ValueError` listing every bad token.
+    """
+    out: list[str] = []
+    invalid: list[str] = []
+    for item in items:
+        for token in item.split():
+            if not token:
+                continue
+            try:
+                UUID(token)
+            except ValueError:
+                if allow_history_ref and looks_like_history_ref(token):
+                    out.append(token)
+                else:
+                    invalid.append(token)
+                continue
+            out.append(token)
+    if invalid:
+        raise ValueError(
+            "Invalid operation UUID"
+            + ("s" if len(invalid) > 1 else "")
+            + ": "
+            + " ".join(repr(u) for u in invalid),
+        )
+    return out
+
+
 ACTIVE_STATUSES = frozenset({"PENDING", "ASSIGNED", "EXECUTING"})
+TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
+WAIT_TIMEOUT_DEFAULT = 60
 STATUS_CHOICES = {
     "P": "PENDING",
     "A": "ASSIGNED",
@@ -83,7 +135,7 @@ class ShowMultiArgs(ArgumentsProtocol):
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> ShowMultiArgs:
-        return cls(uuids=list(ns.uuids))
+        return cls(uuids=split_uuid_args(list(ns.uuids), allow_history_ref=True))
 
 
 @dataclass(frozen=True)
@@ -93,7 +145,22 @@ class CancelArgs(ArgumentsProtocol):
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> CancelArgs:
-        return cls(uuids=list(ns.uuids or []), all=ns.all)
+        return cls(uuids=split_uuid_args(list(ns.uuids or [])), all=ns.all)
+
+
+@dataclass(frozen=True)
+class WaitArgs(ArgumentsProtocol):
+    uuids: list[str] = field(default_factory=list)
+    all: bool = False
+    timeout: int = WAIT_TIMEOUT_DEFAULT
+
+    @classmethod
+    def from_args(cls, ns: argparse.Namespace) -> WaitArgs:
+        return cls(
+            uuids=split_uuid_args(list(ns.uuids or [])),
+            all=ns.all,
+            timeout=ns.timeout,
+        )
 
 
 def setup_cancel_parser(p: argparse.ArgumentParser) -> SetupResult:
@@ -121,6 +188,31 @@ def setup_show_parser(p: argparse.ArgumentParser) -> SetupResult:
         help="One or more operation UUIDs (or @N history references)",
     )
     return cmd_show_multi, ShowMultiArgs
+
+
+def setup_wait_parser(p: argparse.ArgumentParser) -> SetupResult:
+    """Configure the wait parser for `operation wait`."""
+    p.add_argument(
+        "uuids",
+        nargs="*",
+        metavar="UUID",
+        help="Operation UUIDs to wait for",
+    )
+    p.add_argument(
+        *FLAGS["all"],
+        action="store_true",
+        help="Wait for every active operation",
+    )
+    p.add_argument(
+        *FLAGS["timeout"],
+        type=positive_int,
+        default=WAIT_TIMEOUT_DEFAULT,
+        help=(
+            "Fail with exit code 1 if not all operations reach a terminal"
+            f" status within this many seconds (default: {WAIT_TIMEOUT_DEFAULT})"
+        ),
+    )
+    return cmd_wait, WaitArgs
 
 
 def setup_list_parser(p: argparse.ArgumentParser) -> SetupResult:
@@ -215,6 +307,26 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     )
     cancel_handler, cancel_loader = setup_cancel_parser(cancel_p)
     cancel_p.set_defaults(handler=cancel_handler, load_args=cancel_loader)
+
+    wait_p = sub.add_parser(
+        "wait",
+        aliases=["w"],
+        help="Wait for operations to reach a terminal status",
+        description=(
+            "Poll the given operations until each reaches a terminal "
+            "status (SUCCESS, FAILED, CANCELLED) and print one row per "
+            "completion. With --all, waits for every currently active "
+            "operation (PENDING, ASSIGNED, EXECUTING)."
+        ),
+        epilog=(
+            "for coding agents:\n"
+            "  read-only command (polls the API; no state mutation)\n"
+            "  fails with exit code 1 if --timeout is hit before all complete\n"
+            "  exit code 1 also when any operation finished non-SUCCESS"
+        ),
+    )
+    wait_handler, wait_loader = setup_wait_parser(wait_p)
+    wait_p.set_defaults(handler=wait_handler, load_args=wait_loader)
 
     return cmd_show_multi, ShowMultiArgs
 
@@ -347,3 +459,72 @@ def cmd_cancel(args: CancelArgs) -> int | None:
             logger.error("Failed to cancel %s: %s", uuid, exc)
             failed += 1
     return 1 if failed else None
+
+
+def cmd_wait(args: WaitArgs) -> int | None:
+    client = CLIENT.get()
+    formatter = FORMATTER.get()
+    # Pin uuid/status/timed_out/duration up front for the typical eyeball
+    # scan ("did it finish? how long?"); `error` stays in the trailing slot.
+    formatter.configure(
+        head=("uuid", "status", "timed_out", "duration"),
+        tail=("error",),
+    )
+
+    if args.all:
+        if args.uuids:
+            logger.warning("--all overrides explicit UUIDs; waiting for all active")
+        uuids = list_active(client)
+        if not uuids:
+            logger.info("No active operations to wait for")
+            return None
+    else:
+        if not args.uuids:
+            logger.error("Provide at least one UUID, or use --all")
+            return 1
+        uuids = list(args.uuids)
+
+    deadline = time.monotonic() + args.timeout
+    pending = set(uuids)
+    exit_status = 0
+    sleep_time = 0.5
+
+    while pending and time.monotonic() < deadline:
+        for uuid in list(pending):
+            resp = client.get(f"/v1/operations/{uuid}")
+            op = json.loads(resp.read())
+            if op.get("status") in TERMINAL_STATUSES:
+                pending.discard(uuid)
+                formatter(**{**op, "timed_out": False})
+                if op.get("status") != "SUCCESS":
+                    exit_status = max(exit_status, 1)
+        formatter.flush()
+        if not pending:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(sleep_time, max(remaining, 0.0)))
+        sleep_time = min(5.0, sleep_time * 2)
+
+    # Anything still pending after the deadline timed out; emit one last
+    # row per UUID with its observed non-terminal status so the user sees
+    # what state each operation was stuck in.
+    for uuid in sorted(pending):
+        try:
+            resp = client.get(f"/v1/operations/{uuid}")
+            op = json.loads(resp.read())
+        except ApiError as exc:
+            logger.error("Failed to fetch %s: %s", uuid, exc)
+            continue
+        formatter(**{**op, "timed_out": True})
+    if pending:
+        formatter.flush()
+        logger.warning(
+            "Timeout: %d operation(s) did not finish in %ds",
+            len(pending),
+            args.timeout,
+        )
+        exit_status = max(exit_status, 1)
+
+    return exit_status or None
