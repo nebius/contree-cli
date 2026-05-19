@@ -13,7 +13,6 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any, cast
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
@@ -70,6 +69,7 @@ _TERMINAL = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 def cmd_show(args: ShowArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
+    formatter.configure(tail=("error",))
     store = SESSION_STORE.get()
 
     try:
@@ -88,9 +88,6 @@ def cmd_show(args: ShowArgs) -> int | None:
         if op.get("status") in _TERMINAL:
             store.cache[cache_key] = op
 
-    duration = (
-        timedelta(seconds=op["duration"]) if op.get("duration") is not None else None
-    )
     result = op.get("result") or {}
     metadata = op.get("metadata") or {}
     instance_result = metadata.get("result") or {}
@@ -105,14 +102,13 @@ def cmd_show(args: ShowArgs) -> int | None:
         status = "FAILED"
 
     formatter(
-        uuid=op["uuid"],
-        kind=op["kind"],
-        status=status,
-        duration=duration,
-        exit_code=exit_code,
-        error=op.get("error") or "",
-        image=result.get("image") or "",
-        tag=result.get("tag") or "",
+        **{
+            **op,
+            "status": status,
+            "exit_code": exit_code,
+            "image": result.get("image") or "",
+            "tag": result.get("tag") or "",
+        }
     )
     formatter.flush()
 

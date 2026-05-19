@@ -14,15 +14,13 @@ import itertools
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import datetime
 
 from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
 from contree_cli.output import OutputFormatter
 from contree_cli.types import (
     FLAGS,
     isoformat_datetime,
-    parse_datetime,
     parse_interval,
     positive_int,
 )
@@ -119,35 +117,9 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     return cmd_ps, PsArgs
 
 
-DATETIME_FIELDS = frozenset({"created_at", "started_at", "finished_at", "updated_at"})
-
-
-def transform_field(key: str, value: Any) -> Any:
-    """Light-touch typing for known fields, pass-through for everything else."""
-    if value is None:
-        return "" if key == "error" else None
-    if key in DATETIME_FIELDS:
-        return parse_datetime(value)
-    if key == "duration":
-        return timedelta(seconds=value)
-    return value
-
-
-def emit_op(formatter: OutputFormatter, op: dict[str, Any], *, quiet: bool) -> None:
-    if quiet:
-        print(op["uuid"])
-        return
-    row = {
-        key: transform_field(key, value)
-        for key, value in op.items()
-        if key != "error" and not isinstance(value, (dict, list))
-    }
-    row["error"] = transform_field("error", op.get("error"))
-    formatter(**row)
-
-
 def cmd_ps(args: PsArgs) -> None:
     formatter: OutputFormatter = FORMATTER.get()
+    formatter.configure(tail=("error",))
     client = CLIENT.get()
 
     status: str | None = None
@@ -189,18 +161,17 @@ def cmd_ps(args: PsArgs) -> None:
             if limit is not None and emitted >= limit:
                 hit_limit = True
                 break
-            emit_op(formatter, op, quiet=args.quiet)
+            if args.quiet:
+                print(op["uuid"])
+            else:
+                formatter(**op)
             emitted += 1
+        formatter.flush()
         if hit_limit:
             break
         if len(operations) < page_size:
             return
         offset += len(operations)
-        if limit is None or emitted < limit:
-            logger.info(
-                "Fetched %d operations so far... (press Ctrl+C to break)",
-                emitted,
-            )
 
     if limit is None:
         return

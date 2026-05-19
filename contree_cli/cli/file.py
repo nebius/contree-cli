@@ -39,7 +39,6 @@ from contree_cli.session import SessionStore
 from contree_cli.types import (
     FLAGS,
     isoformat_datetime,
-    parse_datetime,
     parse_interval,
     positive_int,
 )
@@ -343,15 +342,8 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
                     source=source,
                 )
                 continue
-            row: dict[str, object] = {}
-            for key, value in entry.items():
-                if isinstance(value, (dict, list)):
-                    continue
-                if key in {"created_at", "updated_at"} and isinstance(value, str):
-                    value = parse_datetime(value)
-                row[key] = value
-            row["source"] = source
-            formatter(**row)
+            formatter(**{**entry, "source": source})
+        formatter.flush()
         emitted += len(files)
         if len(files) < page_size:
             return None

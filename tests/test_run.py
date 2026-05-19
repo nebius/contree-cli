@@ -171,6 +171,19 @@ class TestPollLoop:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["status"] == "SUCCESS"
 
+    def test_unknown_field_passes_through(self, contree_client, session_store, capsys):
+        """New server fields on the operation reach JSON output as-is."""
+        session_store.set_image(IMG_UUID, kind="test")
+        args = _default_args()
+        op_body = json.loads(_op_response(status="SUCCESS", exit_code=0).body)
+        op_body["session_key"] = "sess-1"
+        op_body["future_field"] = "anything"
+        responses = [_spawn_response(), FakeResponse.json(op_body)]
+        _run_cmd(contree_client, args, responses, store=session_store)
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["session_key"] == "sess-1"
+        assert parsed["future_field"] == "anything"
+
     def test_poll_default_shows_stdout(self, contree_client, session_store, capsys):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()

@@ -14,7 +14,6 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, cast
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
@@ -51,6 +50,7 @@ class LsArgs(ArgumentsProtocol):
 def cmd_ls(args: LsArgs) -> None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
+    formatter.configure(tail=("type",))
     store = SESSION_STORE.get()
     image = store.current_image
     uuid = resolve_image(client, image)
@@ -83,11 +83,10 @@ def cmd_ls(args: LsArgs) -> None:
         else:
             ftype = "-"
         formatter(
-            path=f["path"],
-            size=f["size"],
-            mode=format(f["mode"], "o"),
-            owner=f.get("owner", f.get("uid", "")),
-            group=f.get("group", f.get("gid", "")),
-            mtime=datetime.fromtimestamp(f["mtime"], tz=timezone.utc),
-            type=ftype,
+            **{
+                **f,
+                "owner": f.get("owner") or f.get("uid", ""),
+                "group": f.get("group") or f.get("gid", ""),
+                "type": ftype,
+            }
         )

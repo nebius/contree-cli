@@ -102,7 +102,7 @@ def main() -> None:
             log.error("User interrupted")
             exit(1)
         finally:
-            formatter.flush()
+            formatter.close()
 
     exit(exit_code or 0)
 

@@ -647,6 +647,31 @@ class TestWait:
         assert data["title"] == "sleep 1"
         assert session_store.current_image == "img-1"
 
+    def test_wait_unknown_field_passes_through(
+        self, contree_client, session_store, capsys
+    ) -> None:
+        """New server fields reach the row even when not hardcoded."""
+        SESSION_STORE.set(session_store)
+        FORMATTER.set(JSONFormatter())
+        session_store.set_image("img-1", kind="use")
+        contree_client.respond_json(
+            {
+                "uuid": "op-x",
+                "status": "SUCCESS",
+                "kind": "instance",
+                "duration": 1,
+                "session_key": "sess-1",
+                "future_field": "anything",
+                "metadata": {"result": {"state": {"exit_code": 0}}},
+                "result": {"image": "img-new"},
+            }
+        )
+        cmd_wait(WaitArgs(op_ids=["op-x"]))
+        out = capsys.readouterr().out.strip().splitlines()
+        data = json.loads(out[0])
+        assert data["session_key"] == "sess-1"
+        assert data["future_field"] == "anything"
+
     def test_show_defaults_to_last_20_and_logs_info(
         self,
         store: SessionStore,

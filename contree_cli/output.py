@@ -7,12 +7,73 @@ import json
 import logging
 import shutil
 import sys
-from datetime import datetime, timedelta
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
+from typing import Any
 
-from contree_cli.types import STDOUT_IS_A_TTY, Colors
+from contree_cli.types import STDOUT_IS_A_TTY, Colors, parse_datetime
 
 log = logging.getLogger(__name__)
+
+
+DATETIME_FIELDS = frozenset(
+    {"created_at", "started_at", "finished_at", "updated_at"},
+)
+
+
+def transform_field(key: str, value: Any) -> Any:
+    """Apply field-name based type conversion for known API shapes."""
+    if key in DATETIME_FIELDS and isinstance(value, str):
+        return parse_datetime(value)
+    if key == "duration" and isinstance(value, (int, float)):
+        return timedelta(seconds=value)
+    if (key == "error" and value is None) or (key == "tag" and value is None):
+        return ""
+    if key == "mode" and isinstance(value, int):
+        return format(value, "o")
+    if key == "mtime" and isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    return value
+
+
+class ListSorter:
+    """Reorder an API record dict for table output.
+
+    Drops nested values (dict/list), applies light typing to known fields
+    (timestamps, duration, mode, mtime, nullable error/tag), and yields
+    columns in a stable order: ``head`` first, then any new keys
+    discovered in record order (memoised across calls so the order stays
+    stable across rows), then ``tail`` last. Keys named in
+    ``head``/``tail`` that are absent from the record are skipped.
+    """
+
+    def __init__(
+        self,
+        *,
+        head: tuple[str, ...] = (),
+        tail: tuple[str, ...] = (),
+    ) -> None:
+        self.tail = tail
+        self.columns: list[str] = list(head)
+        self.seen: set[str] = set(head) | set(tail)
+
+    def order(self, fields: dict[str, Any]) -> OrderedDict[str, Any]:
+        for key, value in fields.items():
+            if key in self.seen or isinstance(value, (dict, list)):
+                continue
+            self.columns.append(key)
+            self.seen.add(key)
+
+        out: OrderedDict[str, Any] = OrderedDict()
+        for key in (*self.columns, *self.tail):
+            if key not in fields:
+                continue
+            value = fields[key]
+            if isinstance(value, (dict, list)):
+                continue
+            out[key] = transform_field(key, value)
+        return out
 
 
 @functools.singledispatch
@@ -23,6 +84,9 @@ def _format_value(value: object) -> str:
 
 @_format_value.register
 def _(value: datetime) -> str:
+    # API returns UTC; render in the user's local timezone for readability.
+    if value.tzinfo is not None:
+        value = value.astimezone()
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -107,69 +171,110 @@ def _fit_columns(
 
 
 class OutputFormatter:
-    """Base formatter - subclasses decide the serialisation style."""
+    """Base formatter - subclasses decide the serialisation style.
+
+    Maintains an internal :class:`ListSorter` that drops nested values,
+    applies light typing to known fields (timestamps, duration, mode,
+    mtime, nullable error/tag), and reorders columns according to
+    optional ``head``/``tail`` configured via :meth:`configure`.
+    """
 
     # Not suitable for streaming stdout/stderr output (e.g. from `run`)
     STREAM = False
 
+    def __init__(self) -> None:
+        self.sorter = ListSorter()
+
+    def configure(
+        self,
+        *,
+        head: tuple[str, ...] = (),
+        tail: tuple[str, ...] = (),
+    ) -> None:
+        """Configure column ordering for this formatter."""
+        self.sorter = ListSorter(head=head, tail=tail)
+
     def __call__(self, **kwargs: object) -> None:
+        self.write(self.sorter.order(kwargs))
+
+    def write(self, row: OrderedDict[str, Any]) -> None:
         raise NotImplementedError
 
     def flush(self) -> None:
         """Flush any buffered output. No-op for streaming formatters."""
 
+    def close(self) -> None:
+        """Finalise the output stream. Defaults to a final flush."""
+        self.flush()
+
 
 class CSVFormatter(OutputFormatter):
     def __init__(self) -> None:
+        super().__init__()
         self._header_written = False
 
-    def __call__(self, **kwargs: object) -> None:
+    def write(self, row: OrderedDict[str, Any]) -> None:
         buf = io.StringIO()
         writer = csv.writer(buf)
         if not self._header_written:
-            writer.writerow(kwargs.keys())
+            writer.writerow(row.keys())
             self._header_written = True
-        writer.writerow(_format_value(v) for v in kwargs.values())
+        writer.writerow(_format_value(v) for v in row.values())
         sys.stdout.write(buf.getvalue())
 
 
 class TSVFormatter(OutputFormatter):
     def __init__(self) -> None:
+        super().__init__()
         self._header_written = False
 
-    def __call__(self, **kwargs: object) -> None:
+    def write(self, row: OrderedDict[str, Any]) -> None:
         buf = io.StringIO()
         writer = csv.writer(buf, dialect="excel-tab")
         if not self._header_written:
-            writer.writerow(kwargs.keys())
+            writer.writerow(row.keys())
             self._header_written = True
-        writer.writerow(_format_value(v) for v in kwargs.values())
+        writer.writerow(_format_value(v) for v in row.values())
         sys.stdout.write(buf.getvalue())
 
 
 class JSONFormatter(OutputFormatter):
     STREAM = True
 
-    def __call__(self, **kwargs: object) -> None:
-        sys.stdout.write(json.dumps(kwargs, default=_json_default) + "\n")
+    def write(self, row: OrderedDict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(row, default=_json_default) + "\n")
 
 
 class JSONPrettyFormatter(OutputFormatter):
     STREAM = True
 
     def __init__(self) -> None:
-        self._rows: list[dict[str, object]] = []
+        super().__init__()
+        self._rows: list[OrderedDict[str, Any]] = []
+        self._opened = False
+        self._first_row = True
 
-    def __call__(self, **kwargs: object) -> None:
-        self._rows.append(kwargs)
+    def write(self, row: OrderedDict[str, Any]) -> None:
+        self._rows.append(row)
 
     def flush(self) -> None:
         if not self._rows:
             return
-        sys.stdout.write(
-            json.dumps(self._rows, indent=2, default=_json_default) + "\n",
-        )
+        if not self._opened:
+            sys.stdout.write("[\n")
+            self._opened = True
+        for row in self._rows:
+            prefix = "" if self._first_row else ",\n"
+            self._first_row = False
+            sys.stdout.write(prefix + json.dumps(row, indent=2, default=_json_default))
         self._rows.clear()
+
+    def close(self) -> None:
+        self.flush()
+        if self._opened:
+            sys.stdout.write("\n]\n")
+            self._opened = False
+            self._first_row = True
 
 
 class TableFormatter(OutputFormatter):
@@ -198,59 +303,71 @@ class TableFormatter(OutputFormatter):
     )
 
     def __init__(self) -> None:
-        self._rows: list[dict[str, object]] = []
+        super().__init__()
+        self._rows: list[OrderedDict[str, Any]] = []
+        # Layout decided on the first non-empty flush, reused on subsequent
+        # flushes so paginated output keeps the same column alignment.
+        self._columns: list[str] | None = None
+        self._widths: dict[str, int] | None = None
+        self._col_colors: dict[str, Colors] = {}
 
-    def __call__(self, **kwargs: object) -> None:
-        self._rows.append(kwargs)
+    def write(self, row: OrderedDict[str, Any]) -> None:
+        self._rows.append(row)
 
     def flush(self) -> None:
         if not self._rows:
             return
-        columns = list(self._rows[0].keys())
-        widths = {col: len(col) for col in columns}
-        # Split each cell into lines and compute natural column widths.
-        split_rows: list[dict[str, list[str]]] = []
-        for row in self._rows:
-            split_row: dict[str, list[str]] = {}
-            for col in columns:
-                lines = _format_value(row.get(col, "")).split("\n")
-                split_row[col] = lines
-                for line in lines:
-                    widths[col] = max(widths[col], len(line))
-            split_rows.append(split_row)
-        # Constrain to terminal width when outputting to a TTY.
-        truncated = False
-        if STDOUT_IS_A_TTY:
-            term_width = shutil.get_terminal_size().columns
-            separator_space = (len(columns) - 1) * 2
-            available = term_width - separator_space
-            if sum(widths.values()) > available > 0:
-                widths, truncated = _fit_columns(
-                    widths,
-                    columns,
-                    available,
-                    self.MIN_COL_WIDTH,
-                )
-        # Assign a color per column (cycling through the palette).
-        palette = self.COLUMN_PALETTE
-        col_colors: dict[str, Colors] = {}
-        if STDOUT_IS_A_TTY:
-            for idx, col in enumerate(columns):
-                col_colors[col] = palette[idx % len(palette)]
-        # Render header (bold when TTY).
-        header_parts: list[str] = []
-        for col in columns:
-            padded = _truncate(
-                col.upper(),
-                widths[col],
-                self.ELLIPSIS,
-            ).ljust(widths[col])
+        first_flush = self._columns is None
+        if first_flush:
+            columns = list(self._rows[0].keys())
+            widths = {col: len(col) for col in columns}
+            for row in self._rows:
+                for col in columns:
+                    for line in _format_value(row.get(col, "")).split("\n"):
+                        widths[col] = max(widths[col], len(line))
+            truncated = False
             if STDOUT_IS_A_TTY:
-                padded = Colors.BOLD(padded)
-            header_parts.append(padded)
-        sys.stdout.write("  ".join(header_parts) + "\n")
-        # Render rows.
-        for split_row in split_rows:
+                term_width = shutil.get_terminal_size().columns
+                separator_space = (len(columns) - 1) * 2
+                available = term_width - separator_space
+                if sum(widths.values()) > available > 0:
+                    widths, truncated = _fit_columns(
+                        widths,
+                        columns,
+                        available,
+                        self.MIN_COL_WIDTH,
+                    )
+            self._columns = columns
+            self._widths = widths
+            if STDOUT_IS_A_TTY:
+                for idx, col in enumerate(columns):
+                    self._col_colors[col] = self.COLUMN_PALETTE[
+                        idx % len(self.COLUMN_PALETTE)
+                    ]
+            header_parts: list[str] = []
+            for col in columns:
+                padded = _truncate(
+                    col.upper(),
+                    widths[col],
+                    self.ELLIPSIS,
+                ).ljust(widths[col])
+                if STDOUT_IS_A_TTY:
+                    padded = Colors.BOLD(padded)
+                header_parts.append(padded)
+            sys.stdout.write("  ".join(header_parts) + "\n")
+            if truncated:
+                log.warning(
+                    "Output truncated to fit terminal;"
+                    " use --format json to see full values",
+                )
+        assert self._columns is not None
+        assert self._widths is not None
+        columns = self._columns
+        widths = self._widths
+        for row in self._rows:
+            split_row = {
+                col: _format_value(row.get(col, "")).split("\n") for col in columns
+            }
             height = max(len(split_row[col]) for col in columns)
             for i in range(height):
                 parts: list[str] = []
@@ -262,19 +379,14 @@ class TableFormatter(OutputFormatter):
                         widths[col],
                         self.ELLIPSIS,
                     ).ljust(widths[col])
-                    if col in col_colors:
+                    if col in self._col_colors:
                         color = self.VALUE_COLORS.get(
                             cell.strip(),
-                            col_colors[col],
+                            self._col_colors[col],
                         )
                         padded = color(padded)
                     parts.append(padded)
                 sys.stdout.write("  ".join(parts) + "\n")
-        if truncated:
-            log.warning(
-                "Output truncated to fit terminal;"
-                " use --format json to see full values",
-            )
         self._rows.clear()
 
 
@@ -286,14 +398,15 @@ class PlainFormatter(OutputFormatter):
     STREAM = True
 
     def __init__(self) -> None:
+        super().__init__()
         self._count = 0
 
-    def __call__(self, **kwargs: object) -> None:
+    def write(self, row: OrderedDict[str, Any]) -> None:
         if self._count:
             sys.stdout.write("---\n")
         self._count += 1
-        key_width = max(len(k) for k in kwargs) if kwargs else 0
-        for key, val in kwargs.items():
+        key_width = max(len(k) for k in row) if row else 0
+        for key, val in row.items():
             text = _format_value(val)
             label = f"{key}:".ljust(key_width + 2)
             lines = text.split("\n")
@@ -369,10 +482,11 @@ try:
         STREAM = True
 
         def __init__(self) -> None:
-            self._rows: list[dict[str, object]] = []
+            super().__init__()
+            self._rows: list[OrderedDict[str, Any]] = []
 
-        def __call__(self, **kwargs: object) -> None:
-            self._rows.append(kwargs)
+        def write(self, row: OrderedDict[str, Any]) -> None:
+            self._rows.append(row)
 
         def flush(self) -> None:
             if not self._rows:

@@ -146,6 +146,16 @@ class TestCmdShow:
         assert parsed["uuid"] == "op-abc"
         assert parsed["duration"] == 5.0
 
+    def test_unknown_field_passes_through(self, contree_client, capsys, session_store):
+        """New server fields reach the row even when not hardcoded."""
+        op = _make_op()
+        op["session_key"] = "sess-1"
+        op["future_field"] = "anything"
+        _run_cmd(contree_client, op, formatter=JSONFormatter(), store=session_store)
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["session_key"] == "sess-1"
+        assert parsed["future_field"] == "anything"
+
     def test_table_output(self, contree_client, capsys, session_store):
         fmt = TableFormatter()
         _run_cmd(contree_client, _make_op(), formatter=fmt, store=session_store)

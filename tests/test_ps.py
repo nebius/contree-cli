@@ -210,23 +210,19 @@ class TestPsPagination:
         assert "offset=0" in paths[0]
         assert f"offset={PAGE_SIZE}" in paths[1]
 
-    def test_progress_logged_per_full_page(self, contree_client, caplog):
-        """Each completed full page emits a progress line at INFO level."""
-        import logging
-
+    def test_pages_flushed_progressively(self, contree_client, capsys):
+        """Each full page is flushed as it completes (streaming output)."""
         page1 = [_make_op(i) for i in range(PAGE_SIZE)]
         page2 = [_make_op(i) for i in range(PAGE_SIZE, PAGE_SIZE + 3)]
-        with caplog.at_level(logging.INFO, logger="contree_cli.cli.ps"):
-            _run_cmd_pages(
-                contree_client,
-                [page1, page2],
-                show_max=None,
-            )
-        msgs = [r.getMessage() for r in caplog.records]
-        assert any(
-            f"Fetched {PAGE_SIZE} operations so far" in m and "Ctrl+C" in m
-            for m in msgs
+        _run_cmd_pages(
+            contree_client,
+            [page1, page2],
+            show_max=None,
         )
+        out = capsys.readouterr().out
+        # All rows from both pages should appear in output.
+        assert f"op-{PAGE_SIZE - 1}" in out
+        assert f"op-{PAGE_SIZE + 2}" in out
 
 
 class TestPsActiveFilter:

@@ -598,6 +598,7 @@ def cmd_show(args: ShowArgs) -> int | None:
 def cmd_wait(args: WaitArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
+    formatter.configure(tail=("error",))
 
     store = SESSION_STORE.get()
     op_ids = list(args.op_ids)
@@ -665,11 +666,6 @@ def cmd_wait(args: WaitArgs) -> int | None:
             op = json.loads(resp.read())
             status = op.get("status", "")
             if status in WAIT_TERMINAL_STATUSES:
-                duration = (
-                    timedelta(seconds=op["duration"])
-                    if op.get("duration") is not None
-                    else None
-                )
                 metadata = op.get("metadata") or {}
                 instance_result = metadata.get("result") or {}
                 state = instance_result.get("state") or {}
@@ -709,13 +705,13 @@ def cmd_wait(args: WaitArgs) -> int | None:
                             operation_uuid=op_id,
                         )
                 formatter(
-                    uuid=op_id,
-                    status=effective_status,
-                    kind=op.get("kind", ""),
-                    duration=duration,
-                    exit_code=exit_code,
-                    title=title,
-                    error=op.get("error") or "",
+                    **{
+                        **op,
+                        "uuid": op_id,
+                        "status": effective_status,
+                        "exit_code": exit_code,
+                        "title": title,
+                    }
                 )
                 failure_exit = 0
                 if effective_status != "SUCCESS":

@@ -23,7 +23,6 @@ from contree_cli.types import (
     FLAGS,
     ArgumentsFormatter,
     isoformat_datetime,
-    parse_datetime,
     parse_interval,
     positive_int,
 )
@@ -287,25 +286,12 @@ def cmd_images(args: ImagesArgs) -> None:
         if not images:
             return
         for image in images:
-            row: dict[str, object] = {}
-            for key, value in image.items():
-                if isinstance(value, (dict, list)):
-                    continue
-                if key == "created_at" and isinstance(value, str):
-                    value = parse_datetime(value)
-                if key == "tag" and value is None:
-                    value = ""
-                row[key] = value
-            formatter(**row)
+            formatter(**image)
+        formatter.flush()
         emitted += len(images)
         if len(images) < page_size:
             return
         offset += len(images)
-        if emitted < args.limit:
-            logger.info(
-                "Fetched %d images so far... (press Ctrl+C to break)",
-                emitted,
-            )
 
     # Hit the limit. Probe one extra record (offset=emitted, limit=1) to
     # detect truncation without re-fetching a full page.
@@ -353,6 +339,7 @@ def _derive_tag(ref: str) -> str:
 def cmd_import(args: ImportArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
+    formatter.configure(tail=("error",))
 
     # 1. Build credentials (prompt for password when --username given)
     credentials: dict[str, str] | None = None
@@ -411,10 +398,12 @@ def cmd_import(args: ImportArgs) -> int | None:
                     if op["status"] != "SUCCESS":
                         failed = True
                     formatter(
-                        uuid=op_uuids[idx],
-                        status=op["status"],
-                        registry_url=imports[idx][0],
-                        image=(op.get("result") or {}).get("image", ""),
+                        **{
+                            **op,
+                            "uuid": op_uuids[idx],
+                            "registry_url": imports[idx][0],
+                            "image": (op.get("result") or {}).get("image", ""),
+                        }
                     )
     except KeyboardInterrupt:
         # Cancel ALL operations on Ctrl+C

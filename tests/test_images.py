@@ -201,24 +201,16 @@ class TestImagesPagination:
         out = capsys.readouterr().out
         assert out.count("uuid-") == PAGE_SIZE + 5
 
-    def test_progress_logged_per_full_page(self, contree_client, caplog):
-        """Each completed full page emits a progress line at INFO level."""
-        import logging
-
+    def test_pages_flushed_progressively(self, contree_client, capsys):
+        """Each full page is flushed as it completes (streaming output)."""
         page1 = [_make_image(i) for i in range(PAGE_SIZE)]
         page2 = [_make_image(i) for i in range(PAGE_SIZE, PAGE_SIZE * 2)]
         page3 = [_make_image(i) for i in range(PAGE_SIZE * 2, PAGE_SIZE * 2 + 3)]
-        with caplog.at_level(logging.INFO, logger="contree_cli.cli.images"):
-            _run_cmd_pages(contree_client, [page1, page2, page3])
-        msgs = [r.getMessage() for r in caplog.records]
-        assert any(
-            f"Fetched {PAGE_SIZE} images so far" in m and "Ctrl+C" in m for m in msgs
-        )
-        assert any(
-            f"Fetched {PAGE_SIZE * 2} images so far" in m and "Ctrl+C" in m
-            for m in msgs
-        )
-        assert not any(f"{PAGE_SIZE * 2 + 3}" in m for m in msgs)
+        _run_cmd_pages(contree_client, [page1, page2, page3])
+        out = capsys.readouterr().out
+        assert f"uuid-{PAGE_SIZE - 1}" in out
+        assert f"uuid-{PAGE_SIZE * 2 - 1}" in out
+        assert f"uuid-{PAGE_SIZE * 2 + 2}" in out
 
     def test_default_limit_matches_constant(self):
         assert LIMIT_DEFAULT > 0
