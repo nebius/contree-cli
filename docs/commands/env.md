@@ -1,4 +1,4 @@
-# env
+# env - Manage session environment variables
 
 Manage session-level environment variables. Variables set with `env` are
 applied to every `contree run` automatically. Per-run `-e` flags override

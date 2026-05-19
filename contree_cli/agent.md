@@ -265,13 +265,15 @@ Detached mode (-d):
 
 Monitoring background operations:
   Use the `operation` namespace (alias `op`) when juggling several
-  detached runs. `op ls` is `ps`; `op show` and `op cancel` accept
-  multiple UUIDs in one call.
+  detached runs. `op ls` is the canonical command — `contree ps` is
+  its top-level shortcut. `op show` and `op cancel` accept multiple
+  UUIDs in one call (`op cancel` has aliases `kill` and `k`).
 
-  contree op ls                           list operations (= ps)
+  contree op ls                           list operations (= contree ps)
   contree op ls -a -S EXECUTING           filter active runs
   contree op show UUID1 UUID2 UUID3       inspect a batch in one call
   contree op cancel UUID1 UUID2           cancel selected operations
+  contree kill UUID1 UUID2                same -- top-level shortcut
   contree op cancel --all                 cancel every active op (rare)
 
   Fan-out + join pattern:
@@ -423,13 +425,13 @@ All commands
   build [CONTEXT]         Build image from Dockerfile (aliases: bd)
   images                  List/import images (aliases: i, img)
   tag [IMAGE] TAG         Tag image (aliases: t)
-  ps                      List operations
-  kill UUID               Cancel operation
+  ps                      List operations (shortcut for `operation ls`)
+  kill UUID [UUID...]     Cancel operations (shortcut for `operation cancel`); `--all` cancels every active
   show UUID               Show operation result
-  operation list          List operations (aliases: op ls)
-  operation show UUID...  Show one or more operation results (aliases: op)
+  operation list          List operations (aliases: ls)
+  operation show UUID...  Show one or more operation results (aliases: sh)
   operation cancel UUID...
-                          Cancel one or more operations (or --all)
+                          Cancel one or more operations (aliases: kill, k); `--all` cancels every active
   ls [PATH]               List files in image (no VM)
   cat PATH                Show file content (no VM)
   cp PATH DEST            Download file from image

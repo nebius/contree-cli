@@ -1,4 +1,4 @@
-# use
+# use - Choose an image for the session
 
 Set the session image or show the current session state.
 

@@ -24,7 +24,7 @@ ARG_SOURCES: dict[ArgKey, str] = {
     (("use",), "image"): "image",
     (("tag",), "args"): "image",
     # show / kill / wait -- operation UUIDs.
-    (("show",), "uuid"): "operation",
+    (("show",), "uuids"): "operation",
     (("kill",), "uuids"): "operation",
     (("session", "wait"), "op_ids"): "operation",
     (("operation", "show"), "uuids"): "operation",

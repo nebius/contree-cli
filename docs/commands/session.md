@@ -1,4 +1,4 @@
-# session
+# session - Manage sessions, branches, history
 
 Manage session branches and history. Sessions track the image state as you
 run commands, with support for branching and rollback.

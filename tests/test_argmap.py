@@ -107,7 +107,7 @@ class TestRepresentativeMappings:
     @pytest.mark.parametrize(
         "command_path,dest,expected",
         [
-            (("show",), "uuid", "operation"),
+            (("show",), "uuids", "operation"),
             (("use",), "image", "image"),
             (("tag",), "args", "image"),
             (("ls",), "path", "sandbox-path"),

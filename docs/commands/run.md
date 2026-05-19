@@ -1,4 +1,4 @@
-# run
+# run - Execute a command in the sandbox
 
 Spawn a sandbox instance from the session image and execute a command.
 

@@ -1,4 +1,4 @@
-# operation (op)
+# operation - Manage operations
 
 Manage operations under a single namespace. Aggregates `ps` (list),
 `show` (inspect), and `kill` (cancel), and adds **multi-UUID support** to
@@ -11,8 +11,8 @@ Manage operations under a single namespace. Aggregates `ps` (list),
 | Subcommand | Aliases | Description |
 |------------|---------|-------------|
 | `list` | `ls` | List operations. Same flags as `contree ps`. |
-| `show UUID [UUID...]` | -- | Show one or more operation results. |
-| `cancel UUID [UUID...]` | -- | Cancel one or more operations (or `--all`). |
+| `show UUID [UUID...]` | `sh` | Show one or more operation results. |
+| `cancel UUID [UUID...]` | `kill`, `k` | Cancel one or more operations (or `--all`). |
 
 ## Examples
 
@@ -111,9 +111,10 @@ contree op cancel --all ignored-1
 
 ## Comparison with the top-level commands
 
-`contree op` does not replace `ps`/`show`/`kill` -- those keep their
-single-target semantics. The new namespace exists for grouping and for
-multi-UUID workflows:
+`contree ps` and `contree kill` are top-level **shortcuts** that share
+the same argparse setup and handler as `op list` / `op cancel`
+respectively — there is no separate implementation. `contree show`
+keeps its own single-UUID handler (the multi-UUID `op show` wraps it).
 
 | Need | Use |
 |------|-----|
@@ -121,12 +122,12 @@ multi-UUID workflows:
 | Inspect one operation | `contree show UUID` *or* `contree op show UUID` |
 | Inspect multiple | `contree op show UUID1 UUID2 ...` |
 | Cancel one operation | `contree kill UUID` *or* `contree op cancel UUID` |
-| Cancel multiple | `contree op cancel UUID1 UUID2 ...` |
+| Cancel multiple | `contree kill UUID1 UUID2 ...` *or* `contree op cancel UUID1 UUID2 ...` |
 | Cancel everything active | `contree kill --all` *or* `contree op cancel --all` |
 
 ## See also
 
-- {doc}`ps` -- single-purpose list command (delegated to by `op list`)
+- {doc}`ps` -- top-level shortcut for `op list`
 - {doc}`show` -- single-UUID inspect (delegated to by `op show`)
-- {doc}`kill` -- single-UUID cancel
+- {doc}`kill` -- top-level shortcut for `op cancel`
 - {doc}`run` -- the command that creates operations

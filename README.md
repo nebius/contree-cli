@@ -151,9 +151,12 @@ The shell provides tab completion for commands, paths, image tags, and operation
 | `run [-- CMD]` | `r` | Spawn a sandbox instance, execute command |
 | `images [--prefix]` | `i`, `img` | List and import images |
 | `tag UUID TAG` | `t` | Tag or untag an image |
-| `ps` | | List operations (instances, imports) |
-| `kill UUID` | | Cancel an operation (`--all` for all) |
+| `ps` | | List operations (shortcut for `operation ls`) |
+| `kill UUID [UUID...]` | | Cancel operations (shortcut for `operation cancel`; `--all` for all active) |
 | `show UUID` | | Show operation result |
+| `operation list` | `op`, `ls` | Same as `ps` (canonical) |
+| `operation show UUID...` | `sh` | Multi-UUID inspect |
+| `operation cancel UUID...` | `kill`, `k` | Multi-UUID cancel (or `--all`) |
 | `ls [PATH]` | | List files in session image (no VM) |
 | `cat PATH` | | Show file content from session image (no VM) |
 | `cp PATH DEST` | | Download file from image to local path |

@@ -1,9 +1,11 @@
-"""Show the result of an operation.
+"""Per-UUID inspect handler used by `contree operation show` (and its
+top-level shortcut ``contree show``).
 
-Fetches the operation by UUID and displays its status, duration, exit
-code, result image, and captured stdout/stderr. Terminal operations
-(SUCCESS, FAILED, CANCELLED) are cached locally to avoid redundant API
-calls.
+The top-level ``show`` command is registered against
+:func:`contree_cli.cli.operation.setup_show_parser`; that handler loops
+over each UUID and calls :func:`cmd_show` here. This module owns the
+single-UUID logic: ``@N`` history-reference resolution, terminal
+operation caching, and stdout/stderr decoding.
 """
 
 from __future__ import annotations
@@ -15,19 +17,12 @@ import sys
 from dataclasses import dataclass
 from typing import Any, cast
 
-from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
+from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol
 from contree_cli.client import decode_stream
 from contree_cli.output import DefaultFormatter, JSONFormatter, JSONPrettyFormatter
 from contree_cli.session import SessionStore
 
 logger = logging.getLogger(__name__)
-
-EPILOG = """\
-for coding agents:
-  read-only command
-  terminal operation states are cached locally
-  use -f json for structured metadata + decoded stdout/stderr fields
-"""
 
 
 @dataclass(frozen=True)
@@ -37,11 +32,6 @@ class ShowArgs(ArgumentsProtocol):
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> ShowArgs:
         return cls(uuid=ns.uuid)
-
-
-def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
-    p.add_argument("uuid", help="Operation UUID or session entry (e.g., @12)")
-    return cmd_show, ShowArgs
 
 
 def _resolve_operation_uuid(raw: str, store: SessionStore) -> str:

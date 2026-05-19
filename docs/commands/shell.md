@@ -1,4 +1,4 @@
-# shell
+# shell - Interactive REPL
 
 Start an interactive REPL for managing sessions and running sandbox commands.
 

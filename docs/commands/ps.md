@@ -1,4 +1,14 @@
-# ps
+# ps - List activity
+
+:::{note}
+**`contree ps` is a top-level shortcut for {doc}`operation list <operation>` (`contree op ls`).**
+
+Both share one argparse setup and one handler — `ps` exists for the
+Docker-like UX. New flags or columns added to `operation list` apply
+automatically here. See the {doc}`operation` page for the full
+description of dynamic columns, error handling, and multi-UUID
+workflows in the operation namespace.
+:::
 
 List operations and their statuses. By default shows only active operations
 (PENDING, ASSIGNED, EXECUTING).
@@ -54,7 +64,7 @@ to the last column. See {doc}`operation` for the full description.
 
 ## See also
 
-- {doc}`show` -- inspect a specific operation
-- {doc}`kill` -- cancel a running operation
-- {doc}`operation` -- group + multi-UUID variants (`contree op ls/show/cancel`)
-- {doc}`/tutorial/workflows` -- monitoring and scripting patterns
+- {doc}`operation` — the canonical command (`contree ps` is its shortcut)
+- {doc}`show` — inspect a specific operation
+- {doc}`kill` — cancel a running operation
+- {doc}`/tutorial/workflows` — monitoring and scripting patterns

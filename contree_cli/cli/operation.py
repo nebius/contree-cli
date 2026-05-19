@@ -112,6 +112,17 @@ def setup_cancel_parser(p: argparse.ArgumentParser) -> SetupResult:
     return cmd_cancel, CancelArgs
 
 
+def setup_show_parser(p: argparse.ArgumentParser) -> SetupResult:
+    """Configure the show parser used by both `operation show` and `show`."""
+    p.add_argument(
+        "uuids",
+        nargs="+",
+        metavar="UUID",
+        help="One or more operation UUIDs (or @N history references)",
+    )
+    return cmd_show_multi, ShowMultiArgs
+
+
 def setup_list_parser(p: argparse.ArgumentParser) -> SetupResult:
     """Configure the listing parser used by both `operation ls` and `ps`."""
     p.add_argument(
@@ -185,13 +196,8 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
             "  accepts multiple UUIDs; each rendered as its own row"
         ),
     )
-    show_p.add_argument(
-        "uuids",
-        nargs="+",
-        metavar="UUID",
-        help="One or more operation UUIDs (or @N history references)",
-    )
-    show_p.set_defaults(handler=cmd_show_multi, load_args=ShowMultiArgs)
+    show_handler, show_loader = setup_show_parser(show_p)
+    show_p.set_defaults(handler=show_handler, load_args=show_loader)
 
     cancel_p = sub.add_parser(
         "cancel",

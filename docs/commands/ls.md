@@ -1,4 +1,4 @@
-# ls
+# ls - List files in the image
 
 List files and directories in the session image without spawning a sandbox.
 

@@ -17,7 +17,6 @@ from contree_cli.cli import (
     operation,
     run,
     session,
-    show,
     skill,
     tag,
     use,
@@ -222,7 +221,11 @@ register(
     "Cancel operations (alias for `operation cancel`)",
     operation.setup_cancel_parser,
 )
-register("show", "Show operation result", show.setup_parser)
+register(
+    "show",
+    "Show operation result (alias for `operation show`)",
+    operation.setup_show_parser,
+)
 register(
     "operation",
     "Manage operations (list/show/cancel)",

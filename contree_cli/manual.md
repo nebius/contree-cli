@@ -238,9 +238,12 @@ All commands
   run [-- CMD]            Spawn sandbox instance (aliases: r)
   images                  List/import images (aliases: i, img)
   tag [IMAGE] TAG         Tag image (aliases: t)
-  ps                      List operations
-  kill UUID               Cancel operation
+  ps                      List operations (shortcut for `operation ls`)
+  kill UUID [UUID...]     Cancel operations (shortcut for `operation cancel`)
   show UUID               Show operation result
+  operation list          List operations (aliases: ls)
+  operation show UUID...  Show multiple operation results (aliases: sh)
+  operation cancel UUID.. Cancel multiple operations (aliases: kill, k); `--all` cancels every active
   ls [PATH]               List files in image (no VM)
   cat PATH                Show file content (no VM)
   cp PATH DEST            Download file from image

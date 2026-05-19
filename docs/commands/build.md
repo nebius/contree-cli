@@ -1,5 +1,5 @@
 % build command reference for the Docker-style Dockerfile interpreter
-# build
+# build - Build an image from a Dockerfile
 
 Build an image from a `Dockerfile`. Each directive runs against the
 contree API and produces a new image layer; successful layers are
