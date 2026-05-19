@@ -1,4 +1,4 @@
-# env
+# env - Manage session environment variables
 
 Manage session-level environment variables. Variables set with `env` are
 applied to every `contree run` automatically. Per-run `-e` flags override
@@ -17,8 +17,8 @@ contree env DEBUG=1 DB_HOST=localhost
 contree env
 
 # Unset variables
-contree env -d PATH
-contree env -d DEBUG DB_HOST
+contree env -U PATH
+contree env -U DEBUG DB_HOST
 
 # Per-run -e overrides session env
 contree run -e DEBUG=0 -- ./app

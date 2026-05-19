@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.output import DefaultFormatter
+from contree_cli.refs import resolve_operation_uuids
 from contree_cli.types import FLAGS, parse_datetime, parse_interval
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,7 @@ class WaitArgs(ArgumentsProtocol):
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> WaitArgs:
-        return cls(op_ids=ns.op_ids)
+        return cls(op_ids=resolve_operation_uuids(list(ns.op_ids)))
 
 
 @dataclass(frozen=True)
@@ -311,17 +312,34 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
 
     wait_p = sub.add_parser(
         "wait",
-        help="Wait for operations to reach terminal state",
+        help="Drain detached ops in the current session",
         description=(
-            "Wait for specific operations (by UUID). Without arguments, waits for "
-            "active operations of the current session only."
+            "Drain detached operations in the current session. With no "
+            "arguments, reads the session's pending-ops cache, polls each "
+            "to a terminal status, and advances the active branch to each "
+            "non-disposable result image (recording `disposable-<uuid>` "
+            "branches for disposable runs). With explicit UUIDs, this "
+            "command degrades to a plain polling loop: it prints completion "
+            "rows but does NOT touch the active branch, because the pending "
+            "metadata is not loaded for explicit UUIDs."
         ),
-        epilog="for coding agents: read-only command",
+        epilog=(
+            "for coding agents:\n"
+            "  no-arg form mutates session history (advances active branch)\n"
+            "  UUID form is a pure polling observer\n"
+            "  if you need result images from explicit UUIDs, use\n"
+            "    `op show UUID | jq -r .image` and `contree use`"
+        ),
     )
     wait_p.add_argument(
         "op_ids",
         nargs="*",
-        help="Operation UUIDs to wait for (default: all active operations)",
+        metavar="UUID_OR_REF",
+        help=(
+            "Operations to wait for (default: all active in this session). "
+            "Accepts UUIDs and session-history references "
+            "(HEAD, HEAD~N, @, @N, @-N, @+N, :N, bare N)."
+        ),
     )
     wait_p.set_defaults(handler=cmd_wait, load_args=WaitArgs)
 
@@ -598,6 +616,7 @@ def cmd_show(args: ShowArgs) -> int | None:
 def cmd_wait(args: WaitArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
+    formatter.configure(tail=("error",))
 
     store = SESSION_STORE.get()
     op_ids = list(args.op_ids)
@@ -665,11 +684,6 @@ def cmd_wait(args: WaitArgs) -> int | None:
             op = json.loads(resp.read())
             status = op.get("status", "")
             if status in WAIT_TERMINAL_STATUSES:
-                duration = (
-                    timedelta(seconds=op["duration"])
-                    if op.get("duration") is not None
-                    else None
-                )
                 metadata = op.get("metadata") or {}
                 instance_result = metadata.get("result") or {}
                 state = instance_result.get("state") or {}
@@ -692,11 +706,14 @@ def cmd_wait(args: WaitArgs) -> int | None:
                     else str(op.get("title") or "")
                 )
 
-                effective_status = status
-                if status == "SUCCESS" and exit_code not in (None, 0):
-                    effective_status = "FAILED"
-
-                if effective_status == "SUCCESS" and op.get("kind") == "instance":
+                # Branch advancement requires both an API-level success AND
+                # a zero sandbox exit: a process that exited non-zero left
+                # the image in a state we should not silently roll forward
+                # to (matches non-detached `run` semantics). The displayed
+                # `status` is the server's word verbatim -- exit_code lives
+                # in its own column.
+                run_succeeded = status == "SUCCESS" and exit_code in (None, 0)
+                if run_succeeded and op.get("kind") == "instance":
                     result = op.get("result") or {}
                     new_image = result.get("image")
                     if meta and meta.get("disposable", False):
@@ -709,16 +726,15 @@ def cmd_wait(args: WaitArgs) -> int | None:
                             operation_uuid=op_id,
                         )
                 formatter(
-                    uuid=op_id,
-                    status=effective_status,
-                    kind=op.get("kind", ""),
-                    duration=duration,
-                    exit_code=exit_code,
-                    title=title,
-                    error=op.get("error") or "",
+                    **{
+                        **op,
+                        "uuid": op_id,
+                        "exit_code": exit_code,
+                        "title": title,
+                    }
                 )
                 failure_exit = 0
-                if effective_status != "SUCCESS":
+                if status != "SUCCESS":
                     failure_exit = 1
                 if exit_code is not None and exit_code != 0:
                     failure_exit = max(failure_exit, exit_code)

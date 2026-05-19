@@ -61,7 +61,6 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import timedelta
 from multiprocessing.pool import ThreadPool
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
@@ -511,12 +510,6 @@ def _display_operation(
     formatter: OutputFormatter,
 ) -> None:
     """Display an operation result using the given formatter."""
-    duration_raw = op.get("duration")
-    duration = (
-        timedelta(seconds=duration_raw)  # type: ignore[arg-type]
-        if duration_raw is not None
-        else None
-    )
     result = op.get("result") or {}
     assert isinstance(result, dict)
     metadata = op.get("metadata") or {}
@@ -531,17 +524,16 @@ def _display_operation(
         exit_code = state.get("exit_code")
 
     if formatter.STREAM:
+        formatter.configure(tail=("error",))
         formatter(
-            uuid=op["uuid"],
-            kind=op.get("kind", ""),
-            status=op["status"],
-            duration=duration,
-            exit_code=exit_code,
-            error=op.get("error") or "",
-            image=result.get("image") or "",
-            tag=result.get("tag") or "",
-            stdout=decode_stream(instance_result.get("stdout")),
-            stderr=decode_stream(instance_result.get("stderr")),
+            **{
+                **op,
+                "exit_code": exit_code,
+                "image": result.get("image") or "",
+                "tag": result.get("tag") or "",
+                "stdout": decode_stream(instance_result.get("stdout")),
+                "stderr": decode_stream(instance_result.get("stderr")),
+            }
         )
         formatter.flush()
         return
@@ -691,7 +683,8 @@ def cmd_run(args: RunArgs) -> int | None:
 
     # 4. Detach mode - exit immediately
     if args.detach:
-        formatter(uuid=op_uuid, status=op.get("status", "PENDING"))
+        formatter.configure(tail=("error",))
+        formatter(**{"uuid": op_uuid, "status": "PENDING", **op})
         formatter.flush()
         return None
 

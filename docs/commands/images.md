@@ -1,4 +1,4 @@
-# images
+# images - List and import images
 
 List images in the project. Images are the filesystem snapshots that sandboxes
 run from -- every non-disposable `contree run` produces a new one.

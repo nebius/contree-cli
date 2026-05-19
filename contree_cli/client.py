@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import base64
+import collections
+import contextlib
 import http.client
 import io
 import json
 import logging
 import platform
+import socket
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
-from typing import IO, cast
+from typing import IO, Any, cast
 from urllib.parse import urlencode, urlsplit
 
 from contree_cli.config import AuthType, ConfigProfile
@@ -19,6 +24,16 @@ from contree_cli.config import AuthType, ConfigProfile
 log = logging.getLogger(__name__)
 
 RETRY_DELAYS = (1, 2, 4, 5, 10, 10, 10)
+
+# Socket-level / connection-level errors that warrant a retry. DNS hiccups
+# (gaierror), refused/reset connections, and broken HTTP framing are all
+# transient — the server may come back. TimeoutError already retried below.
+RETRYABLE_NETWORK_ERRORS: tuple[type[BaseException], ...] = (
+    socket.gaierror,
+    ConnectionError,
+    http.client.HTTPException,
+    OSError,
+)
 
 
 def cli_version() -> str:
@@ -214,6 +229,7 @@ class ContreeClient(ABC):
 
         full_path = self._prefix + path
         last_error: ApiError | None = None
+        last_network_error: BaseException | None = None
         attempts = len(RETRY_DELAYS) + 1
 
         log.debug(
@@ -225,13 +241,21 @@ class ContreeClient(ABC):
         )
 
         for attempt in range(attempts):
-            if last_error is not None:
+            if last_error is not None or last_network_error is not None:
                 delay = RETRY_DELAYS[attempt - 1]
-                log.warning(
-                    "Server error %d, retrying in %ds…",
-                    last_error.status,
-                    delay,
-                )
+                if last_network_error is not None:
+                    log.warning(
+                        "Network error (%s), retrying in %ds…",
+                        type(last_network_error).__name__,
+                        delay,
+                    )
+                else:
+                    assert last_error is not None
+                    log.warning(
+                        "Server error %d, retrying in %ds…",
+                        last_error.status,
+                        delay,
+                    )
                 time.sleep(delay)
 
             if attempt > 0 and hasattr(body, "seek"):
@@ -249,6 +273,18 @@ class ContreeClient(ABC):
                 resp = conn.getresponse()
             except TimeoutError as exc:
                 raise TimeoutError(f"Request timed out: {method} {full_path}") from exc
+            except http.client.InvalidURL:
+                # Malformed URL is a permanent caller-side error — retrying
+                # would just spin through the back-off ladder for nothing.
+                raise
+            except RETRYABLE_NETWORK_ERRORS as exc:
+                last_network_error = exc
+                last_error = None
+                continue
+
+            # Successful round-trip clears the network-error trail so the
+            # final raise below doesn't pick up stale failure context.
+            last_network_error = None
 
             if 200 <= resp.status < 300:
                 log.debug(
@@ -291,6 +327,8 @@ class ContreeClient(ABC):
 
             raise error
 
+        if last_network_error is not None:
+            raise last_network_error
         assert last_error is not None
         raise last_error
 
@@ -511,3 +549,109 @@ def decode_stream(stream: dict[str, object] | None) -> str:
             errors="replace",
         )
     return value
+
+
+class PaginatedFetcher:
+    """Iterate paginated API endpoint pages concurrently.
+
+    Issues GET ``path`` requests with ``offset``/``limit`` query params,
+    pulling pages in parallel via :class:`ThreadPool.imap` (results
+    delivered in offset order). Stops on the first empty or short
+    (``< page_size``) page or after ``max_pages`` requests. May
+    over-fetch by up to ``concurrency - 1`` pages past the actual end
+    of data; the trade-off buys roughly ``concurrency``-fold latency
+    reduction on multi-page listings.
+
+    Callers that hit their own record limit mid-iteration should call
+    :meth:`stop` to short-circuit pending workers — fetches that have
+    not yet issued their HTTP request will skip it and return an empty
+    page, ending iteration.
+
+    :attr:`exhausted` is ``True`` after iteration finishes only if the
+    helper saw the end of data (short/empty page) — including via the
+    ``stop`` signal. It stays ``False`` if it stopped because
+    ``max_pages`` was reached without seeing the end.
+    """
+
+    DEFAULT_PAGE_SIZE = 1000
+    UNLIMITED_MAX_PAGES = 1000  # 1M-record safety cap when limit=None.
+
+    def __init__(
+        self,
+        client: ContreeClient,
+        path: str,
+        params: dict[str, str],
+        extract: Callable[[bytes], list[dict[str, Any]]],
+        *,
+        limit: int | None,
+        page_size: int | None = None,
+        concurrency: int = 8,
+    ) -> None:
+        """Configure a paginated fetch.
+
+        ``limit`` is the caller's record budget (``--limit``, ``--show-max``).
+        ``None`` means "fetch everything up to ``UNLIMITED_MAX_PAGES * page_size``
+        records". When set, ``page_size`` is capped at ``limit + 1`` so a
+        small budget like ``--limit 5`` doesn't pull a 1000-row page just
+        to discard 995, and ``max_pages`` is sized to cover ``limit + 1``
+        records (the extra record lets callers detect "more available"
+        and warn). ``page_size`` defaults to :attr:`DEFAULT_PAGE_SIZE`.
+        """
+        self.client = client
+        self.path = path
+        self.params = params
+        self.extract = extract
+        self.concurrency = concurrency
+        self.exhausted = False
+        self._stop = threading.Event()
+
+        default_page_size = page_size or self.DEFAULT_PAGE_SIZE
+        if limit is None:
+            self.page_size = default_page_size
+            self.max_pages = self.UNLIMITED_MAX_PAGES
+        else:
+            # Fetch one extra record so callers can detect "more results
+            # exist past --limit" and emit a warning.
+            self.page_size = min(default_page_size, limit + 1)
+            self.max_pages = (limit + self.page_size) // self.page_size + 1
+
+    def stop(self) -> None:
+        """Signal that the caller has seen enough; skip pending fetches."""
+        self._stop.set()
+
+    def _fetch(self, offset: int) -> list[dict[str, Any]]:
+        if self._stop.is_set():
+            return []
+        page_params = {
+            **self.params,
+            "offset": str(offset),
+            "limit": str(self.page_size),
+        }
+        resp = self.client.get(self.path, params=page_params)
+        return self.extract(resp.read())
+
+    def __iter__(self) -> Iterator[list[dict[str, Any]]]:
+        offsets = iter(i * self.page_size for i in range(self.max_pages))
+        pending: collections.deque[Future[list[dict[str, Any]]]] = collections.deque()
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            # Prime the pool with up to `concurrency` in-flight fetches.
+            for _ in range(self.concurrency):
+                with contextlib.suppress(StopIteration):
+                    pending.append(pool.submit(self._fetch, next(offsets)))
+
+            while pending:
+                page = pending.popleft().result()
+                if not page:
+                    self.exhausted = True
+                    self._stop.set()
+                    continue
+                if len(page) < self.page_size:
+                    # Mark exhausted before yielding so callers that break
+                    # out of the loop still see the correct end-of-data flag.
+                    self.exhausted = True
+                    self._stop.set()
+                yield page
+                # Refill so in-flight count stays at `concurrency`.
+                if not self._stop.is_set():
+                    with contextlib.suppress(StopIteration):
+                        pending.append(pool.submit(self._fetch, next(offsets)))

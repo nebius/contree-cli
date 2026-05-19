@@ -1,4 +1,4 @@
-# skill
+# skill - Install agent skills
 
 Install, remove, or upgrade ConTree agent skills for Codex and Claude Code.
 

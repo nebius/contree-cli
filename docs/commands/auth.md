@@ -1,4 +1,4 @@
-# auth
+# auth - Configure credentials and profiles
 
 Configure authentication tokens and manage profiles. Each profile stores
 credentials for a different project or environment.

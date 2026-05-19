@@ -13,7 +13,7 @@ contree run apt-get install -y curl     # builds on the previous snapshot
 contree session branch experiment       # branch the sandbox state
 contree run -- make test                # experiment freely
 contree session checkout main           # switch back instantly
-contree session rollback 2              # or rewind two steps
+contree session rollback -- -2          # or rewind two steps
 ```
 
 ## What is ConTree?
@@ -116,7 +116,7 @@ contree cp /app/output.log . # download to local machine
 contree session branch experiment     # create a branch
 contree run -- make test              # experiment on it
 contree session checkout main         # switch back
-contree session rollback 1            # undo last run
+contree session rollback              # undo last run (default: back 1 entry)
 ```
 
 ## Interactive Shell
@@ -151,9 +151,13 @@ The shell provides tab completion for commands, paths, image tags, and operation
 | `run [-- CMD]` | `r` | Spawn a sandbox instance, execute command |
 | `images [--prefix]` | `i`, `img` | List and import images |
 | `tag UUID TAG` | `t` | Tag or untag an image |
-| `ps` | | List operations (instances, imports) |
-| `kill UUID` | | Cancel an operation (`--all` for all) |
+| `ps` | | List operations (shortcut for `operation ls`) |
+| `kill UUID [UUID...]` | | Cancel operations (shortcut for `operation cancel`; `--all` for all active) |
 | `show UUID` | | Show operation result |
+| `operation list` | `op`, `ls` | Same as `ps` (canonical) |
+| `operation show UUID...` | `sh` | Multi-UUID inspect |
+| `operation wait UUID...` | `w` | Block until each op finishes (or `--all`; `--timeout`) |
+| `operation cancel UUID...` | `kill`, `k` | Multi-UUID cancel (or `--all`) |
 | `ls [PATH]` | | List files in session image (no VM) |
 | `cat PATH` | | Show file content from session image (no VM) |
 | `cp PATH DEST` | | Download file from image to local path |
@@ -237,7 +241,7 @@ contree session                       # show current state
 contree session show                  # display history DAG
 contree session branch feature        # create branch from HEAD
 contree session checkout feature      # switch to it
-contree session rollback 3            # go back 3 steps
+contree session rollback -- -3        # go back 3 steps (note `--`; bare `3` is absolute id)
 contree session use other-session     # import image from another session
 ```
 
@@ -259,7 +263,7 @@ Pipe JSON output into `jq`, feed CSV into spreadsheets, or parse programmaticall
 
 ### Config file
 
-`~/.config/contree-cli/config.ini`:
+`$XDG_CONFIG_HOME/contree/auth.ini` (default: `~/.config/contree/auth.ini`; override via `$CONTREE_HOME`):
 
 ```ini
 [DEFAULT]

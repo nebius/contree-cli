@@ -1,4 +1,4 @@
-# cp
+# cp - Download a file from the image
 
 Download a file from the session image to a local path.
 

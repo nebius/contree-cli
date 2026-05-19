@@ -201,24 +201,16 @@ class TestImagesPagination:
         out = capsys.readouterr().out
         assert out.count("uuid-") == PAGE_SIZE + 5
 
-    def test_progress_logged_per_full_page(self, contree_client, caplog):
-        """Each completed full page emits a progress line at INFO level."""
-        import logging
-
+    def test_pages_flushed_progressively(self, contree_client, capsys):
+        """Each full page is flushed as it completes (streaming output)."""
         page1 = [_make_image(i) for i in range(PAGE_SIZE)]
         page2 = [_make_image(i) for i in range(PAGE_SIZE, PAGE_SIZE * 2)]
         page3 = [_make_image(i) for i in range(PAGE_SIZE * 2, PAGE_SIZE * 2 + 3)]
-        with caplog.at_level(logging.INFO, logger="contree_cli.cli.images"):
-            _run_cmd_pages(contree_client, [page1, page2, page3])
-        msgs = [r.getMessage() for r in caplog.records]
-        assert any(
-            f"Fetched {PAGE_SIZE} images so far" in m and "Ctrl+C" in m for m in msgs
-        )
-        assert any(
-            f"Fetched {PAGE_SIZE * 2} images so far" in m and "Ctrl+C" in m
-            for m in msgs
-        )
-        assert not any(f"{PAGE_SIZE * 2 + 3}" in m for m in msgs)
+        _run_cmd_pages(contree_client, [page1, page2, page3])
+        out = capsys.readouterr().out
+        assert f"uuid-{PAGE_SIZE - 1}" in out
+        assert f"uuid-{PAGE_SIZE * 2 - 1}" in out
+        assert f"uuid-{PAGE_SIZE * 2 + 2}" in out
 
     def test_default_limit_matches_constant(self):
         assert LIMIT_DEFAULT > 0
@@ -288,18 +280,21 @@ class TestImagesPagination:
         warns = [r for r in caplog.records if r.levelname == "WARNING"]
         assert not any("truncated" in r.getMessage() for r in warns)
 
-    def test_limit_request_uses_capped_page_size(self, contree_client):
-        """When --limit < PAGE_SIZE, the API request asks for limit items only."""
-        contree_client.respond_json({"images": [_make_image(i) for i in range(3)]})
-        contree_client.respond_json({"images": []})  # probe
+    def test_limit_smaller_than_page_size_emits_only_limit_records(
+        self, contree_client, capsys
+    ):
+        """--limit < PAGE_SIZE: caller emits exactly limit records from the page."""
+        contree_client.respond_json(
+            {"images": [_make_image(i) for i in range(PAGE_SIZE)]}
+        )
 
         FORMATTER.set(CSVFormatter())
         ctx = copy_context()
         ctx.run(cmd_images, ImagesArgs(limit=3))
 
-        assert "limit=3" in contree_client.request_paths[0]
-        assert "limit=1" in contree_client.request_paths[1]
-        assert contree_client.request_count == 2
+        out = capsys.readouterr().out
+        # 1 header row + 3 data rows.
+        assert len(out.strip().splitlines()) == 4
 
     def test_progress_not_logged_for_single_short_page(self, contree_client, caplog):
         """Final/only partial page does not emit progress (output covers it)."""

@@ -20,8 +20,8 @@ examples:
   contree env                                  list session env vars
   contree env PATH=/root/.cargo/bin:$PATH      set PATH
   contree env DEBUG=1 DB_HOST=localhost         set multiple
-  contree env -d PATH                          unset PATH
-  contree env -d PATH DEBUG                    unset multiple
+  contree env -U PATH                          unset PATH
+  contree env -U PATH DEBUG                    unset multiple
 """
 
 

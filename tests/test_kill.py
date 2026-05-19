@@ -2,20 +2,18 @@ from __future__ import annotations
 
 from contextvars import copy_context
 
-import pytest
 from conftest import ContreeTestClient
 
 from contree_cli import CLIENT
-from contree_cli.cli.kill import ACTIVE_STATUSES, KillArgs, cmd_kill
-from contree_cli.client import ApiError
+from contree_cli.cli.operation import ACTIVE_STATUSES, CancelArgs, cmd_cancel
 
 
 def _run_cmd(tc: ContreeTestClient, uuid, *, status=202):
     tc.respond(status=status, body=b"")
     ctx = copy_context()
 
-    args = KillArgs(uuid=uuid)
-    ctx.run(cmd_kill, args)
+    args = CancelArgs(uuids=[uuid])
+    ctx.run(cmd_cancel, args)
 
 
 class TestCmdKill:
@@ -30,21 +28,22 @@ class TestCmdKill:
             _run_cmd(contree_client, "op-456")
         assert "Cancelled operation op-456" in caplog.text
 
-    def test_not_found_raises(self, contree_client):
+    def test_not_found_logs_and_sets_exit(self, contree_client, caplog):
         contree_client.respond(status=404, body=b"nope")
+        CLIENT.set(contree_client)
         ctx = copy_context()
-        args = KillArgs(uuid="bad-uuid")
-        with pytest.raises(ApiError) as exc_info:
-            ctx.run(cmd_kill, args)
-        assert exc_info.value.status == 404
+        with caplog.at_level("ERROR"):
+            rc = ctx.run(cmd_cancel, CancelArgs(uuids=["bad-uuid"]))
+        assert rc == 1
+        assert "Failed to cancel bad-uuid" in caplog.text
 
-    def test_conflict_raises(self, contree_client):
+    def test_conflict_logs_and_sets_exit(self, contree_client, caplog):
         contree_client.respond(status=409, body=b"already done")
+        CLIENT.set(contree_client)
         ctx = copy_context()
-        args = KillArgs(uuid="done-op")
-        with pytest.raises(ApiError) as exc_info:
-            ctx.run(cmd_kill, args)
-        assert exc_info.value.status == 409
+        with caplog.at_level("ERROR"):
+            rc = ctx.run(cmd_cancel, CancelArgs(uuids=["done-op"]))
+        assert rc == 1
 
 
 # ---------------------------------------------------------------------------
@@ -57,11 +56,7 @@ def _ops_for_status(status, count):
 
 
 def _run_kill_all(ops_by_status, *, delete_failures=None):
-    """Run cmd_kill --all with mocked list + delete responses.
-
-    ops_by_status: dict mapping status string to list of op dicts
-    delete_failures: set of UUIDs that should return 409
-    """
+    """Run cmd_cancel --all with mocked list + delete responses."""
     delete_failures = delete_failures or set()
     tc = ContreeTestClient()
 
@@ -80,9 +75,9 @@ def _run_kill_all(ops_by_status, *, delete_failures=None):
 
     CLIENT.set(tc)
     ctx = copy_context()
-    args = KillArgs(all=True)
+    args = CancelArgs(uuids=[], all=True)
 
-    rc = ctx.run(cmd_kill, args)
+    rc = ctx.run(cmd_cancel, args)
     return tc, rc
 
 

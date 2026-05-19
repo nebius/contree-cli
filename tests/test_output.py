@@ -85,7 +85,7 @@ class TestJSONPrettyFormatter:
     def test_single_item_is_list(self, capsys):
         fmt = JSONPrettyFormatter()
         fmt(a=1, b=2)
-        fmt.flush()
+        fmt.close()
         parsed = json.loads(capsys.readouterr().out)
         assert parsed == [{"a": 1, "b": 2}]
 
@@ -93,28 +93,40 @@ class TestJSONPrettyFormatter:
         fmt = JSONPrettyFormatter()
         fmt(x=1)
         fmt(x=2)
-        fmt.flush()
+        fmt.close()
         parsed = json.loads(capsys.readouterr().out)
         assert parsed == [{"x": 1}, {"x": 2}]
 
     def test_indented(self, capsys):
         fmt = JSONPrettyFormatter()
         fmt(key="val")
-        fmt.flush()
+        fmt.close()
         assert "  " in capsys.readouterr().out
 
-    def test_flush_empty(self, capsys):
+    def test_close_empty(self, capsys):
         fmt = JSONPrettyFormatter()
-        fmt.flush()
+        fmt.close()
         assert capsys.readouterr().out == ""
 
-    def test_flush_clears_buffer(self, capsys):
+    def test_close_clears_buffer(self, capsys):
         fmt = JSONPrettyFormatter()
         fmt(k=1)
-        fmt.flush()
+        fmt.close()
         capsys.readouterr()
-        fmt.flush()
+        fmt.close()
         assert capsys.readouterr().out == ""
+
+    def test_streaming_across_flushes(self, capsys):
+        """Multiple flushes accumulate into a single JSON array."""
+        fmt = JSONPrettyFormatter()
+        fmt(x=1)
+        fmt.flush()
+        fmt(x=2)
+        fmt.flush()
+        fmt(x=3)
+        fmt.close()
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed == [{"x": 1}, {"x": 2}, {"x": 3}]
 
 
 class TestTableFormatter:
@@ -165,11 +177,46 @@ class TestTableFormatter:
         assert "a" in first
         assert "b" in second
 
+    def test_header_only_on_first_flush(self, capsys):
+        """Subsequent flushes don't reprint the header (paginated streaming)."""
+        with patch("contree_cli.output.STDOUT_IS_A_TTY", False):
+            fmt = TableFormatter()
+            fmt(name="alice", val="x")
+            fmt.flush()
+            first = capsys.readouterr().out
+            fmt(name="bob", val="y")
+            fmt.flush()
+            second = capsys.readouterr().out
+        assert "NAME" in first
+        assert "NAME" not in second
+        assert "bob" in second
+
+    def test_column_widths_stable_across_flushes(self, capsys):
+        """Column widths from the first flush apply to later flushes."""
+        with patch("contree_cli.output.STDOUT_IS_A_TTY", False):
+            fmt = TableFormatter()
+            fmt(name="ab", val="x")
+            fmt.flush()
+            first_lines = capsys.readouterr().out.splitlines()
+            # A wider name in the next batch must be truncated to the
+            # already-printed column width so columns don't shift.
+            fmt(name="abcdef", val="y")
+            fmt.flush()
+            second_lines = capsys.readouterr().out.splitlines()
+        assert len(first_lines[0]) == len(second_lines[0])
+
 
 class TestFormatValue:
-    def test_datetime(self):
-        dt = datetime(2025, 1, 15, 10, 30, 45, tzinfo=timezone.utc)
+    def test_datetime_naive(self):
+        # Naive datetimes are printed as-is without TZ conversion.
+        dt = datetime(2025, 1, 15, 10, 30, 45)
         assert _format_value(dt) == "2025-01-15 10:30:45"
+
+    def test_datetime_aware_converts_to_local(self):
+        # Aware UTC datetime is converted to the local timezone for display.
+        dt = datetime(2025, 1, 15, 10, 30, 45, tzinfo=timezone.utc)
+        expected = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        assert _format_value(dt) == expected
 
     def test_timedelta_seconds(self):
         assert _format_value(timedelta(seconds=42)) == "42s"

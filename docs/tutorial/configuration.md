@@ -61,10 +61,13 @@ SHA256), active status, and a health check result.
 `auth ls` verifies each profile against the API with a 2-second timeout.
 Possible status values:
 
-- `ok` — token is valid
+- `ok` — token is valid and has the required sandbox permission
 - `timeout` — server did not respond in time
 - `error` — bad token or network error
 - `offline mode` — you passed `-O` / `--offline`
+- `no url` — the profile has no API URL configured (re-run `contree auth`)
+- `inactive` — token authenticates, but the configured project does not
+  grant the sandbox permission this CLI needs
 
 Skip the network check:
 

@@ -42,6 +42,7 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "profile": ("-p", "--profile"),
         "offline": ("-O", "--offline"),
         "status": ("--status",),
+        "raw": ("--raw",),
         # run
         "cwd": ("-C", "--cwd"),
         "detach": ("-d", "--detach", "--no-wait"),

@@ -4,11 +4,10 @@ import base64
 import json
 from contextvars import copy_context
 
-import pytest
 from conftest import ContreeTestClient
 
 from contree_cli import FORMATTER, SESSION_STORE
-from contree_cli.cli.show import ShowArgs, _resolve_operation_uuid, cmd_show
+from contree_cli.cli.show import ShowArgs, cmd_show
 from contree_cli.client import decode_stream
 from contree_cli.output import (
     CSVFormatter,
@@ -145,6 +144,16 @@ class TestCmdShow:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["uuid"] == "op-abc"
         assert parsed["duration"] == 5.0
+
+    def test_unknown_field_passes_through(self, contree_client, capsys, session_store):
+        """New server fields reach the row even when not hardcoded."""
+        op = _make_op()
+        op["session_key"] = "sess-1"
+        op["future_field"] = "anything"
+        _run_cmd(contree_client, op, formatter=JSONFormatter(), store=session_store)
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["session_key"] == "sess-1"
+        assert parsed["future_field"] == "anything"
 
     def test_table_output(self, contree_client, capsys, session_store):
         fmt = TableFormatter()
@@ -292,58 +301,26 @@ class TestShowCaching:
         assert contree_client.request_count == 2  # new request (not cached)
 
 
-class TestResolveOperationUuid:
-    def test_at_prefix_resolves(self, session_store):
-        session_store.set_image("img-1", kind="use")
-        session_store.set_image("img-2", kind="run", operation_uuid="op-abc")
-        result = _resolve_operation_uuid("@2", session_store)
-        assert result == "op-abc"
-
-    def test_colon_prefix_resolves(self, session_store):
-        session_store.set_image("img-1", kind="use")
-        session_store.set_image("img-2", kind="run", operation_uuid="op-def")
-        result = _resolve_operation_uuid(":2", session_store)
-        assert result == "op-def"
-
-    def test_bare_numeric_resolves(self, session_store):
-        session_store.set_image("img-1", kind="use")
-        session_store.set_image("img-2", kind="run", operation_uuid="op-ghi")
-        result = _resolve_operation_uuid("2", session_store)
-        assert result == "op-ghi"
-
-    def test_non_numeric_passthrough(self, session_store):
-        result = _resolve_operation_uuid("abc-def-uuid", session_store)
-        assert result == "abc-def-uuid"
-
-    def test_no_session_raises(self, session_store):
-        with pytest.raises(ValueError, match="No active session"):
-            _resolve_operation_uuid("@1", session_store)
-
-    def test_no_operation_uuid_raises(self, session_store):
-        session_store.set_image("img-1", kind="use")
-        with pytest.raises(ValueError, match="has no operation UUID"):
-            _resolve_operation_uuid("@1", session_store)
-
-    def test_nonexistent_entry_raises(self, session_store):
-        session_store.set_image("img-1", kind="use")
-        with pytest.raises(ValueError, match="not found"):
-            _resolve_operation_uuid("@999", session_store)
-
-
-class TestExitCodeToFailed:
-    def test_success_with_exit_code_shows_failed(
+class TestStatusVerbatim:
+    def test_success_with_nonzero_exit_keeps_status(
         self, contree_client, capsys, session_store
     ):
-        """SUCCESS + exit_code!=0 should show status as FAILED."""
+        """SUCCESS + exit_code!=0 reports SUCCESS; exit_code is its own column.
+
+        Operation status is an orchestration verdict (did the API run the
+        job?). What the sandbox process did with its exit code is a
+        separate concern and lives in the `exit_code` column.
+        """
         op = _make_op(status="SUCCESS", exit_code=1)
         _run_cmd(contree_client, op, store=session_store)
         out = capsys.readouterr().out
-        assert "FAILED" in out
+        assert "SUCCESS" in out
+        assert "FAILED" not in out
+        assert ",1," in out  # exit_code column
 
     def test_success_with_exit_code_zero_shows_success(
         self, contree_client, capsys, session_store
     ):
-        """SUCCESS + exit_code=0 should still show SUCCESS."""
         op = _make_op(status="SUCCESS", exit_code=0)
         _run_cmd(contree_client, op, store=session_store)
         out = capsys.readouterr().out
@@ -352,8 +329,35 @@ class TestExitCodeToFailed:
     def test_success_with_no_exit_code_shows_success(
         self, contree_client, capsys, session_store
     ):
-        """SUCCESS + exit_code=None should show SUCCESS."""
         op = _make_op(status="SUCCESS", exit_code=None)
         _run_cmd(contree_client, op, store=session_store)
         out = capsys.readouterr().out
         assert "SUCCESS" in out
+
+
+class TestShowRaw:
+    def test_raw_prints_server_payload_as_jsonl(
+        self, contree_client, capsys, session_store
+    ):
+        # --raw skips formatter routing and derived columns and emits
+        # JSONL: one operation per line, the full server JSON, so multi-
+        # UUID `op show --raw` streams cleanly into `jq -c` / `awk`.
+        op = _make_op(status="SUCCESS", exit_code=1)
+        op["server_only_field"] = "preserved"
+        contree_client.respond_json(op)
+        FORMATTER.set(JSONFormatter())
+        SESSION_STORE.set(session_store)
+        ctx = copy_context()
+        ctx.run(cmd_show, ShowArgs(uuid="op-abc", raw=True))
+        out = capsys.readouterr().out
+        lines = out.strip().splitlines()
+        assert len(lines) == 1
+        parsed = json.loads(lines[0])
+        # No derived columns (no `exit_code` flattening, no `image`/`tag`
+        # promotion); the entire server payload is what came back.
+        assert parsed["status"] == "SUCCESS"
+        assert parsed["server_only_field"] == "preserved"
+        assert "metadata" in parsed  # full nested structure preserved
+        assert parsed["metadata"]["result"]["state"]["exit_code"] == 1
+        # JSONL contract: exactly one line of compact JSON per op.
+        assert "\n" not in lines[0]

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from contree_cli.output import ListSorter
 from contree_cli.types import FLAGS, parse_datetime, parse_interval
 
 REF = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -269,3 +270,59 @@ class TestFlags:
                         f" FLAGS[{name!r}]"
                     )
                 seen[flag] = name
+
+
+class TestListSorter:
+    def test_skips_nested_dict_and_list(self) -> None:
+        out = ListSorter().order({"a": 1, "b": {"x": 1}, "c": [1, 2]})
+        assert dict(out) == {"a": 1}
+
+    def test_unknown_fields_pass_through(self) -> None:
+        out = ListSorter().order({"future": "anything", "n": 42})
+        assert dict(out) == {"future": "anything", "n": 42}
+
+    def test_datetime_fields_parsed(self) -> None:
+        out = ListSorter().order({"created_at": "2025-01-02T03:04:05Z"})
+        assert out["created_at"] == datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    def test_duration_to_timedelta(self) -> None:
+        assert ListSorter().order({"duration": 5})["duration"] == timedelta(seconds=5)
+
+    def test_null_error_becomes_empty(self) -> None:
+        assert ListSorter().order({"error": None})["error"] == ""
+
+    def test_null_tag_becomes_empty(self) -> None:
+        assert ListSorter().order({"tag": None})["tag"] == ""
+
+    def test_mode_formatted_as_octal(self) -> None:
+        assert ListSorter().order({"mode": 0o755})["mode"] == "755"
+
+    def test_mtime_to_datetime(self) -> None:
+        out = ListSorter().order({"mtime": 1700000000})
+        assert isinstance(out["mtime"], datetime)
+        assert out["mtime"].tzinfo == timezone.utc
+
+    def test_preserves_insertion_order(self) -> None:
+        keys = list(ListSorter().order({"c": 1, "a": 2, "b": 3}))
+        assert keys == ["c", "a", "b"]
+
+    def test_head_pinned_first(self) -> None:
+        keys = list(ListSorter(head=("z",)).order({"a": 1, "b": 2, "z": 3}))
+        assert keys == ["z", "a", "b"]
+
+    def test_tail_pinned_last(self) -> None:
+        keys = list(ListSorter(tail=("error",)).order({"error": "x", "a": 1}))
+        assert keys == ["a", "error"]
+
+    def test_head_tail_absent_keys_skipped(self) -> None:
+        out = ListSorter(head=("nope",), tail=("missing",)).order({"a": 1})
+        assert list(out) == ["a"]
+
+    def test_column_order_memoised_across_calls(self) -> None:
+        """Column order locks in from first occurrence."""
+        sorter = ListSorter(tail=("error",))
+        first = list(sorter.order({"a": 1, "b": 2}))
+        second = list(sorter.order({"b": 3, "a": 4, "c": 5}))
+        assert first == ["a", "b"]
+        # Second call: a/b keep first-seen order, c appended, error skipped.
+        assert second == ["a", "b", "c"]

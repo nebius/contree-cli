@@ -122,7 +122,9 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     spec_arg(remove_p)
     remove_p.set_defaults(handler=cmd_skill_remove, load_args=SkillRemoveArgs)
 
-    upgrade_p = sub.add_parser("upgrade", help="Upgrade installed skill files")
+    upgrade_p = sub.add_parser(
+        "upgrade", aliases=["u", "update"], help="Upgrade installed skill files"
+    )
     upgrade_p.set_defaults(handler=cmd_skill_upgrade, load_args=SkillUpgradeArgs)
     spec_arg(upgrade_p)
 

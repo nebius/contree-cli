@@ -1,5 +1,5 @@
 % build command reference for the Docker-style Dockerfile interpreter
-# build
+# build - Build an image from a Dockerfile
 
 Build an image from a `Dockerfile`. Each directive runs against the
 contree API and produces a new image layer; successful layers are
@@ -78,6 +78,19 @@ To inspect the resulting branches:
 contree session list --filter build:
 contree session show
 ```
+
+:::{note}
+`build` is **project-scoped from the user's point of view**: it does
+not bind to the agent's `-S <key>` session. Passing `-S` is harmless
+but does not move that key's image. After a successful build, attach
+the result to your normal agent session by tag:
+
+```bash
+contree build . --tag myapp:dev
+contree -S agent_verify use tag:myapp:dev
+contree -S agent_verify run -D -- myapp --version
+```
+:::
 
 ## `.dockerignore`
 

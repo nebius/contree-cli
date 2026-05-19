@@ -6,7 +6,7 @@ to reference in commands like `contree use tag:NAME`.
 With one argument, tags the current session image.
 With two arguments, the first is the image reference and the second is the tag.
 
-Use -d/--delete to remove a tag instead of assigning one.
+Use -U/--delete/--rm to remove a tag instead of assigning one.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ examples:
   contree tag python-dev:latest            # tag current session image
   contree tag UUID python-dev:latest       # tag specific image by UUID
   contree tag tag:alpine:latest my-alpine  # re-tag by reference
-  contree tag -d UUID my-tag               # remove a tag
+  contree tag -U UUID my-tag               # remove a tag (or --delete/--rm)
 
 for coding agents:
   mutating command

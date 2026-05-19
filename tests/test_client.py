@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from contree_cli.client import (
     ContreeClient,
     ContreeJWTClient,
     HeaderFormatter,
+    PaginatedFetcher,
     resolve_image,
 )
 
@@ -180,6 +182,70 @@ class TestRetry:
         assert mock_sleep.call_count == 3
         delays = [call.args[0] for call in mock_sleep.call_args_list]
         assert delays == list(RETRY_DELAYS[:3])
+
+    def test_retry_on_network_error_then_succeeds(self):
+        """A transient gaierror is retried like a 5xx response."""
+        import socket
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=200, body=b'{"ok":true}')
+
+        call_count = {"n": 0}
+        real_connect = c._connect
+
+        def flaky_connect():
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                raise socket.gaierror(8, "nodename nor servname provided")
+            return real_connect()
+
+        c._connect = flaky_connect  # type: ignore[method-assign]
+
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            result = c.request("GET", "/v1/images")
+
+        assert result.body == b'{"ok":true}'
+        assert call_count["n"] == 3
+        assert mock_sleep.call_count == 2
+
+    def test_retry_exhausted_raises_network_error(self):
+        """When retries run out, the last network error propagates."""
+        import socket
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+
+        def always_fails():
+            raise socket.gaierror(8, "nodename nor servname provided")
+
+        c._connect = always_fails  # type: ignore[method-assign]
+
+        with (
+            patch("contree_cli.client.time.sleep"),
+            pytest.raises(socket.gaierror),
+        ):
+            c.request("GET", "/v1/images")
+
+    def test_invalid_url_is_not_retried(self):
+        """InvalidURL is a permanent caller-side error — should raise immediately."""
+        import http.client
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+
+        call_count = {"n": 0}
+
+        def fail_with_invalid_url():
+            call_count["n"] += 1
+            raise http.client.InvalidURL("control characters in URL")
+
+        c._connect = fail_with_invalid_url  # type: ignore[method-assign]
+
+        with (
+            patch("contree_cli.client.time.sleep") as mock_sleep,
+            pytest.raises(http.client.InvalidURL),
+        ):
+            c.request("GET", "/v1/images")
+        assert call_count["n"] == 1
+        mock_sleep.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -550,3 +616,65 @@ class TestContreeIAMClient:
         c = ContreeTestIAMClient("https://example.com", None, "aiproject-x")
         with pytest.raises(ApiError, match="No token"):
             c.request("GET", "/v1/images")
+
+
+class TestPaginatedFetcherLimit:
+    """``limit=`` lives in :class:`PaginatedFetcher` so callers don't repeat
+    the page-size math, and a small budget like ``--limit 5`` doesn't pull a
+    full 1000-row page just to discard 995."""
+
+    def make_fetcher(
+        self,
+        client: ContreeTestClient,
+        *,
+        limit: int | None,
+        page_size: int | None = None,
+    ) -> PaginatedFetcher:
+        return PaginatedFetcher(
+            client,
+            "/v1/things",
+            {},
+            lambda body: json.loads(body)["items"],
+            limit=limit,
+            page_size=page_size,
+            concurrency=1,
+        )
+
+    def test_small_limit_caps_page_size(self, contree_client):
+        f = self.make_fetcher(contree_client, limit=5)
+        # +1 so callers can detect "more exists past the limit".
+        assert f.page_size == 6
+        # Need to cover at most limit+1 records; +1 page of safety pad
+        # plus the +1 ceiling makes the math straightforward.
+        assert f.max_pages >= 2
+
+    def test_large_limit_uses_default_page_size(self, contree_client):
+        f = self.make_fetcher(contree_client, limit=10000)
+        assert f.page_size == PaginatedFetcher.DEFAULT_PAGE_SIZE
+        assert f.max_pages >= 10000 // PaginatedFetcher.DEFAULT_PAGE_SIZE
+
+    def test_no_limit_uses_default_and_safety_cap(self, contree_client):
+        f = self.make_fetcher(contree_client, limit=None)
+        assert f.page_size == PaginatedFetcher.DEFAULT_PAGE_SIZE
+        assert f.max_pages == PaginatedFetcher.UNLIMITED_MAX_PAGES
+
+    def test_explicit_page_size_still_capped_by_limit(self, contree_client):
+        # Caller-supplied page_size is an upper bound; limit can still
+        # squash it smaller.
+        f = self.make_fetcher(contree_client, limit=3, page_size=100)
+        assert f.page_size == 4
+
+    def test_small_limit_uses_capped_page_size_in_request(self, contree_client):
+        # `limit=5` must request `limit=6` (capped page size + 1 for the
+        # truncation probe), not the default 1000.
+        contree_client.respond_json({"items": [{"i": i} for i in range(6)]})
+        f = self.make_fetcher(contree_client, limit=5)
+        pages_iter = iter(f)
+        first = next(pages_iter)
+        assert len(first) == 6
+        f.stop()  # mirror the real caller, which calls stop() after hitting limit
+        with contextlib.suppress(StopIteration):
+            next(pages_iter)
+        req = contree_client.get_request(0)
+        assert "limit=6" in req.path
+        assert "limit=1000" not in req.path

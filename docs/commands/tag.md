@@ -1,4 +1,4 @@
-# tag
+# tag - Tag or untag an image
 
 Assign or remove a tag from an image. Tags are human-readable names that
 make images easier to reference.

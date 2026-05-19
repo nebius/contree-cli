@@ -7,15 +7,16 @@
 :maxdepth: 1
 :caption: Commands
 
+auth
 use
 run
 build
 images
 tag
-ps
-kill
-show
 operation
+ps
+show
+kill
 ls
 cat
 cp
@@ -24,7 +25,6 @@ env
 file
 session
 shell
-auth
 skill
 agent
 ```

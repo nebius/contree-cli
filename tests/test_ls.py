@@ -146,6 +146,16 @@ class TestCmdLs:
         assert parsed["path"] == "/bin/sh"
         assert parsed["size"] == 42
 
+    def test_unknown_field_passes_through(self, contree_client, session_store, capsys):
+        """New server fields reach the row even when not hardcoded."""
+        f = _make_file()
+        f["future_field"] = "anything"
+        f["inode"] = 4242
+        _run_cmd(contree_client, [f], store=session_store, formatter=JSONFormatter())
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["future_field"] == "anything"
+        assert parsed["inode"] == 4242
+
     def test_table_output(self, contree_client, session_store, capsys):
         files = [_make_file(), _make_file(path="/etc/passwd")]
         fmt = TableFormatter()

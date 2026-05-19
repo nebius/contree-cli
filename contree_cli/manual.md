@@ -38,7 +38,7 @@ Key commands:
   contree session show            view history DAG
   contree session branch <name>   create branch
   contree session checkout <name> switch branch
-  contree session rollback [N]    undo N steps
+  contree session rollback [N]    jump to history id N (absolute); use -N for steps back
   contree session delete <key>    delete session
 
 Branch workflow:
@@ -49,8 +49,14 @@ Branch workflow:
   contree session branch -d experiment   clean up
 
 Rollback:
-  contree session rollback 1             undo last run
+  contree session rollback               back one entry (default)
+  contree session rollback -- -3         back three entries (note `--`)
+  contree session rollback +1            forward one entry
+  contree session rollback 42            absolute jump to history id 42
   contree session show                   inspect before rollback
+
+  WARNING: a bare positive N is an ABSOLUTE history id, not "back N steps".
+  Use `--` plus a negative N for relative back-navigation.
 
 More: contree session --help
 
@@ -153,7 +159,13 @@ Detached workflow:
   contree run -d -- long-task
   contree ps                             check status
   contree show UUID                      view result
-  contree session wait                   block until done
+  contree op wait UUID                   block until terminal
+
+Fan-out + join (use -f json BEFORE run so jq sees JSON):
+  A=$(contree -f json run -d -- make a | jq -r .uuid)
+  B=$(contree -f json run -d -- make b | jq -r .uuid)
+  contree op wait "$A" "$B"              wait for both; one row each
+  contree op wait --all --timeout 600    or block on every active op
 
 More: contree run --help
 
@@ -182,9 +194,20 @@ Operations
   contree show UUID          show operation result
   contree kill UUID          cancel operation
   contree kill -a            cancel all active
-  contree session wait       wait for active operations
+  contree op wait UUID...    wait for given operations to finish
+  contree op wait --all      wait for every active operation
+  contree op wait --timeout SECONDS   bound the wait (default 60s)
 
-More: contree ps --help, contree show --help
+Every positional shown as UUID_OR_REF in --help (op show, op cancel,
+op wait, top-level show/kill, session wait) also accepts session-
+history references against the active session:
+  HEAD / @ / :          latest op on the active branch tip
+  HEAD~N / @-N          N steps back from the tip
+  HEAD~                 shorthand for HEAD~1
+  @+N                   N steps forward (latest child)
+  @N / :N / bare N      absolute history id
+
+More: contree ps --help, contree op wait --help
 
 Profiles
 ========
@@ -238,23 +261,29 @@ All commands
   run [-- CMD]            Spawn sandbox instance (aliases: r)
   images                  List/import images (aliases: i, img)
   tag [IMAGE] TAG         Tag image (aliases: t)
-  ps                      List operations
-  kill UUID               Cancel operation
+  ps                      List operations (shortcut for `operation ls`)
+  kill UUID [UUID...]     Cancel operations (shortcut for `operation cancel`)
   show UUID               Show operation result
+  operation list          List operations (aliases: ls)
+  operation show UUID...  Show multiple operation results (aliases: sh)
+  operation wait UUID...  Block until operations finish (aliases: w);
+                          `--all` waits for every active op; `--timeout
+                          SECONDS` fails if not all complete (default: 60)
+  operation cancel UUID.. Cancel multiple operations (aliases: kill, k); `--all` cancels every active
   ls [PATH]               List files in image (no VM)
   cat PATH                Show file content (no VM)
   cp PATH DEST            Download file from image
   cd [PATH]               Change session working directory
-  env [KEY=VALUE ...]     Session env vars (-d to unset)
+  env [KEY=VALUE ...]     Session env vars (-U to unset)
   file edit PATH          Edit remote file via $EDITOR
   file cp SRC DEST        Stage local file for next run
   session list            List sessions (aliases: ls)
   session branch [NAME]   Create/list branches (aliases: br)
   session checkout BRANCH Switch branch (aliases: co)
-  session rollback [N]    Undo N steps (aliases: rb)
+  session rollback [N]    Jump to history id N (absolute); -N steps back (aliases: rb)
   session show            Show history DAG
   session delete KEY      Delete session (aliases: rm, del)
-  session wait [OPS]      Wait for operations
+  session wait [OPS]      Drain detached ops; no-arg form advances branch, UUID form polls only
   auth                    Save token
   auth ls                 List profiles (aliases: profiles)
   auth switch NAME        Switch profile

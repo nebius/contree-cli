@@ -1,4 +1,4 @@
-# cat
+# cat - Show file content from the image
 
 Display the contents of a file from the session image.
 

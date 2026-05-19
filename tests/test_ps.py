@@ -7,7 +7,16 @@ import pytest
 from conftest import ContreeTestClient
 
 from contree_cli import FORMATTER
-from contree_cli.cli.ps import PAGE_SIZE, STATUS_CHOICES, PsArgs, cmd_ps
+from contree_cli.cli.operation import (
+    PAGE_SIZE,
+    STATUS_CHOICES,
+)
+from contree_cli.cli.operation import (
+    ListArgs as PsArgs,
+)
+from contree_cli.cli.operation import (
+    cmd_list as cmd_ps,
+)
 from contree_cli.output import CSVFormatter, JSONFormatter, TableFormatter
 from contree_cli.types import parse_interval
 
@@ -210,23 +219,19 @@ class TestPsPagination:
         assert "offset=0" in paths[0]
         assert f"offset={PAGE_SIZE}" in paths[1]
 
-    def test_progress_logged_per_full_page(self, contree_client, caplog):
-        """Each completed full page emits a progress line at INFO level."""
-        import logging
-
+    def test_pages_flushed_progressively(self, contree_client, capsys):
+        """Each full page is flushed as it completes (streaming output)."""
         page1 = [_make_op(i) for i in range(PAGE_SIZE)]
         page2 = [_make_op(i) for i in range(PAGE_SIZE, PAGE_SIZE + 3)]
-        with caplog.at_level(logging.INFO, logger="contree_cli.cli.ps"):
-            _run_cmd_pages(
-                contree_client,
-                [page1, page2],
-                show_max=None,
-            )
-        msgs = [r.getMessage() for r in caplog.records]
-        assert any(
-            f"Fetched {PAGE_SIZE} operations so far" in m and "Ctrl+C" in m
-            for m in msgs
+        _run_cmd_pages(
+            contree_client,
+            [page1, page2],
+            show_max=None,
         )
+        out = capsys.readouterr().out
+        # All rows from both pages should appear in output.
+        assert f"op-{PAGE_SIZE - 1}" in out
+        assert f"op-{PAGE_SIZE + 2}" in out
 
 
 class TestPsActiveFilter:
@@ -341,16 +346,18 @@ class TestPsShowMax:
         _run_cmd(contree_client, ops, show_max=100, all=True)
         assert "Output truncated" not in caplog.text
 
-    def test_show_max_stops_pagination(self, contree_client, capsys):
-        """show_max stops mid-page; one probe request follows."""
+    def test_show_max_stops_pagination(self, contree_client):
+        """show_max stops mid-page; short first page is detected without a probe."""
         ops = [_make_op(i) for i in range(10)]
         _run_cmd_pages(
             contree_client,
-            [ops, [_make_op(99)]],  # main + probe
+            [ops],
             show_max=3,
             all=True,
         )
-        assert contree_client.request_count == 2
+        # Short page (10 < PAGE_SIZE) is enough to know we've seen all data;
+        # no need for the historical probe request.
+        assert contree_client.request_count == 1
 
     def test_show_max_across_pages(self, contree_client, capsys):
         """show_max truncates across page boundaries."""
@@ -379,19 +386,6 @@ class TestPsShowMax:
         assert "op-0" in out
         assert "op-1" not in out
 
-    def test_show_max_probe_uses_skip_of_one(self, contree_client):
-        """Probe is a single-record request after the cap."""
-        page = [_make_op(i) for i in range(5)]
-        _run_cmd_pages(
-            contree_client,
-            [page, []],
-            show_max=3,
-            all=True,
-        )
-        probe_path = contree_client.request_paths[1]
-        assert "limit=1" in probe_path
-        assert "offset=3" in probe_path
-
     def test_show_max_no_warning_when_probe_empty(self, contree_client, caplog):
         """Empty probe means we hit show_max but there's nothing more."""
         page = [_make_op(i) for i in range(3)]
@@ -413,7 +407,7 @@ class TestPsShowMax:
 
         FORMATTER.set(TableFormatter())
         ctx = copy_context()
-        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.ps"):
+        with caplog.at_level(logging.WARNING, logger="contree_cli.cli.operation"):
             ctx.run(cmd_ps, PsArgs(show_max=3, all=True))
 
         out = capsys.readouterr().out

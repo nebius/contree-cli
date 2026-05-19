@@ -612,7 +612,10 @@ class TestWait:
         assert rc == 1
         out = capsys.readouterr().out.strip().splitlines()
         data = json.loads(out[0])
-        assert data["status"] == "FAILED"
+        # status is the server's word; exit_code is reported separately
+        # and propagated to the CLI rc. Branch is not advanced because
+        # the sandbox process failed (non-zero exit).
+        assert data["status"] == "SUCCESS"
         assert data["exit_code"] == 1
         assert session_store.current_image == "img-1"
 
@@ -642,10 +645,35 @@ class TestWait:
         assert rc == 2
         out = capsys.readouterr().out.strip().splitlines()
         data = json.loads(out[0])
-        assert data["status"] == "FAILED"
+        assert data["status"] == "SUCCESS"
         assert data["exit_code"] == 2
         assert data["title"] == "sleep 1"
         assert session_store.current_image == "img-1"
+
+    def test_wait_unknown_field_passes_through(
+        self, contree_client, session_store, capsys
+    ) -> None:
+        """New server fields reach the row even when not hardcoded."""
+        SESSION_STORE.set(session_store)
+        FORMATTER.set(JSONFormatter())
+        session_store.set_image("img-1", kind="use")
+        contree_client.respond_json(
+            {
+                "uuid": "op-x",
+                "status": "SUCCESS",
+                "kind": "instance",
+                "duration": 1,
+                "session_key": "sess-1",
+                "future_field": "anything",
+                "metadata": {"result": {"state": {"exit_code": 0}}},
+                "result": {"image": "img-new"},
+            }
+        )
+        cmd_wait(WaitArgs(op_ids=["op-x"]))
+        out = capsys.readouterr().out.strip().splitlines()
+        data = json.loads(out[0])
+        assert data["session_key"] == "sess-1"
+        assert data["future_field"] == "anything"
 
     def test_show_defaults_to_last_20_and_logs_info(
         self,
@@ -849,9 +877,16 @@ class TestFromArgs:
         assert args.forward == 0
 
     def test_wait_args(self) -> None:
-        ns = argparse.Namespace(op_ids=["a", "b"])
+        uuid_a = "019e3fb6-e2d8-7350-a8f9-8b2b5ebfda7f"
+        uuid_b = "019e3fb6-e447-760d-b7ab-62ef51f91b1f"
+        ns = argparse.Namespace(op_ids=[uuid_a, uuid_b])
         args = WaitArgs.from_args(ns)
-        assert args.op_ids == ["a", "b"]
+        assert args.op_ids == [uuid_a, uuid_b]
+
+    def test_wait_args_rejects_invalid_uuid(self) -> None:
+        ns = argparse.Namespace(op_ids=["definitely-not-uuid"])
+        with pytest.raises(ValueError, match="Invalid operation reference"):
+            WaitArgs.from_args(ns)
 
     def test_show_args(self) -> None:
         ns = argparse.Namespace(
