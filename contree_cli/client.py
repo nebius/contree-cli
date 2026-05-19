@@ -573,6 +573,9 @@ class PaginatedFetcher:
     ``max_pages`` was reached without seeing the end.
     """
 
+    DEFAULT_PAGE_SIZE = 1000
+    UNLIMITED_MAX_PAGES = 1000  # 1M-record safety cap when limit=None.
+
     def __init__(
         self,
         client: ContreeClient,
@@ -580,19 +583,37 @@ class PaginatedFetcher:
         params: dict[str, str],
         extract: Callable[[bytes], list[dict[str, Any]]],
         *,
-        page_size: int,
-        max_pages: int,
+        limit: int | None,
+        page_size: int | None = None,
         concurrency: int = 8,
     ) -> None:
+        """Configure a paginated fetch.
+
+        ``limit`` is the caller's record budget (``--limit``, ``--show-max``).
+        ``None`` means "fetch everything up to ``UNLIMITED_MAX_PAGES * page_size``
+        records". When set, ``page_size`` is capped at ``limit + 1`` so a
+        small budget like ``--limit 5`` doesn't pull a 1000-row page just
+        to discard 995, and ``max_pages`` is sized to cover ``limit + 1``
+        records (the extra record lets callers detect "more available"
+        and warn). ``page_size`` defaults to :attr:`DEFAULT_PAGE_SIZE`.
+        """
         self.client = client
         self.path = path
         self.params = params
         self.extract = extract
-        self.page_size = page_size
-        self.max_pages = max_pages
         self.concurrency = concurrency
         self.exhausted = False
         self._stop = threading.Event()
+
+        default_page_size = page_size or self.DEFAULT_PAGE_SIZE
+        if limit is None:
+            self.page_size = default_page_size
+            self.max_pages = self.UNLIMITED_MAX_PAGES
+        else:
+            # Fetch one extra record so callers can detect "more results
+            # exist past --limit" and emit a warning.
+            self.page_size = min(default_page_size, limit + 1)
+            self.max_pages = (limit + self.page_size) // self.page_size + 1
 
     def stop(self) -> None:
         """Signal that the caller has seen enough; skip pending fetches."""

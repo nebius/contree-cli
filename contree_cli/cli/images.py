@@ -30,7 +30,7 @@ from contree_cli.types import (
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 1000
+PAGE_SIZE = PaginatedFetcher.DEFAULT_PAGE_SIZE
 LIMIT_DEFAULT = 3000
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 DOCKER_HUB = "docker.io"
@@ -277,8 +277,7 @@ def cmd_images(args: ImagesArgs) -> None:
         "/v1/images",
         base_params,
         lambda body: json.loads(body)["images"],
-        page_size=PAGE_SIZE,
-        max_pages=args.limit // PAGE_SIZE + 2,
+        limit=args.limit,
         concurrency=CONTREE_CONCURRENCY,
     )
 

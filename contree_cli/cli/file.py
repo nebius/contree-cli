@@ -80,7 +80,7 @@ class FileCpArgs(ArgumentsProtocol):
 
 
 FILE_LIST_LIMIT_DEFAULT = 1000
-FILE_LIST_PAGE_SIZE = 1000
+FILE_LIST_PAGE_SIZE = PaginatedFetcher.DEFAULT_PAGE_SIZE
 
 
 @dataclass(frozen=True)
@@ -333,8 +333,7 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
         "/v1/files",
         params,
         lambda body: json.loads(body).get("files", []),
-        page_size=FILE_LIST_PAGE_SIZE,
-        max_pages=args.limit // FILE_LIST_PAGE_SIZE + 2,
+        limit=args.limit,
         concurrency=CONTREE_CONCURRENCY,
     )
 

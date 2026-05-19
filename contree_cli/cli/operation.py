@@ -48,10 +48,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 1000
-# Hard cap on pages fetched when --show-max is omitted (1M operations).
-UNLIMITED_PAGE_CAP = 1000
-
+PAGE_SIZE = PaginatedFetcher.DEFAULT_PAGE_SIZE
 
 ACTIVE_STATUSES = frozenset({"PENDING", "ASSIGNED", "EXECUTING"})
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
@@ -396,16 +393,12 @@ def cmd_list(args: ListArgs) -> None:
         base_params["until"] = isoformat_datetime(args.until)
 
     limit = args.show_max
-    # +1 page so we can detect "more results exist" beyond the limit.
-    max_pages = limit // PAGE_SIZE + 2 if limit is not None else UNLIMITED_PAGE_CAP
-
     fetcher = PaginatedFetcher(
         client,
         "/v1/operations",
         base_params,
         json.loads,
-        page_size=PAGE_SIZE,
-        max_pages=max_pages,
+        limit=limit,
         concurrency=CONTREE_CONCURRENCY,
     )
 
