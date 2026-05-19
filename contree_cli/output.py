@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import sys
+import threading
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
@@ -17,9 +18,7 @@ from contree_cli.types import STDOUT_IS_A_TTY, Colors, parse_datetime
 log = logging.getLogger(__name__)
 
 
-DATETIME_FIELDS = frozenset(
-    {"created_at", "started_at", "finished_at", "updated_at"},
-)
+DATETIME_FIELDS = frozenset({"created_at", "updated_at"})
 
 
 def transform_field(key: str, value: Any) -> Any:
@@ -253,28 +252,33 @@ class JSONPrettyFormatter(OutputFormatter):
         self._rows: list[OrderedDict[str, Any]] = []
         self._opened = False
         self._first_row = True
+        self.flush_lock = threading.RLock()
 
     def write(self, row: OrderedDict[str, Any]) -> None:
         self._rows.append(row)
 
     def flush(self) -> None:
-        if not self._rows:
-            return
-        if not self._opened:
-            sys.stdout.write("[\n")
-            self._opened = True
-        for row in self._rows:
-            prefix = "" if self._first_row else ",\n"
-            self._first_row = False
-            sys.stdout.write(prefix + json.dumps(row, indent=2, default=_json_default))
-        self._rows.clear()
+        with self.flush_lock:
+            if not self._rows:
+                return
+            if not self._opened:
+                sys.stdout.write("[\n")
+                self._opened = True
+            for row in self._rows:
+                prefix = "" if self._first_row else ",\n"
+                self._first_row = False
+                sys.stdout.write(
+                    prefix + json.dumps(row, indent=2, default=_json_default)
+                )
+            self._rows.clear()
 
     def close(self) -> None:
         self.flush()
-        if self._opened:
-            sys.stdout.write("\n]\n")
-            self._opened = False
-            self._first_row = True
+        with self.flush_lock:
+            if self._opened:
+                sys.stdout.write("\n]\n")
+                self._opened = False
+                self._first_row = True
 
 
 class TableFormatter(OutputFormatter):
@@ -310,84 +314,86 @@ class TableFormatter(OutputFormatter):
         self._columns: list[str] | None = None
         self._widths: dict[str, int] | None = None
         self._col_colors: dict[str, Colors] = {}
+        self.flush_lock = threading.RLock()
 
     def write(self, row: OrderedDict[str, Any]) -> None:
         self._rows.append(row)
 
     def flush(self) -> None:
-        if not self._rows:
-            return
-        first_flush = self._columns is None
-        if first_flush:
-            columns = list(self._rows[0].keys())
-            widths = {col: len(col) for col in columns}
-            for row in self._rows:
-                for col in columns:
-                    for line in _format_value(row.get(col, "")).split("\n"):
-                        widths[col] = max(widths[col], len(line))
-            truncated = False
-            if STDOUT_IS_A_TTY:
-                term_width = shutil.get_terminal_size().columns
-                separator_space = (len(columns) - 1) * 2
-                available = term_width - separator_space
-                if sum(widths.values()) > available > 0:
-                    widths, truncated = _fit_columns(
-                        widths,
-                        columns,
-                        available,
-                        self.MIN_COL_WIDTH,
-                    )
-            self._columns = columns
-            self._widths = widths
-            if STDOUT_IS_A_TTY:
-                for idx, col in enumerate(columns):
-                    self._col_colors[col] = self.COLUMN_PALETTE[
-                        idx % len(self.COLUMN_PALETTE)
-                    ]
-            header_parts: list[str] = []
-            for col in columns:
-                padded = _truncate(
-                    col.upper(),
-                    widths[col],
-                    self.ELLIPSIS,
-                ).ljust(widths[col])
+        with self.flush_lock:
+            if not self._rows:
+                return
+            first_flush = self._columns is None
+            if first_flush:
+                columns = list(self._rows[0].keys())
+                widths = {col: len(col) for col in columns}
+                for row in self._rows:
+                    for col in columns:
+                        for line in _format_value(row.get(col, "")).split("\n"):
+                            widths[col] = max(widths[col], len(line))
+                truncated = False
                 if STDOUT_IS_A_TTY:
-                    padded = Colors.BOLD(padded)
-                header_parts.append(padded)
-            sys.stdout.write("  ".join(header_parts) + "\n")
-            if truncated:
-                log.warning(
-                    "Output truncated to fit terminal;"
-                    " use --format json to see full values",
-                )
-        assert self._columns is not None
-        assert self._widths is not None
-        columns = self._columns
-        widths = self._widths
-        for row in self._rows:
-            split_row = {
-                col: _format_value(row.get(col, "")).split("\n") for col in columns
-            }
-            height = max(len(split_row[col]) for col in columns)
-            for i in range(height):
-                parts: list[str] = []
+                    term_width = shutil.get_terminal_size().columns
+                    separator_space = (len(columns) - 1) * 2
+                    available = term_width - separator_space
+                    if sum(widths.values()) > available > 0:
+                        widths, truncated = _fit_columns(
+                            widths,
+                            columns,
+                            available,
+                            self.MIN_COL_WIDTH,
+                        )
+                self._columns = columns
+                self._widths = widths
+                if STDOUT_IS_A_TTY:
+                    for idx, col in enumerate(columns):
+                        self._col_colors[col] = self.COLUMN_PALETTE[
+                            idx % len(self.COLUMN_PALETTE)
+                        ]
+                header_parts: list[str] = []
                 for col in columns:
-                    lines = split_row[col]
-                    cell = lines[i] if i < len(lines) else ""
                     padded = _truncate(
-                        cell,
+                        col.upper(),
                         widths[col],
                         self.ELLIPSIS,
                     ).ljust(widths[col])
-                    if col in self._col_colors:
-                        color = self.VALUE_COLORS.get(
-                            cell.strip(),
-                            self._col_colors[col],
-                        )
-                        padded = color(padded)
-                    parts.append(padded)
-                sys.stdout.write("  ".join(parts) + "\n")
-        self._rows.clear()
+                    if STDOUT_IS_A_TTY:
+                        padded = Colors.BOLD(padded)
+                    header_parts.append(padded)
+                sys.stdout.write("  ".join(header_parts) + "\n")
+                if truncated:
+                    log.warning(
+                        "Output truncated to fit terminal;"
+                        " use --format json to see full values",
+                    )
+            assert self._columns is not None
+            assert self._widths is not None
+            columns = self._columns
+            widths = self._widths
+            for row in self._rows:
+                split_row = {
+                    col: _format_value(row.get(col, "")).split("\n") for col in columns
+                }
+                height = max(len(split_row[col]) for col in columns)
+                for i in range(height):
+                    parts: list[str] = []
+                    for col in columns:
+                        lines = split_row[col]
+                        cell = lines[i] if i < len(lines) else ""
+                        padded = _truncate(
+                            cell,
+                            widths[col],
+                            self.ELLIPSIS,
+                        ).ljust(widths[col])
+                        if col in self._col_colors:
+                            color = self.VALUE_COLORS.get(
+                                cell.strip(),
+                                self._col_colors[col],
+                            )
+                            padded = color(padded)
+                        parts.append(padded)
+                    sys.stdout.write("  ".join(parts) + "\n")
+            self._rows.clear()
 
 
 class DefaultFormatter(TableFormatter):
@@ -414,6 +420,9 @@ class PlainFormatter(OutputFormatter):
             indent = " " * len(label)
             for line in lines[1:]:
                 sys.stdout.write(f"{indent}{line}\n")
+
+    def flush(self) -> None:
+        sys.stdout.flush()
 
 
 FORMATTERS: dict[str, type[OutputFormatter]] = {
@@ -484,21 +493,23 @@ try:
         def __init__(self) -> None:
             super().__init__()
             self._rows: list[OrderedDict[str, Any]] = []
+            self.flush_lock = threading.RLock()
 
         def write(self, row: OrderedDict[str, Any]) -> None:
             self._rows.append(row)
 
         def flush(self) -> None:
-            if not self._rows:
-                return
-            parts: list[str] = []
-            for row in self._rows:
-                parts.append("[[results]]")
-                for key, val in row.items():
-                    parts.append(f"{key} = {_toml_value(val)}")
-                parts.append("")
-            sys.stdout.write("\n".join(parts))
-            self._rows.clear()
+            with self.flush_lock:
+                if not self._rows:
+                    return
+                parts: list[str] = []
+                for row in self._rows:
+                    parts.append("[[results]]")
+                    for key, val in row.items():
+                        parts.append(f"{key} = {_toml_value(val)}")
+                    parts.append("")
+                sys.stdout.write("\n".join(parts))
+                self._rows.clear()
 
     FORMATTERS["toml"] = TOMLFormatter
 

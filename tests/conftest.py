@@ -29,6 +29,18 @@ for var in (
     os.environ.pop(var, None)
 
 
+@pytest.fixture(autouse=True)
+def _sequential_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force PaginatedFetcher to use concurrency=1 in tests.
+
+    The mock client's response queue is FIFO and not thread-safe;
+    parallel fetches would race on it. Sequential keeps tests
+    deterministic without affecting handler logic under test.
+    """
+    for mod in ("contree_cli.cli.ps", "contree_cli.cli.images", "contree_cli.cli.file"):
+        monkeypatch.setattr(f"{mod}.CONTREE_CONCURRENCY", 1, raising=False)
+
+
 @dataclass
 class FakeResponse:
     """Minimal HTTPResponse-compatible object for tests."""

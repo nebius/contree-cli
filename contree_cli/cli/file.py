@@ -33,9 +33,15 @@ from contree_cli import (
     ArgumentsProtocol,
     SetupResult,
 )
-from contree_cli.client import ApiError, ContreeClient, resolve_image, stream_response
+from contree_cli.client import (
+    ApiError,
+    ContreeClient,
+    PaginatedFetcher,
+    resolve_image,
+    stream_response,
+)
 from contree_cli.config import EDITOR
-from contree_cli.session import SessionStore
+from contree_cli.session import CONTREE_CONCURRENCY, SessionStore
 from contree_cli.types import (
     FLAGS,
     isoformat_datetime,
@@ -322,17 +328,23 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
     if args.until is not None:
         params["until"] = isoformat_datetime(args.until)
 
-    offset = 0
+    fetcher = PaginatedFetcher(
+        client,
+        "/v1/files",
+        params,
+        lambda body: json.loads(body).get("files", []),
+        page_size=FILE_LIST_PAGE_SIZE,
+        max_pages=args.limit // FILE_LIST_PAGE_SIZE + 2,
+        concurrency=CONTREE_CONCURRENCY,
+    )
+
     emitted = 0
-    while emitted < args.limit:
-        page_size = min(FILE_LIST_PAGE_SIZE, args.limit - emitted)
-        page = {**params, "offset": str(offset), "limit": str(page_size)}
-        resp = client.get("/v1/files", params=page)
-        data = json.loads(resp.read())
-        files = data.get("files", [])
-        if not files:
-            return None
-        for entry in files:
+    hit_limit = False
+    for page in fetcher:
+        for entry in page:
+            if emitted >= args.limit:
+                hit_limit = True
+                break
             uuid_str = entry.get("uuid")
             source = sources.get(uuid_str, "") if isinstance(uuid_str, str) else ""
             if args.quiet:
@@ -341,19 +353,15 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
                     sha256=entry.get("sha256", ""),
                     source=source,
                 )
-                continue
-            formatter(**{**entry, "source": source})
+            else:
+                formatter(**{**entry, "source": source})
+            emitted += 1
         formatter.flush()
-        emitted += len(files)
-        if len(files) < page_size:
-            return None
-        offset += len(files)
+        if hit_limit:
+            fetcher.stop()
+            break
 
-    probe = {**params, "offset": str(offset), "limit": "1"}
-    resp = client.get("/v1/files", params=probe)
-    data = json.loads(resp.read())
-    if data.get("files"):
-        formatter.flush()
+    if hit_limit:
         logger.warning(
             "Output truncated at --limit=%d files; more results are"
             " available. Raise --limit or narrow with --since/--until.",

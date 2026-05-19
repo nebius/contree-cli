@@ -181,6 +181,48 @@ class TestRetry:
         delays = [call.args[0] for call in mock_sleep.call_args_list]
         assert delays == list(RETRY_DELAYS[:3])
 
+    def test_retry_on_network_error_then_succeeds(self):
+        """A transient gaierror is retried like a 5xx response."""
+        import socket
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=200, body=b'{"ok":true}')
+
+        call_count = {"n": 0}
+        real_connect = c._connect
+
+        def flaky_connect():
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                raise socket.gaierror(8, "nodename nor servname provided")
+            return real_connect()
+
+        c._connect = flaky_connect  # type: ignore[method-assign]
+
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            result = c.request("GET", "/v1/images")
+
+        assert result.body == b'{"ok":true}'
+        assert call_count["n"] == 3
+        assert mock_sleep.call_count == 2
+
+    def test_retry_exhausted_raises_network_error(self):
+        """When retries run out, the last network error propagates."""
+        import socket
+
+        c = ContreeTestClient("https://contree.dev", "tok")
+
+        def always_fails():
+            raise socket.gaierror(8, "nodename nor servname provided")
+
+        c._connect = always_fails  # type: ignore[method-assign]
+
+        with (
+            patch("contree_cli.client.time.sleep"),
+            pytest.raises(socket.gaierror),
+        ):
+            c.request("GET", "/v1/images")
+
 
 # ---------------------------------------------------------------------------
 # Convenience methods

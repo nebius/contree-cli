@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
+from contree_cli.client import PaginatedFetcher
 from contree_cli.output import OutputFormatter
+from contree_cli.session import CONTREE_CONCURRENCY
 from contree_cli.types import (
     FLAGS,
     isoformat_datetime,
@@ -28,6 +30,8 @@ from contree_cli.types import (
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 1000
+# Hard cap on pages fetched when --show-max is omitted (1M operations).
+UNLIMITED_PAGE_CAP = 1000
 ACTIVE_STATUSES = frozenset({"PENDING", "ASSIGNED", "EXECUTING"})
 
 EPILOG = """\
@@ -142,22 +146,23 @@ def cmd_ps(args: PsArgs) -> None:
         base_params["until"] = isoformat_datetime(args.until)
 
     limit = args.show_max
-    offset = 0
+    # +1 page so we can detect "more results exist" beyond the limit.
+    max_pages = limit // PAGE_SIZE + 2 if limit is not None else UNLIMITED_PAGE_CAP
+
+    fetcher = PaginatedFetcher(
+        client,
+        "/v1/operations",
+        base_params,
+        json.loads,
+        page_size=PAGE_SIZE,
+        max_pages=max_pages,
+        concurrency=CONTREE_CONCURRENCY,
+    )
+
     emitted = 0
     hit_limit = False
-
-    while limit is None or emitted < limit:
-        page_size = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - emitted)
-        params = {
-            **base_params,
-            "offset": str(offset),
-            "limit": str(page_size),
-        }
-        resp = client.get("/v1/operations", params=params)
-        operations = json.loads(resp.read())
-        if not operations:
-            return
-        for op in operations:
+    for page in fetcher:
+        for op in page:
             if limit is not None and emitted >= limit:
                 hit_limit = True
                 break
@@ -168,21 +173,10 @@ def cmd_ps(args: PsArgs) -> None:
             emitted += 1
         formatter.flush()
         if hit_limit:
+            fetcher.stop()
             break
-        if len(operations) < page_size:
-            return
-        offset += len(operations)
 
-    if limit is None:
-        return
-
-    # Hit the limit. Probe one extra record (offset=emitted, limit=1) to
-    # detect truncation without re-fetching a full page.
-    probe_params = {**base_params, "offset": str(emitted), "limit": "1"}
-    resp = client.get("/v1/operations", params=probe_params)
-    operations = json.loads(resp.read())
-    if operations:
-        formatter.flush()
+    if hit_limit:
         logger.warning(
             "Output truncated at --show-max=%d operations; more results"
             " are available. Raise --show-max or filter with"

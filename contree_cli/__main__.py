@@ -1,4 +1,5 @@
 import contextvars
+import http.client
 import logging
 import sys
 from collections.abc import Callable
@@ -97,6 +98,9 @@ def main() -> None:
             exit_code = ctx.run(handler, loader.from_args(args))
         except ApiError as exc:
             log.error("%s", exc)
+            exit(1)
+        except (OSError, http.client.HTTPException) as exc:
+            log.error("Network error: %s", exc)
             exit(1)
         except KeyboardInterrupt:
             log.error("User interrupted")

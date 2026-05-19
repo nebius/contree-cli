@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
-from contree_cli.client import ApiError
+from contree_cli.client import ApiError, PaginatedFetcher
+from contree_cli.session import CONTREE_CONCURRENCY
 from contree_cli.types import (
     FLAGS,
     ArgumentsFormatter,
@@ -271,37 +272,31 @@ def cmd_images(args: ImagesArgs) -> None:
     if args.until is not None:
         base_params["until"] = isoformat_datetime(args.until)
 
-    offset = 0
-    emitted = 0
-    while emitted < args.limit:
-        page_size = min(PAGE_SIZE, args.limit - emitted)
-        params = {
-            **base_params,
-            "offset": str(offset),
-            "limit": str(page_size),
-        }
-        resp = client.get("/v1/images", params=params)
-        data = json.loads(resp.read())
-        images = data["images"]
-        if not images:
-            return
-        for image in images:
-            formatter(**image)
-        formatter.flush()
-        emitted += len(images)
-        if len(images) < page_size:
-            return
-        offset += len(images)
+    fetcher = PaginatedFetcher(
+        client,
+        "/v1/images",
+        base_params,
+        lambda body: json.loads(body)["images"],
+        page_size=PAGE_SIZE,
+        max_pages=args.limit // PAGE_SIZE + 2,
+        concurrency=CONTREE_CONCURRENCY,
+    )
 
-    # Hit the limit. Probe one extra record (offset=emitted, limit=1) to
-    # detect truncation without re-fetching a full page.
-    probe_params = {**base_params, "offset": str(offset), "limit": "1"}
-    resp = client.get("/v1/images", params=probe_params)
-    data = json.loads(resp.read())
-    if data.get("images"):
-        # Flush buffered output (e.g. TableFormatter) before the warning
-        # so the truncation note appears AFTER the listing on screen.
+    emitted = 0
+    hit_limit = False
+    for page in fetcher:
+        for image in page:
+            if emitted >= args.limit:
+                hit_limit = True
+                break
+            formatter(**image)
+            emitted += 1
         formatter.flush()
+        if hit_limit:
+            fetcher.stop()
+            break
+
+    if hit_limit:
         logger.warning(
             "Output truncated at --limit=%d images; more results are"
             " available. Raise --limit or narrow with"

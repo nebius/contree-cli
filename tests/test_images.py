@@ -280,18 +280,21 @@ class TestImagesPagination:
         warns = [r for r in caplog.records if r.levelname == "WARNING"]
         assert not any("truncated" in r.getMessage() for r in warns)
 
-    def test_limit_request_uses_capped_page_size(self, contree_client):
-        """When --limit < PAGE_SIZE, the API request asks for limit items only."""
-        contree_client.respond_json({"images": [_make_image(i) for i in range(3)]})
-        contree_client.respond_json({"images": []})  # probe
+    def test_limit_smaller_than_page_size_emits_only_limit_records(
+        self, contree_client, capsys
+    ):
+        """--limit < PAGE_SIZE: caller emits exactly limit records from the page."""
+        contree_client.respond_json(
+            {"images": [_make_image(i) for i in range(PAGE_SIZE)]}
+        )
 
         FORMATTER.set(CSVFormatter())
         ctx = copy_context()
         ctx.run(cmd_images, ImagesArgs(limit=3))
 
-        assert "limit=3" in contree_client.request_paths[0]
-        assert "limit=1" in contree_client.request_paths[1]
-        assert contree_client.request_count == 2
+        out = capsys.readouterr().out
+        # 1 header row + 3 data rows.
+        assert len(out.strip().splitlines()) == 4
 
     def test_progress_not_logged_for_single_short_page(self, contree_client, caplog):
         """Final/only partial page does not emit progress (output covers it)."""
