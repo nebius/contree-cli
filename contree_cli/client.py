@@ -619,6 +619,17 @@ class PaginatedFetcher:
         """Signal that the caller has seen enough; skip pending fetches."""
         self._stop.set()
 
+    def __enter__(self) -> PaginatedFetcher:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        # Setting the stop event short-circuits any worker that hasn't
+        # started yet and prevents the iterator's refill from enqueueing
+        # more fetches. Callers wrap iteration in `with PaginatedFetcher(...)`
+        # so they don't have to remember an explicit `stop()` after
+        # breaking out of a paged loop.
+        self.stop()
+
     def _fetch(self, offset: int) -> list[dict[str, Any]]:
         if self._stop.is_set():
             return []

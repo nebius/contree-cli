@@ -668,11 +668,12 @@ class TestPaginatedFetcherLimit:
         # `limit=5` must request `limit=6` (capped page size + 1 for the
         # truncation probe), not the default 1000.
         contree_client.respond_json({"items": [{"i": i} for i in range(6)]})
-        f = self.make_fetcher(contree_client, limit=5)
-        pages_iter = iter(f)
-        first = next(pages_iter)
-        assert len(first) == 6
-        f.stop()  # mirror the real caller, which calls stop() after hitting limit
+        with self.make_fetcher(contree_client, limit=5) as f:
+            pages_iter = iter(f)
+            first = next(pages_iter)
+            assert len(first) == 6
+            # Context manager exit calls stop() automatically; mirrors the
+            # real caller which breaks out of the loop after hitting limit.
         with contextlib.suppress(StopIteration):
             next(pages_iter)
         req = contree_client.get_request(0)

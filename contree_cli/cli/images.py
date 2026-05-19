@@ -272,28 +272,26 @@ def cmd_images(args: ImagesArgs) -> None:
     if args.until is not None:
         base_params["until"] = isoformat_datetime(args.until)
 
-    fetcher = PaginatedFetcher(
+    emitted = 0
+    hit_limit = False
+    with PaginatedFetcher(
         client,
         "/v1/images",
         base_params,
         lambda body: json.loads(body)["images"],
         limit=args.limit,
         concurrency=CONTREE_CONCURRENCY,
-    )
-
-    emitted = 0
-    hit_limit = False
-    for page in fetcher:
-        for image in page:
-            if emitted >= args.limit:
-                hit_limit = True
+    ) as fetcher:
+        for page in fetcher:
+            for image in page:
+                if emitted >= args.limit:
+                    hit_limit = True
+                    break
+                formatter(**image)
+                emitted += 1
+            formatter.flush()
+            if hit_limit:
                 break
-            formatter(**image)
-            emitted += 1
-        formatter.flush()
-        if hit_limit:
-            fetcher.stop()
-            break
 
     if hit_limit:
         logger.warning(

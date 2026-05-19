@@ -328,37 +328,35 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
     if args.until is not None:
         params["until"] = isoformat_datetime(args.until)
 
-    fetcher = PaginatedFetcher(
+    emitted = 0
+    hit_limit = False
+    with PaginatedFetcher(
         client,
         "/v1/files",
         params,
         lambda body: json.loads(body).get("files", []),
         limit=args.limit,
         concurrency=CONTREE_CONCURRENCY,
-    )
-
-    emitted = 0
-    hit_limit = False
-    for page in fetcher:
-        for entry in page:
-            if emitted >= args.limit:
-                hit_limit = True
+    ) as fetcher:
+        for page in fetcher:
+            for entry in page:
+                if emitted >= args.limit:
+                    hit_limit = True
+                    break
+                uuid_str = entry.get("uuid")
+                source = sources.get(uuid_str, "") if isinstance(uuid_str, str) else ""
+                if args.quiet:
+                    formatter(
+                        uuid=uuid_str,
+                        sha256=entry.get("sha256", ""),
+                        source=source,
+                    )
+                else:
+                    formatter(**{**entry, "source": source})
+                emitted += 1
+            formatter.flush()
+            if hit_limit:
                 break
-            uuid_str = entry.get("uuid")
-            source = sources.get(uuid_str, "") if isinstance(uuid_str, str) else ""
-            if args.quiet:
-                formatter(
-                    uuid=uuid_str,
-                    sha256=entry.get("sha256", ""),
-                    source=source,
-                )
-            else:
-                formatter(**{**entry, "source": source})
-            emitted += 1
-        formatter.flush()
-        if hit_limit:
-            fetcher.stop()
-            break
 
     if hit_limit:
         logger.warning(
