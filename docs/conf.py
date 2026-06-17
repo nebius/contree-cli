@@ -17,6 +17,7 @@ extensions = [
     "sphinx_design",
     "contree_doc_ext",
     "terminal_ext",
+    "sphinx_mintlify_output",
 ]
 
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
@@ -38,4 +39,13 @@ html_logo = "_static/logo.svg"
 html_theme_options = {
     "navigation_with_keys": True,
     "sidebar_hide_name": True,
+}
+
+
+# -- Mintlify output --------------------------------------------------------
+
+mintlify_docs_json = {
+    "name": "ConTree CLI",
+    "theme": "mint",
+    "logo": {"light": "_static/logo.svg", "dark": "_static/logo.svg"},
 }

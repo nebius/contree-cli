@@ -1,3 +1,7 @@
+---
+icon: gear
+---
+
 # Configuration & Profiles
 
 Profiles let you store credentials for multiple projects or environments

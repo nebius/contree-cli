@@ -1,3 +1,7 @@
+---
+icon: book-open-cover
+---
+
 # Command Reference
 
 ```{terminal-shell} contree --help
@@ -5,7 +9,6 @@
 
 ```{toctree}
 :maxdepth: 1
-:caption: Commands
 
 auth
 use

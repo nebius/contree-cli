@@ -1,4 +1,9 @@
+---
+icon: hammer
+---
+
 % build command reference for the Docker-style Dockerfile interpreter
+
 # build - Build an image from a Dockerfile
 
 Build an image from a `Dockerfile`. Each directive runs against the

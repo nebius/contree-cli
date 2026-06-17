@@ -1,3 +1,7 @@
+---
+icon: folder-open
+---
+
 # Working with Files
 
 contree-cli lets you inject local files into sandboxes, edit remote files
@@ -8,6 +12,8 @@ in-place, and stage changes that automatically apply on the next run.
 Use `--file` / `-F` on `contree run` to attach a local file:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run --file ./app.py python /app.py
@@ -27,6 +33,8 @@ By default the file is placed at the same path inside the sandbox.
 Specify a different destination with a colon:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run --file ./app.py:/app/main.py python /app/main.py
@@ -113,6 +121,8 @@ from a different session or machine, it is reused without re-uploading.
 ## Edit remote files
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 `contree file edit` downloads a file from the session image, opens it
 in your `$EDITOR`, and stages the changes as a pending file:
@@ -153,6 +163,8 @@ you to fill in.
 You can edit multiple files before running:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree file edit /etc/nginx/nginx.conf
@@ -177,6 +189,8 @@ Both edits are staged as pending and applied together on the next run.
 `contree file cp` copies a local file into the session as a pending file:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree file cp ./config.yaml /etc/app/config.yaml
@@ -196,6 +210,8 @@ The file will be included in the next `contree run` automatically.
 ### Build up a working environment
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree file cp ./app.py /app/app.py

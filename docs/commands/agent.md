@@ -1,3 +1,7 @@
+---
+icon: robot
+---
+
 # agent - Coding-agent manual
 
 Display the coding-agent manual — a guide for AI agents and automated

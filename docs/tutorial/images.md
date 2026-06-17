@@ -1,3 +1,7 @@
+---
+icon: layer-group
+---
+
 # Images & Tags
 
 Images are filesystem snapshots. Every non-disposable `contree run`

@@ -1,3 +1,7 @@
+---
+icon: code-branch
+---
+
 # Sessions, Branches & Rollback
 
 Sessions track the current image and its history as you run commands. Every
@@ -29,6 +33,8 @@ The auto-generated key is a deterministic UUID5 derived from three values:
 ## Viewing session state
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree session            # show current session info
@@ -51,6 +57,8 @@ contree session show
 Create a branch to experiment without affecting the main line:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree session branch experiment
@@ -71,6 +79,8 @@ apt-get install -y curl
 Not happy? Switch back:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree session checkout main
@@ -90,6 +100,8 @@ pointer at the current position.
 Create a branch from another branch:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree session branch hotfix --from main
@@ -106,6 +118,8 @@ contree session branch hotfix --from main
 List branches (`*` marks the active one):
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree session branch
@@ -132,6 +146,8 @@ absolute jumps from relative navigation:
 | `N` (bare positive) | **Absolute** jump to history id `N` |
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree session rollback           # back one entry
@@ -166,6 +182,8 @@ Because the auto-generated key is deterministic, the same terminal always
 resumes the same session. Use `--new` (`-N`) to start a fresh session:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 # bash / zsh

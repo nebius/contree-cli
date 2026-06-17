@@ -14,6 +14,9 @@ check: lint types
 tests: check
 	uv run pytest --cov=contree_cli --cov-report=term-missing
 
+docs-mintlify:
+	$(MAKE) -C docs mintlify
+
 docs:
 	$(MAKE) -C docs html
 

@@ -1,3 +1,7 @@
+---
+icon: rocket
+---
+
 # Your First Sandbox
 
 Now that you're authenticated, let's spin up a sandbox and explore it.
@@ -7,6 +11,8 @@ Now that you're authenticated, let's spin up a sandbox and explore it.
 List available images:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree images --prefix=ubuntu
@@ -102,6 +108,8 @@ Without `-S`, the auto-generated session is used (tied to current terminal).
 ## Run a command
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run uname -a
@@ -140,6 +148,8 @@ Both `contree run uname -a` and `contree run -- uname -a` work the same way.
 See what image and session you're working with:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree use
@@ -160,6 +170,8 @@ Running `contree use` without arguments prints the current session info.
 Commands chain naturally. Each run advances the session image:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run apt-get update -qq
@@ -201,6 +213,8 @@ contree cd                   # reset to sandbox default
 List files and read content without spawning a new sandbox:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree ls /usr/bin
@@ -229,6 +243,8 @@ contree run cat /etc/os-release
 Copy a file from the sandbox to your local machine:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree cp /etc/os-release ./os-release.txt
@@ -250,6 +266,8 @@ Use `-D` / `--disposable` when you want to run a command without advancing the
 session image. Changes are discarded after execution:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run -D -- rm -rf /important

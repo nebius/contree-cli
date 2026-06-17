@@ -1,3 +1,7 @@
+---
+icon: list
+---
+
 # ps - List activity
 
 :::{note}

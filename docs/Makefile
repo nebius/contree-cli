@@ -11,5 +11,15 @@ help:
 html:
 	$(SPHINXBUILD) -b html "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS)
 
+mintlify-build:
+	$(SPHINXBUILD) -b mintlify "$(SOURCEDIR)" "$(BUILDDIR)/mintlify" $(SPHINXOPTS)
+
+mintlify-clean:
+	rm -rf $(BUILDDIR)/mintlify
+
+mintlify:
+	$(MAKE) mintlify-clean
+	LC_ALL=C.UTF-8 $(MAKE) mintlify-build
+
 clean:
 	rm -rf $(BUILDDIR)

@@ -1,4 +1,8 @@
-# contree-cli
+---
+icon: book-open-lines
+---
+
+# Overview
 
 Command-line client for the [ConTree](https://contree.dev) sandboxing platform.
 
@@ -108,7 +112,7 @@ new instance.
 ::::
 
 ```{toctree}
-:maxdepth: 2
+:maxdepth: 1
 :hidden:
 
 tutorial/index

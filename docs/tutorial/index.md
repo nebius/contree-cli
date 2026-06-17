@@ -1,3 +1,7 @@
+---
+icon: graduation-cap
+---
+
 # Tutorial
 
 Learn contree-cli by building a real workflow -- from zero to automated
@@ -103,6 +107,8 @@ how profiles affect sessions, and configure environment variables.
 If you just want to see contree-cli in action before diving in:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 # install

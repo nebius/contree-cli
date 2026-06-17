@@ -1,3 +1,7 @@
+---
+icon: hammer
+---
+
 # Building from a Dockerfile
 
 `contree build` turns a familiar `Dockerfile` into a ConTree image. Each

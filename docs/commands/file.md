@@ -1,3 +1,7 @@
+---
+icon: file
+---
+
 # file - Stage file edits for the next run
 
 Stage file changes for the next `contree run`. Pending files are

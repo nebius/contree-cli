@@ -1,3 +1,7 @@
+---
+icon: spinner
+---
+
 # operation - Manage operations
 
 Manage operations under a single namespace. Aggregates `ps` (list),

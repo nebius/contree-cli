@@ -1,3 +1,7 @@
+---
+icon: magnifying-glass
+---
+
 # show - Inspect an operation
 
 :::{note}

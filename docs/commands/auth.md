@@ -1,3 +1,7 @@
+---
+icon: key
+---
+
 # auth - Configure credentials and profiles
 
 Configure authentication tokens and manage profiles. Each profile stores
