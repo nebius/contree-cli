@@ -19,7 +19,7 @@ mintlify-clean:
 
 mintlify:
 	$(MAKE) mintlify-clean
-	LC_ALL=C.UTF-8 $(MAKE) mintlify-build
+	$(MAKE) mintlify-build
 
 clean:
 	rm -rf $(BUILDDIR)
