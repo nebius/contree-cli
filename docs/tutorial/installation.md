@@ -1,3 +1,7 @@
+---
+icon: download
+---
+
 # Install & Authenticate
 
 ## Requirements
@@ -8,6 +12,8 @@
 ## Install
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} uv (recommended)
 ```bash
 uv tool install contree-cli

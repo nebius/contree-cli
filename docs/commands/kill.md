@@ -1,3 +1,7 @@
+---
+icon: circle-xmark
+---
+
 # kill - Cancel operations
 
 :::{note}

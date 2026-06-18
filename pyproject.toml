@@ -58,6 +58,7 @@ docs = [
     "furo",
     "sphinx-design",
     "myst-parser",
+    "sphinx-mintlify-output",
 ]
 
 [tool.pytest.ini_options]

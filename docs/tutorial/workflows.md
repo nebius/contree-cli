@@ -1,3 +1,7 @@
+---
+icon: gears
+---
+
 # Scripting & Automation
 
 contree-cli is designed for scripting. Exit codes propagate, output formats
@@ -71,6 +75,8 @@ is a Python script. Without `-S`, the kernel sees a nested shebang
 The default mode. Each positional argument becomes a separate argv entry:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run uname -a
@@ -89,6 +95,8 @@ uname -a
 `-s` joins all arguments into a single shell expression:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run -s -- 'echo hello && ls /'
@@ -128,6 +136,8 @@ cat deploy.sh | contree run /bin/sh
 `-d` spawns the operation and exits immediately, printing the operation UUID:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run -d -- long-running-task
@@ -181,6 +191,8 @@ exits with code 1.
 Pass environment variables into the sandbox with `-e`:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run -e DEBUG=1 -e DB_HOST=postgres -- ./app
@@ -204,6 +216,8 @@ By default, stdout/stderr is capped at 64 KiB in the API response. Override
 with `-T`:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree run -T 1048576 -- ./generate-big-output.sh
@@ -222,6 +236,8 @@ contree run -T 1048576 -- ./generate-big-output.sh
 List running and recent operations:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree ps            # active operations only
@@ -242,6 +258,8 @@ contree ps -q
 Show the full result of a specific operation:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree show UUID
@@ -258,6 +276,8 @@ contree show UUID
 Cancel an operation:
 
 ::::{tab-set}
+:class: no-sync
+
 :::{tab-item} CLI
 ```bash
 contree kill UUID

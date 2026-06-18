@@ -1,3 +1,7 @@
+---
+icon: folder
+---
+
 # cd - Change session working directory
 
 Change the working directory for subsequent commands in the current session.

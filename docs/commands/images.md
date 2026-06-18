@@ -1,3 +1,7 @@
+---
+icon: layer-group
+---
+
 # images - List and import images
 
 List images in the project. Images are the filesystem snapshots that sandboxes

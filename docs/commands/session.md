@@ -1,3 +1,7 @@
+---
+icon: clock
+---
+
 # session - Manage sessions, branches, history
 
 Manage session branches and history. Sessions track the image state as you

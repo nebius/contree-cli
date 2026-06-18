@@ -1,3 +1,7 @@
+---
+icon: leaf
+---
+
 # env - Manage session environment variables
 
 Manage session-level environment variables. Variables set with `env` are

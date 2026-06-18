@@ -1,3 +1,7 @@
+---
+icon: terminal
+---
+
 # Interactive Shell
 
 `contree shell` starts a REPL that combines management commands and sandbox
