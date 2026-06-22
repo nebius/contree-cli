@@ -1,4 +1,4 @@
-"""Sphinx extension: render text or shell output as SVG terminal windows.
+"""Sphinx extension: render text or shell output as HTML terminal windows.
 
 Directives::
 
@@ -24,13 +24,17 @@ import os
 import subprocess
 from typing import Any, ClassVar
 
-from ansi_svg import render_terminal
+from ansi_html import render_terminal
 from docutils import nodes
 from docutils.parsers.rst import directives
 from sphinx.application import Sphinx
 from sphinx.util.docutils import SphinxDirective
 
 TERMINAL_COLUMNS = 100
+
+
+def _is_mdx_build(sphinx_directive: SphinxDirective) -> bool:
+    return getattr(sphinx_directive.env.app.builder, "format", "") == "mdx"
 
 
 def _highlight(text: str, language: str) -> str:
@@ -44,7 +48,7 @@ def _highlight(text: str, language: str) -> str:
 
 
 class TerminalDirective(SphinxDirective):
-    """Render literal text content as an SVG terminal window.
+    """Render literal text content as an HTML terminal window.
 
     The argument is the window title. Content is the text body.
     Use :language: to syntax-highlight via Pygments.
@@ -66,12 +70,12 @@ class TerminalDirective(SphinxDirective):
         language = self.options.get("language")
         if language:
             text = _highlight(text, language)
-        svg = render_terminal(title, text)
-        return [nodes.raw("", svg, format="html")]
+        html_output = render_terminal(title, text, mdx=_is_mdx_build(self))
+        return [nodes.raw("", html_output, format="html")]
 
 
 class TerminalShellDirective(SphinxDirective):
-    """Run a shell command and render its output as an SVG terminal.
+    """Run a shell command and render its output as an HTML terminal.
 
     The argument is the shell command to execute.
     """
@@ -95,15 +99,15 @@ class TerminalShellDirective(SphinxDirective):
         output = result.stdout or result.stderr
         if not output.strip():
             return []
-        svg = render_terminal(f"$ {command}", output)
-        return [nodes.raw("", svg, format="html")]
+        html_output = render_terminal(f"$ {command}", output, mdx=_is_mdx_build(self))
+        return [nodes.raw("", html_output, format="html")]
 
 
 def setup(app: Sphinx) -> dict[str, Any]:
     app.add_directive("terminal", TerminalDirective)
     app.add_directive("terminal-shell", TerminalShellDirective)
     return {
-        "version": "0.2",
+        "version": "0.1",
         "parallel_read_safe": True,
         "parallel_write_safe": True,
     }

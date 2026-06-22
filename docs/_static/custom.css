@@ -16,3 +16,7 @@
 code span.pre {
     white-space: nowrap;
 }
+
+.contree-terminal {
+    font-size: var(--code-font-size);
+}
