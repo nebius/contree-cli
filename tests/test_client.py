@@ -231,6 +231,28 @@ class TestRetry:
         ):
             c.request("GET", "/v1/images")
 
+    def test_first_attempt_410_uses_short_delay(self):
+        """410 on the very first attempt sleeps `RETRY_DELAYS[0]`, not
+        the wraparound `RETRY_DELAYS[-1]` from the old `attempt-1` index."""
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=410, body=b"gone")
+        c.respond(status=200, body=b'{"ok":true}')
+
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            c.request("GET", "/v1/images")
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays[0] == RETRY_DELAYS[0]
+
+    def test_first_attempt_425_uses_short_delay(self):
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=425, body=b"too early")
+        c.respond(status=200, body=b'{"ok":true}')
+
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            c.request("GET", "/v1/images")
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays[0] == RETRY_DELAYS[0]
+
     def test_invalid_url_is_not_retried(self):
         """InvalidURL is a permanent caller-side error — should raise immediately."""
         import http.client

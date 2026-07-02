@@ -335,8 +335,8 @@ class ContreeClient(ABC):
         )
 
         for attempt in range(attempts):
-            delay = RETRY_DELAYS[attempt - 1]
             if last_error is not None or last_network_error is not None:
+                delay = RETRY_DELAYS[attempt - 1]
                 if last_network_error is not None:
                     log.warning(
                         "Network error (%s), retrying in %ds…",
@@ -397,7 +397,10 @@ class ContreeClient(ABC):
                 return resp
 
             if resp.status in (410, 425):
-                time.sleep(delay)
+                # Retry-After hint: sleep the next-attempt delay, capped
+                # at the last RETRY_DELAYS entry so `attempt=0` uses 1s
+                # instead of the -1 index wrapping to the tail (10s).
+                time.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
                 last_error = ApiError(resp.status, resp.reason, resp.read().decode())
                 continue
 
