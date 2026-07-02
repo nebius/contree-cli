@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import collections
 import contextlib
 import http.client
@@ -12,10 +13,12 @@ import socket
 import sys
 import threading
 import time
+import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from importlib.metadata import PackageNotFoundError, version
+from contextlib import suppress
+from importlib.metadata import PackageNotFoundError, distribution
 from typing import IO, Any, cast
 from urllib.parse import urlencode, urlsplit
 
@@ -38,9 +41,17 @@ RETRYABLE_NETWORK_ERRORS: tuple[type[BaseException], ...] = (
 
 def cli_version() -> str:
     try:
-        return version("contree-cli")
+        dist = distribution("contree-cli")
     except PackageNotFoundError:
         return "editable"
+    raw = dist.read_text("direct_url.json")
+    if raw:
+        try:
+            if json.loads(raw).get("dir_info", {}).get("editable"):
+                return "editable"
+        except ValueError:
+            pass
+    return dist.version
 
 
 CLI_USER_AGENT = (
@@ -138,6 +149,88 @@ class BodyFormatter:
         return f"<binary {len(data)}B>"
 
 
+class GzipResponse:
+    """Wrap an HTTPResponse, inflating `Content-Encoding: gzip` via
+    `zlib.decompressobj(wbits=31)` so Z_SYNC_FLUSH'd SSE frames decode
+    incrementally without buffering whole responses."""
+
+    def __init__(self, resp: http.client.HTTPResponse) -> None:
+        self.resp = resp
+        self.decomp = zlib.decompressobj(wbits=31)
+        self.buf = bytearray()
+        self.eof = False
+
+    def pump(self, want: int = -1) -> None:
+        while not self.eof and (want < 0 or len(self.buf) < want):
+            # read1() returns whatever's in the socket buffer after one
+            # underlying read; plain read(n) blocks for n bytes, which
+            # stalls SSE streaming because tiny frames never fill it.
+            chunk = self.resp.read1(8192)
+            if not chunk:
+                tail = self.decomp.flush()
+                if tail:
+                    self.buf.extend(tail)
+                self.eof = True
+                return
+            decoded = self.decomp.decompress(chunk)
+            if decoded:
+                self.buf.extend(decoded)
+
+    def read(self, amt: int | None = None) -> bytes:
+        if amt is None or amt < 0:
+            self.pump()
+            out = bytes(self.buf)
+            self.buf.clear()
+            return out
+        self.pump(amt)
+        out = bytes(self.buf[:amt])
+        del self.buf[:amt]
+        return out
+
+    def readline(self, limit: int = -1) -> bytes:
+        while True:
+            nl = self.buf.find(b"\n")
+            if nl >= 0:
+                end = nl + 1
+                if 0 <= limit < end:
+                    end = limit
+                out = bytes(self.buf[:end])
+                del self.buf[:end]
+                return out
+            if self.eof:
+                out = bytes(self.buf)
+                self.buf.clear()
+                return out
+            self.pump(want=len(self.buf) + 1)
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.resp.close()
+
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        # Hide Content-Encoding so downstream readers don't try a
+        # second decompression; Content-Length is bogus post-inflate.
+        lname = name.lower()
+        if lname in ("content-encoding", "content-length"):
+            return default
+        return self.resp.getheader(name, default)
+
+    def getheaders(self) -> list[tuple[str, str]]:
+        return [
+            (k, v)
+            for k, v in self.resp.getheaders()
+            if k.lower() not in ("content-encoding", "content-length")
+        ]
+
+    @property
+    def status(self) -> int:
+        return self.resp.status
+
+    @property
+    def reason(self) -> str:
+        return self.resp.reason
+
+
 class BufferedResponse:
     """Replay an HTTPResponse from buffered bytes (for debug body logging)."""
 
@@ -221,6 +314,7 @@ class ContreeClient(ABC):
         merged: dict[str, str] = {
             **self._build_headers(),
             "User-Agent": CLI_USER_AGENT,
+            "Accept-Encoding": "gzip",
         }
         if body is not None:
             merged.setdefault("Content-Type", "application/json")
@@ -286,6 +380,9 @@ class ContreeClient(ABC):
             # final raise below doesn't pick up stale failure context.
             last_network_error = None
 
+            if (resp.getheader("Content-Encoding", "") or "").lower() == "gzip":
+                resp = cast(http.client.HTTPResponse, GzipResponse(resp))
+
             if 200 <= resp.status < 300:
                 log.debug(
                     "%s %s -> %d %s headers=%s",
@@ -298,6 +395,14 @@ class ContreeClient(ABC):
                 if log.isEnabledFor(logging.DEBUG):
                     return self.log_and_buffer(method, full_path, resp)
                 return resp
+
+            if resp.status in (410, 425):
+                # Retry-After hint: sleep the next-attempt delay, capped
+                # at the last RETRY_DELAYS entry so `attempt=0` uses 1s
+                # instead of the -1 index wrapping to the tail (10s).
+                time.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+                last_error = ApiError(resp.status, resp.reason, resp.read().decode())
+                continue
 
             resp_headers = list(resp.getheaders())
             resp_body = resp.read().decode("utf-8", errors="replace")
@@ -340,8 +445,10 @@ class ContreeClient(ABC):
     ) -> http.client.HTTPResponse:
         """Read & log a textual response body; pass binary streams through."""
         content_type = resp.getheader("Content-Type", "") or ""
+        # event-stream is line-streamed and unbounded — buffering it would block.
+        is_event_stream = "event-stream" in content_type
         textual = not content_type or "json" in content_type or "text" in content_type
-        if not textual:
+        if is_event_stream or not textual:
             log.debug(
                 "%s %s response body: <stream Content-Type=%r>",
                 method,
@@ -533,6 +640,73 @@ def stream_response(
         if not chunk:
             break
         yield chunk
+
+
+def iter_sse_events(resp: http.client.HTTPResponse) -> Iterator[dict[str, object]]:
+    """Yield one dict per SSE frame.
+
+    Normal frames carry a JSON object in ``data:`` — that object is
+    yielded as-is.  Server-pushed error frames use ``event: sse_error``
+    with a plain-text ``data:`` body (the exception message) — those
+    surface as ``{"type": "sse_error", "message": <text>, "id": ...}``
+    so callers can log + decide whether to reconnect with
+    ``Last-Event-Id`` set to the last good id.
+    """
+    data_lines: list[str] = []
+    event_name: str | None = None
+    event_id: str | None = None
+
+    def emit() -> Iterator[dict[str, object]]:
+        nonlocal event_name, event_id
+        if not data_lines:
+            return
+        body = "\n".join(data_lines)
+        if event_name == "sse_error":
+            payload: dict[str, object] = {"type": "sse_error", "message": body}
+            if event_id is not None:
+                payload["id"] = event_id
+            yield payload
+        else:
+            with suppress(json.JSONDecodeError):
+                decoded = json.loads(body)
+                if isinstance(decoded, dict):
+                    yield decoded
+        data_lines.clear()
+        event_name = None
+        event_id = None
+
+    while True:
+        line_bytes = resp.readline()
+        if not line_bytes:
+            yield from emit()
+            return
+        line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+        match line:
+            case "":
+                yield from emit()
+            case _ if line.startswith(":"):
+                pass  # SSE comment / keepalive
+            case _ if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip(" "))
+            case _ if line.startswith("event:"):
+                event_name = line[6:].lstrip(" ").strip() or None
+            case _ if line.startswith("id:"):
+                event_id = line[3:].lstrip(" ").strip() or None
+
+
+def decode_event_chunk(data: object) -> bytes:
+    """Decode `{value, encoding}` event payload to raw bytes (ascii or base64)."""
+    if not isinstance(data, dict):
+        return b""
+    value = data.get("value", "")
+    if not isinstance(value, str) or not value:
+        return b""
+    encoding = data.get("encoding", "ascii")
+    if encoding == "base64":
+        with suppress(binascii.Error, ValueError):
+            return base64.b64decode(value)
+        return b""
+    return value.encode("utf-8", errors="replace")
 
 
 def decode_stream(stream: dict[str, object] | None) -> str:

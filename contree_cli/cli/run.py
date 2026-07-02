@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import fnmatch
 import functools
 import io
@@ -62,9 +63,19 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
+from typing import Any
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
-from contree_cli.client import ApiError, ContreeClient, decode_stream, resolve_image
+from contree_cli.client import (
+    RETRY_DELAYS,
+    RETRYABLE_NETWORK_ERRORS,
+    ApiError,
+    ContreeClient,
+    decode_event_chunk,
+    decode_stream,
+    iter_sse_events,
+    resolve_image,
+)
 from contree_cli.mapped_file import MAPPING_RULES, MappedFile
 from contree_cli.output import (
     DefaultFormatter,
@@ -505,11 +516,250 @@ def _build_payload(
     return payload
 
 
+TERMINAL_OP_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
+
+
+@dataclass
+class TerminalSummary:
+    """Authoritative end-of-stream snapshot built from the SSE events
+    themselves — `cmd_run` consumes this directly instead of doing a
+    second ``GET /operations/{uuid}``.
+
+    If SSE ends without a `completion` frame but a between-attempt GET
+    detects the op is already terminal, the full op dict lands in
+    ``fallback_op`` so `cmd_run` can use it directly."""
+
+    completion: dict[str, Any] | None = None
+    exit_event: dict[str, Any] | None = None
+    stdout: bytearray = field(default_factory=bytearray)
+    stderr: bytearray = field(default_factory=bytearray)
+    fallback_op: dict[str, Any] | None = None
+
+
+def _check_terminal_via_get(
+    client: ContreeClient, op_uuid: str, summary: TerminalSummary
+) -> bool:
+    """Poll `GET /v1/operations/{uuid}`; if the op is in a terminal
+    status, park the full response on ``summary.fallback_op`` and
+    return True.  Any GET failure or non-terminal status returns False
+    so the caller keeps retrying SSE."""
+    try:
+        resp = client.request("GET", f"/v1/operations/{op_uuid}")
+        op = json.loads(resp.read())
+    except (ApiError, ValueError) as exc:
+        logger.debug("terminal check GET failed: %s", exc)
+        return False
+    except RETRYABLE_NETWORK_ERRORS as exc:
+        logger.debug("terminal check GET failed: %s", exc)
+        return False
+    if isinstance(op, dict) and op.get("status") in TERMINAL_OP_STATUSES:
+        summary.fallback_op = op
+        return True
+    return False
+
+
+def _stream_backoff_sleep(attempt: int) -> None:
+    """Sleep for `RETRY_DELAYS[attempt]`, capped at the last entry —
+    the loop retries indefinitely, so anything past the sequence just
+    reuses the tail delay."""
+    if attempt <= 0:
+        return
+    idx = min(attempt - 1, len(RETRY_DELAYS) - 1)
+    time.sleep(RETRY_DELAYS[idx])
+
+
+def _stream_events_until_close(
+    client: ContreeClient,
+    op_uuid: str,
+    formatter: OutputFormatter,
+) -> TerminalSummary:
+    """Open `follow=1` SSE for *op_uuid* and write events to stdio,
+    transparently resuming on network drops / mid-stream errors using
+    ``Last-Event-Id`` for replay-free continuation.
+
+    For ``DefaultFormatter``: ``stdout`` / ``stderr`` events go to
+    ``sys.std*.buffer`` directly so the user sees output as it arrives.
+    For JSON formatters: data goes to ``log.debug`` so the JSON output
+    isn't polluted, but the chunks are accumulated into the returned
+    ``TerminalSummary`` so the caller can render full stdout/stderr
+    without a follow-up GET.
+
+    Retries the SSE stream indefinitely — only a `completion` event,
+    a GET-detected terminal status, ``BrokenPipeError`` from local
+    stdout/stderr, or ``KeyboardInterrupt`` breaks the loop.  Between
+    every failed SSE cycle (connect error, mid-stream drop, or clean
+    close without ``completion``) the streamer polls the plain
+    operation endpoint and, if the op is already terminal, parks the
+    full op on ``summary.fallback_op`` and returns.
+
+    ``BrokenPipeError`` from a local stdio write propagates unchanged —
+    it means the shell pipe closed and retrying cannot help; the
+    caller cancels the op and exits.
+    """
+    is_default = isinstance(formatter, DefaultFormatter)
+    attempt = 0
+    last_id: int = -1
+    summary = TerminalSummary()
+
+    while True:
+        headers: dict[str, str] | None = None
+        if last_id >= 0:
+            headers = {"Last-Event-Id": str(last_id)}
+        try:
+            resp = client.request(
+                "GET",
+                f"/v1/operations/{op_uuid}/events?follow=1",
+                headers=headers,
+            )
+        except ApiError as exc:
+            logger.debug("event stream open failed (attempt %d): %s", attempt + 1, exc)
+            if _check_terminal_via_get(client, op_uuid, summary):
+                return summary
+            attempt += 1
+            _stream_backoff_sleep(attempt)
+            continue
+        except RETRYABLE_NETWORK_ERRORS as exc:
+            logger.debug(
+                "event stream connect error (attempt %d): %s",
+                attempt + 1,
+                exc,
+            )
+            if _check_terminal_via_get(client, op_uuid, summary):
+                return summary
+            attempt += 1
+            _stream_backoff_sleep(attempt)
+            continue
+
+        events_before = last_id
+        try:
+            for ev in iter_sse_events(resp):
+                ev_id = ev.get("id")
+                if isinstance(ev_id, int):
+                    last_id = ev_id
+                ev_type = ev.get("type")
+                data = ev.get("data")
+                match ev_type:
+                    case "stdout":
+                        chunk = decode_event_chunk(data)
+                        summary.stdout.extend(chunk)
+                        if is_default:
+                            sys.stdout.buffer.write(chunk)
+                            sys.stdout.buffer.flush()
+                    case "stderr":
+                        chunk = decode_event_chunk(data)
+                        summary.stderr.extend(chunk)
+                        if is_default:
+                            sys.stderr.buffer.write(chunk)
+                            sys.stderr.buffer.flush()
+                    case "exit":
+                        # spid=1 is the main process — its exit code/timed_out
+                        # drive the CLI's own exit code.
+                        if ev.get("spid") == 1:
+                            summary.exit_event = ev
+                        logger.debug("event: %s", ev)
+                    case "sse_error":
+                        logger.warning(
+                            "server-side stream error (last_id=%s): %s",
+                            last_id,
+                            ev.get("message"),
+                        )
+                    case "completion":
+                        # Authoritative terminal frame — don't wait for the server
+                        # to close, return the summary for the caller.
+                        summary.completion = ev
+                        logger.debug("event: %s", ev)
+                        return summary
+                    case _:
+                        logger.debug("event: %s", ev)
+        except BrokenPipeError:
+            # Local stdout/stderr was closed by the shell (e.g. piping
+            # into `head`).  Retrying cannot help — the caller cancels
+            # the op and exits.
+            raise
+        except RETRYABLE_NETWORK_ERRORS as exc:
+            logger.debug(
+                "event stream broken (attempt %d, last_id=%s): %s",
+                attempt + 1,
+                last_id,
+                exc,
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                resp.close()
+
+        if _check_terminal_via_get(client, op_uuid, summary):
+            return summary
+
+        # Reset retry budget on forward progress: at least one new
+        # event before the stream broke / sse_error fired means the
+        # server is alive and Last-Event-Id resumption is working.
+        if last_id > events_before:
+            attempt = 0
+        else:
+            attempt += 1
+        _stream_backoff_sleep(attempt)
+
+
+def _build_op_from_summary(op_uuid: str, summary: TerminalSummary) -> dict[str, Any]:
+    """Synthesize a `GET /operations/{uuid}` shape from the SSE terminal
+    summary — completion event drives status / error / duration / image
+    metadata; exit event drives exit_code + timed_out; stdout/stderr
+    are reassembled from the streamed chunks.
+
+    Lets `cmd_run` avoid a second HTTP round-trip on the happy path
+    while keeping the downstream `_display_operation` consumers
+    (default and JSON formatters) untouched."""
+    assert summary.completion is not None
+    completion_data = summary.completion.get("data") or {}
+    status = completion_data.get("status")
+    state: dict[str, Any] = {}
+    if summary.exit_event:
+        exit_data = summary.exit_event.get("data") or {}
+        if "code" in exit_data:
+            state["exit_code"] = int(exit_data["code"])
+        if "timed_out" in exit_data:
+            state["timed_out"] = bool(exit_data["timed_out"])
+    result_image_uuid = completion_data.get("result_image_uuid")
+    return {
+        "uuid": op_uuid,
+        "kind": "instance",
+        "status": status,
+        "error": completion_data.get("error"),
+        "duration": (completion_data.get("duration_ms") or 0) / 1000.0,
+        "image_size": completion_data.get("image_size_bytes"),
+        "result_image_uuid": result_image_uuid,
+        "metadata": {
+            "result": {
+                "stdout": {
+                    "value": bytes(summary.stdout).decode("utf-8", errors="replace"),
+                    "encoding": "ascii",
+                    "truncated": False,
+                },
+                "stderr": {
+                    "value": bytes(summary.stderr).decode("utf-8", errors="replace"),
+                    "encoding": "ascii",
+                    "truncated": False,
+                },
+                "state": state or None,
+            }
+        },
+        "result": {"image": result_image_uuid, "tag": None},
+    }
+
+
 def _display_operation(
     op: dict[str, object],
     formatter: OutputFormatter,
+    live_streamed: bool = False,
 ) -> None:
-    """Display an operation result using the given formatter."""
+    """Display an operation result using the given formatter.
+
+    ``live_streamed=True`` means the SSE path already wrote stdout/
+    stderr to stdio incrementally — DefaultFormatter then has nothing
+    left to print.  ``live_streamed=False`` is the GET-fallback path
+    (legacy server or aborted stream) — DefaultFormatter prints
+    sanitized stdout/stderr from the operation's metadata blob.
+    """
     result = op.get("result") or {}
     assert isinstance(result, dict)
     metadata = op.get("metadata") or {}
@@ -544,10 +794,14 @@ def _display_operation(
             "only json/json-pretty/default are supported"
         )
 
-    # For DefaultFormatter, just only print stdout/stderr
+    if live_streamed:
+        # stdout/stderr already streamed live via SSE — nothing more to print.
+        return
+
+    # Legacy / fallback path (no completion event received): print
+    # sanitized stdout/stderr from op metadata.
     stdout = _BREAKING_ESC_RE.sub("", decode_stream(instance_result.get("stdout")))
     stderr = _BREAKING_ESC_RE.sub("", decode_stream(instance_result.get("stderr")))
-
     if stdout:
         sys.stdout.write(stdout)
         if not stdout.endswith("\n"):
@@ -688,19 +942,27 @@ def cmd_run(args: RunArgs) -> int | None:
         formatter.flush()
         return None
 
-    # 5. Poll until terminal status
-    sleep_time = 0.5
+    # 5. Stream events (follow=1) — write stdout/stderr to stdtio as they
+    # come, log other events at debug, accumulate the terminal frame.
+    store = SESSION_STORE.get()
     try:
-        time.sleep(sleep_time)
-        sleep_time += sleep_time
-        while True:
+        summary = _stream_events_until_close(client, op_uuid, formatter)
+        if summary.completion is not None:
+            # Authoritative terminal frame from the server — build the
+            # full op dict from the SSE events themselves, no GET.
+            op = _build_op_from_summary(op_uuid, summary)
+        elif summary.fallback_op is not None:
+            # SSE couldn't deliver `completion`, but a GET between
+            # retries confirmed the op is terminal — use that dict.
+            op = summary.fallback_op
+        else:
+            # Safety net: streamer normally loops until either
+            # completion or a terminal GET, so this path is only hit
+            # in tests where the stub queue drains early.
             resp = client.get(f"/v1/operations/{op_uuid}")
             op = json.loads(resp.read())
-            if op["status"] in TERMINAL_STATUSES:
-                break
-            time.sleep(sleep_time)
-            if sleep_time < 5:
-                sleep_time += sleep_time
+        cache_key = (op_uuid, "operation")
+        store.cache[cache_key] = op
     except KeyboardInterrupt:
         try:
             client.delete(f"/v1/operations/{op_uuid}")
@@ -708,6 +970,17 @@ def cmd_run(args: RunArgs) -> int | None:
         except (ApiError, KeyboardInterrupt, OSError):
             pass
         raise
+    except BrokenPipeError:
+        # Local stdout/stderr was closed (e.g. `contree run | head`).
+        # Cancel the op, silence further stdio writes, then exit 141
+        # so callers see the SIGPIPE convention (128 + 13).
+        with contextlib.suppress(ApiError, OSError):
+            client.delete(f"/v1/operations/{op_uuid}")
+        with contextlib.suppress(OSError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+        raise SystemExit(141) from None
 
     # 6. Cache terminal operation result
     store.cache[(op_uuid, "operation")] = op
@@ -735,7 +1008,7 @@ def cmd_run(args: RunArgs) -> int | None:
         )
 
     # 7. Display result
-    _display_operation(op, formatter)
+    _display_operation(op, formatter, live_streamed=summary.completion is not None)
 
     result = op.get("result") or {}
     assert isinstance(result, dict)
