@@ -15,13 +15,16 @@ from conftest import ContreeTestClient, FakeResponse
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.cli.run import (
     RunArgs,
+    TerminalSummary,
+    _build_op_from_summary,
     _expand_mapped_files,
     _is_excluded,
     _local_file_cache_kind,
     _read_piped_stdin,
+    _stream_events_until_close,
     cmd_run,
 )
-from contree_cli.client import ApiError
+from contree_cli.client import RETRY_DELAYS, ApiError
 from contree_cli.mapped_file import MappedFile
 from contree_cli.output import DefaultFormatter, JSONFormatter
 from contree_cli.session import SessionStore
@@ -96,7 +99,12 @@ def _run_cmd(
     formatter=None,
     stdin_mock: MagicMock | None = None,
 ):
-    """Run cmd_run with mocked HTTP responses and mocked sleep."""
+    """Run cmd_run with mocked HTTP responses and mocked sleep.
+
+    The fake connection auto-serves empty SSE responses for any
+    GET /events path so existing tests can stay shaped as
+    `[spawn, op]` without knowing the CLI now opens an SSE first.
+    """
     tc.fake.responses.extend(responses)
 
     FORMATTER.set(formatter or JSONFormatter())
@@ -159,11 +167,12 @@ class TestDetach:
 
 class TestPollLoop:
     def test_poll_until_success(self, contree_client, session_store, capsys):
+        """SSE follow=1 makes the API serve the terminal state directly —
+        the CLI no longer polls through intermediate PENDING snapshots."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         responses = [
             _spawn_response(),
-            _op_response(status="PENDING"),
             _op_response(status="SUCCESS", exit_code=0),
         ]
         rc = _run_cmd(contree_client, args, responses, store=session_store)
@@ -321,7 +330,9 @@ class TestCtrlC:
     def _run_ctrl_c(
         responses: list[FakeResponse], store: SessionStore
     ) -> ContreeTestClient:
-        """Run cmd_run with sleep raising KeyboardInterrupt."""
+        """Run cmd_run with the events stream raising KeyboardInterrupt
+        — simulates the user hitting Ctrl-C while the CLI was waiting
+        on SSE for the operation to terminate."""
         store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         tc = ContreeTestClient()
@@ -334,7 +345,7 @@ class TestCtrlC:
 
         with (
             patch(
-                "contree_cli.cli.run.time.sleep",
+                "contree_cli.cli.run._stream_events_until_close",
                 side_effect=KeyboardInterrupt,
             ),
             patch("contree_cli.cli.run.sys.stdin", _tty_stdin()),
@@ -344,11 +355,10 @@ class TestCtrlC:
         return tc
 
     def test_ctrl_c_cancels_operation(self, session_store):
-        """On KeyboardInterrupt during sleep, DELETE is sent."""
+        """On KeyboardInterrupt during the wait, DELETE is sent."""
         tc = self._run_ctrl_c(
             [
                 _spawn_response(),
-                _op_response(status="PENDING"),
                 _api_response({}, status=202),
             ],
             session_store,
@@ -363,7 +373,6 @@ class TestCtrlC:
         self._run_ctrl_c(
             [
                 _spawn_response(),
-                _op_response(status="PENDING"),
                 _api_response({"error": "not found"}, status=404),
             ],
             session_store,
@@ -1968,3 +1977,346 @@ class TestUseFlag:
         ]
         _run_cmd(contree_client, args, responses, store=session_store)
         assert session_store.session is not None
+
+
+# ---------------------------------------------------------------------------
+# SSE streaming (`_stream_events_until_close` and `_build_op_from_summary`)
+# ---------------------------------------------------------------------------
+
+
+class _SSEResponse:
+    """Minimal HTTPResponse-shaped object backed by an in-memory buffer.
+
+    `_stream_events_until_close` only touches `.readline()` (via
+    `iter_sse_events`) and `.close()`; nothing else is needed.
+    """
+
+    def __init__(self, body: bytes | str) -> None:
+        payload = body.encode("utf-8") if isinstance(body, str) else body
+        self._buf = io.BytesIO(payload)
+        self.closed = False
+
+    def readline(self, size: int = -1) -> bytes:
+        return self._buf.readline()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StubStreamClient:
+    """Stand-in for `ContreeClient` that returns queued SSE responses.
+
+    Each `.request()` call pops the next response from `responses`.  A
+    response may be an `_SSEResponse` (served as-is), an `Exception`
+    subclass or instance (raised), or `None` (equivalent to an empty
+    stream).  `.request` records every call so tests can assert the
+    URL / headers the streamer sent.
+    """
+
+    def __init__(self, responses: list) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, str, dict[str, str] | None]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        **_: object,
+    ):
+        self.calls.append((method, path, headers))
+        item = self.responses.pop(0)
+        if isinstance(item, type) and issubclass(item, BaseException):
+            raise item("stub")
+        if isinstance(item, BaseException):
+            raise item
+        if item is None:
+            return _SSEResponse(b"")
+        return item
+
+
+def _frame(*, id: int, event: str, data: dict | str) -> str:
+    """Build one SSE frame. Mirrors the API contract by embedding `id`
+    inside the JSON `data:` payload as well as the SSE `id:` line
+    (the CLI reads the id from the JSON, not the SSE header)."""
+    if isinstance(data, dict) and "id" not in data:
+        data = {"id": id, **data}
+    data_str = data if isinstance(data, str) else json.dumps(data)
+    return f"id: {id}\nevent: {event}\ndata: {data_str}\n\n"
+
+
+class TestStreamEventsUntilClose:
+    def test_url_uses_follow_1(self, session_store):
+        """Verifies the endpoint spelling matches the OpenAPI spec (`?follow=1`)."""
+        completion = _frame(
+            id=1,
+            event="completion",
+            data={"type": "completion", "data": {"status": "SUCCESS"}},
+        )
+        client = _StubStreamClient([_SSEResponse(completion)])
+        _stream_events_until_close(client, "op-1", DefaultFormatter())
+        assert client.calls[0][0] == "GET"
+        assert client.calls[0][1] == "/v1/operations/op-1/events?follow=1"
+
+    def test_first_call_has_no_last_event_id_header(self, session_store):
+        client = _StubStreamClient(
+            [
+                _SSEResponse(
+                    _frame(
+                        id=1,
+                        event="completion",
+                        data={"type": "completion", "data": {}},
+                    )
+                )
+            ]
+        )
+        _stream_events_until_close(client, "op-x", DefaultFormatter())
+        assert client.calls[0][2] is None
+
+    def test_stdout_streamed_live_for_default_formatter(self, capsys):
+        chunk = _frame(
+            id=1,
+            event="stdout",
+            data={
+                "type": "stdout",
+                "spid": 1,
+                "data": {"value": "hello", "encoding": "ascii"},
+            },
+        )
+        completion = _frame(
+            id=2,
+            event="completion",
+            data={"type": "completion", "data": {"status": "SUCCESS"}},
+        )
+        client = _StubStreamClient([_SSEResponse(chunk + completion)])
+        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        out = capsys.readouterr()
+        assert out.out == "hello"
+        assert bytes(summary.stdout) == b"hello"
+
+    def test_stderr_streamed_live_for_default_formatter(self, capsys):
+        chunk = _frame(
+            id=1,
+            event="stderr",
+            data={
+                "type": "stderr",
+                "spid": 1,
+                "data": {"value": "oops\n", "encoding": "ascii"},
+            },
+        )
+        completion = _frame(
+            id=2,
+            event="completion",
+            data={"type": "completion", "data": {"status": "FAILED"}},
+        )
+        client = _StubStreamClient([_SSEResponse(chunk + completion)])
+        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        out = capsys.readouterr()
+        assert out.err == "oops\n"
+        assert bytes(summary.stderr) == b"oops\n"
+
+    def test_json_formatter_accumulates_without_printing(self, capsys):
+        chunk = _frame(
+            id=1,
+            event="stdout",
+            data={
+                "type": "stdout",
+                "spid": 1,
+                "data": {"value": "hi", "encoding": "ascii"},
+            },
+        )
+        completion = _frame(
+            id=2,
+            event="completion",
+            data={"type": "completion", "data": {"status": "SUCCESS"}},
+        )
+        client = _StubStreamClient([_SSEResponse(chunk + completion)])
+        summary = _stream_events_until_close(client, "op-1", JSONFormatter())
+        out = capsys.readouterr()
+        assert out.out == ""
+        assert bytes(summary.stdout) == b"hi"
+
+    def test_base64_chunk_decoded(self, capsys):
+        payload = base64.b64encode(b"\x00\xff bin").decode("ascii")
+        chunk = _frame(
+            id=1,
+            event="stdout",
+            data={
+                "type": "stdout",
+                "spid": 1,
+                "data": {"value": payload, "encoding": "base64"},
+            },
+        )
+        completion = _frame(
+            id=2,
+            event="completion",
+            data={"type": "completion", "data": {"status": "SUCCESS"}},
+        )
+        client = _StubStreamClient([_SSEResponse(chunk + completion)])
+        summary = _stream_events_until_close(client, "op-1", JSONFormatter())
+        assert bytes(summary.stdout) == b"\x00\xff bin"
+
+    def test_exit_event_for_spid_1_stored(self):
+        exit_frame = _frame(
+            id=1,
+            event="exit",
+            data={"type": "exit", "spid": 1, "data": {"code": 0, "timed_out": False}},
+        )
+        completion = _frame(
+            id=2,
+            event="completion",
+            data={"type": "completion", "data": {"status": "SUCCESS"}},
+        )
+        client = _StubStreamClient([_SSEResponse(exit_frame + completion)])
+        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        assert summary.exit_event is not None
+        assert summary.exit_event["data"]["code"] == 0
+
+    def test_exit_event_for_non_main_spid_ignored(self):
+        """Only spid=1 drives CLI exit code; child spid exits stay unrecorded."""
+        exit_frame = _frame(
+            id=1,
+            event="exit",
+            data={"type": "exit", "spid": 2, "data": {"code": 3, "timed_out": False}},
+        )
+        completion = _frame(
+            id=2,
+            event="completion",
+            data={"type": "completion", "data": {"status": "SUCCESS"}},
+        )
+        client = _StubStreamClient([_SSEResponse(exit_frame + completion)])
+        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        assert summary.exit_event is None
+
+    def test_completion_frame_breaks_loop(self):
+        completion = _frame(
+            id=1,
+            event="completion",
+            data={"type": "completion", "data": {"status": "SUCCESS"}},
+        )
+        client = _StubStreamClient([_SSEResponse(completion)])
+        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        assert summary.completion is not None
+        assert summary.completion["data"]["status"] == "SUCCESS"
+
+    def test_stream_ends_without_completion_returns_empty_summary(self):
+        """Server closes cleanly with no completion frame — the caller
+        will fall back to a GET; summary.completion stays None."""
+        client = _StubStreamClient([_SSEResponse(b"")])
+        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        assert summary.completion is None
+        assert bytes(summary.stdout) == b""
+
+    def test_api_error_giving_up_after_budget(self):
+        """After exhausting RETRY_DELAYS on ApiError, streamer returns empty."""
+        errors = [ApiError(500, "srv", "boom")] * (len(RETRY_DELAYS) + 1)
+        client = _StubStreamClient(errors)
+        with patch("contree_cli.cli.run.time.sleep"):
+            summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        assert summary.completion is None
+        assert len(client.calls) == len(RETRY_DELAYS) + 1
+
+    def test_sse_error_frame_triggers_reconnect_with_last_event_id(self):
+        first = (
+            _frame(
+                id=1,
+                event="stdout",
+                data={
+                    "type": "stdout",
+                    "spid": 1,
+                    "data": {"value": "a", "encoding": "ascii"},
+                },
+            )
+            + "event: sse_error\ndata: boom\n\n"
+        )
+        completion = _frame(
+            id=2,
+            event="completion",
+            data={"type": "completion", "data": {"status": "SUCCESS"}},
+        )
+        client = _StubStreamClient([_SSEResponse(first), _SSEResponse(completion)])
+        with patch("contree_cli.cli.run.time.sleep"):
+            summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        assert summary.completion is not None
+        assert len(client.calls) == 2
+        assert client.calls[1][2] == {"Last-Event-Id": "1"}
+
+
+class TestBuildOpFromSummary:
+    def _completion(self, **overrides) -> dict:
+        base = {
+            "type": "completion",
+            "data": {
+                "status": "SUCCESS",
+                "error": None,
+                "duration_ms": 1500,
+                "image_size_bytes": 4096,
+                "result_image_uuid": IMG_NEW,
+            },
+        }
+        base["data"].update(overrides)
+        return base
+
+    def test_shape_carries_status_and_uuid(self):
+        summary = TerminalSummary(completion=self._completion())
+        op = _build_op_from_summary("op-1", summary)
+        assert op["uuid"] == "op-1"
+        assert op["kind"] == "instance"
+        assert op["status"] == "SUCCESS"
+
+    def test_duration_ms_converted_to_seconds(self):
+        summary = TerminalSummary(completion=self._completion(duration_ms=2500))
+        op = _build_op_from_summary("op-1", summary)
+        assert op["duration"] == 2.5
+
+    def test_duration_missing_falls_back_to_zero(self):
+        summary = TerminalSummary(
+            completion={"type": "completion", "data": {"status": "SUCCESS"}}
+        )
+        op = _build_op_from_summary("op-1", summary)
+        assert op["duration"] == 0.0
+
+    def test_result_image_uuid_propagates(self):
+        summary = TerminalSummary(completion=self._completion())
+        op = _build_op_from_summary("op-1", summary)
+        assert op["result_image_uuid"] == IMG_NEW
+        assert op["result"] == {"image": IMG_NEW, "tag": None}
+
+    def test_exit_event_drives_state(self):
+        summary = TerminalSummary(
+            completion=self._completion(),
+            exit_event={
+                "type": "exit",
+                "spid": 1,
+                "data": {"code": 42, "timed_out": True},
+            },
+        )
+        op = _build_op_from_summary("op-1", summary)
+        state = op["metadata"]["result"]["state"]
+        assert state == {"exit_code": 42, "timed_out": True}
+
+    def test_state_is_none_without_exit_event(self):
+        summary = TerminalSummary(completion=self._completion())
+        op = _build_op_from_summary("op-1", summary)
+        assert op["metadata"]["result"]["state"] is None
+
+    def test_stdout_stderr_reassembled_from_bytearrays(self):
+        summary = TerminalSummary(
+            completion=self._completion(),
+            stdout=bytearray(b"hello\n"),
+            stderr=bytearray(b"warn\n"),
+        )
+        op = _build_op_from_summary("op-1", summary)
+        result = op["metadata"]["result"]
+        assert result["stdout"]["value"] == "hello\n"
+        assert result["stderr"]["value"] == "warn\n"
+        assert result["stdout"]["truncated"] is False
+
+    def test_error_field_passthrough(self):
+        summary = TerminalSummary(
+            completion=self._completion(status="FAILED", error="boom")
+        )
+        op = _build_op_from_summary("op-1", summary)
+        assert op["status"] == "FAILED"
+        assert op["error"] == "boom"
