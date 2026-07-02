@@ -7,6 +7,7 @@ import logging
 import os
 import select
 from contextvars import copy_context
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,7 +25,7 @@ from contree_cli.cli.run import (
     _stream_events_until_close,
     cmd_run,
 )
-from contree_cli.client import RETRY_DELAYS, ApiError
+from contree_cli.client import ApiError
 from contree_cli.mapped_file import MappedFile
 from contree_cli.output import DefaultFormatter, JSONFormatter
 from contree_cli.session import SessionStore
@@ -375,6 +376,65 @@ class TestCtrlC:
                 _spawn_response(),
                 _api_response({"error": "not found"}, status=404),
             ],
+            session_store,
+        )
+
+
+class TestBrokenPipe:
+    """`BrokenPipeError` from local stdio (shell piped output closed
+    early, e.g. ``contree run ... | head``) must cancel the remote op
+    and exit with 141 (128 + SIGPIPE) instead of being misinterpreted
+    as a remote network drop."""
+
+    @staticmethod
+    def _run_broken_pipe(
+        responses: list[FakeResponse], store: SessionStore
+    ) -> ContreeTestClient:
+        store.set_image(IMG_UUID, kind="test")
+        args = _default_args()
+        tc = ContreeTestClient()
+        tc.fake.responses.extend(responses)
+
+        CLIENT.set(tc)
+        FORMATTER.set(JSONFormatter())
+        SESSION_STORE.set(store)
+        ctx = copy_context()
+
+        with (
+            patch(
+                "contree_cli.cli.run._stream_events_until_close",
+                side_effect=BrokenPipeError,
+            ),
+            patch("contree_cli.cli.run.sys.stdin", _tty_stdin()),
+            # `cmd_run` reopens stdout to /dev/null on BrokenPipeError;
+            # short-circuit that so pytest keeps its capture intact.
+            patch("contree_cli.cli.run.os.dup2"),
+            patch(
+                "contree_cli.cli.run.os.open",
+                return_value=os.open(os.devnull, os.O_RDONLY),
+            ),
+            patch("contree_cli.cli.run.os.close"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ctx.run(cmd_run, args)
+        assert exc_info.value.code == 141
+        return tc
+
+    def test_broken_pipe_cancels_operation(self, session_store):
+        tc = self._run_broken_pipe(
+            [_spawn_response(), _api_response({}, status=202)],
+            session_store,
+        )
+        methods = [r.method for r in tc.fake.requests]
+        assert "DELETE" in methods
+        delete_req = next(r for r in tc.fake.requests if r.method == "DELETE")
+        assert "/v1/operations/op-1" in delete_req.path
+
+    def test_broken_pipe_delete_failure_still_exits_141(self, session_store):
+        """Even if the DELETE fails, we still exit 141 rather than
+        re-raising BrokenPipeError."""
+        self._run_broken_pipe(
+            [_spawn_response(), _api_response({"error": "not found"}, status=404)],
             session_store,
         )
 
@@ -1993,29 +2053,66 @@ class _SSEResponse:
 
     def __init__(self, body: bytes | str) -> None:
         payload = body.encode("utf-8") if isinstance(body, str) else body
-        self._buf = io.BytesIO(payload)
+        self.buf = io.BytesIO(payload)
         self.closed = False
 
     def readline(self, size: int = -1) -> bytes:
-        return self._buf.readline()
+        return self.buf.readline()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _JSONResponse:
+    """Minimal HTTPResponse-shape for the streamer's between-attempt
+    ``GET /operations/{uuid}`` terminal check.  Only ``.read()`` and
+    ``.close()`` are used."""
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = json.dumps(payload).encode("utf-8")
+        self.closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        return self.payload
 
     def close(self) -> None:
         self.closed = True
 
 
 class _StubStreamClient:
-    """Stand-in for `ContreeClient` that returns queued SSE responses.
+    """Stand-in for `ContreeClient` that queues responses for both the
+    SSE `follow=1` endpoint and the between-attempt terminal-status
+    GET.
 
-    Each `.request()` call pops the next response from `responses`.  A
-    response may be an `_SSEResponse` (served as-is), an `Exception`
-    subclass or instance (raised), or `None` (equivalent to an empty
-    stream).  `.request` records every call so tests can assert the
-    URL / headers the streamer sent.
+    `responses` feeds `GET /events?follow=1` calls.  `get_responses`
+    feeds `GET /operations/{uuid}` terminal checks; when it's empty
+    the stub falls back to a non-terminal op (`status=EXECUTING`) so
+    tests that don't care about the check don't have to prime it.
+
+    A queued item may be an `_SSEResponse` / `_JSONResponse` (served
+    as-is), an `Exception` subclass or instance (raised), or `None`
+    (equivalent to an empty response).  All calls are recorded so
+    tests can inspect them via `.calls`, `.sse_calls`, `.get_calls`.
     """
 
-    def __init__(self, responses: list) -> None:
+    NON_TERMINAL: ClassVar[dict[str, str]] = {"status": "EXECUTING"}
+
+    def __init__(
+        self,
+        responses: list,
+        get_responses: list | None = None,
+    ) -> None:
         self.responses = list(responses)
+        self.get_responses = list(get_responses or [])
         self.calls: list[tuple[str, str, dict[str, str] | None]] = []
+
+    @property
+    def sse_calls(self) -> list[tuple[str, str, dict[str, str] | None]]:
+        return [c for c in self.calls if "/events" in c[1]]
+
+    @property
+    def get_calls(self) -> list[tuple[str, str, dict[str, str] | None]]:
+        return [c for c in self.calls if "/events" not in c[1]]
 
     def request(
         self,
@@ -2026,13 +2123,19 @@ class _StubStreamClient:
         **_: object,
     ):
         self.calls.append((method, path, headers))
-        item = self.responses.pop(0)
+        is_sse = "/events" in path
+        if is_sse:
+            item = self.responses.pop(0)
+        elif self.get_responses:
+            item = self.get_responses.pop(0)
+        else:
+            return _JSONResponse(self.NON_TERMINAL)
         if isinstance(item, type) and issubclass(item, BaseException):
             raise item("stub")
         if isinstance(item, BaseException):
             raise item
         if item is None:
-            return _SSEResponse(b"")
+            return _SSEResponse(b"") if is_sse else _JSONResponse(self.NON_TERMINAL)
         return item
 
 
@@ -2200,22 +2303,40 @@ class TestStreamEventsUntilClose:
         assert summary.completion is not None
         assert summary.completion["data"]["status"] == "SUCCESS"
 
-    def test_stream_ends_without_completion_returns_empty_summary(self):
-        """Server closes cleanly with no completion frame — the caller
-        will fall back to a GET; summary.completion stays None."""
-        client = _StubStreamClient([_SSEResponse(b"")])
+    def test_stream_ends_without_completion_falls_back_to_terminal_get(self):
+        """SSE closes cleanly without a `completion` frame — the
+        between-attempt GET check detects the op is terminal and parks
+        it on `summary.fallback_op` so the caller doesn't need to GET
+        again."""
+        op = {"uuid": "op-1", "status": "SUCCESS", "result": {"image": None}}
+        client = _StubStreamClient(
+            [_SSEResponse(b"")], get_responses=[_JSONResponse(op)]
+        )
         summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
         assert summary.completion is None
+        assert summary.fallback_op == op
         assert bytes(summary.stdout) == b""
 
-    def test_api_error_giving_up_after_budget(self):
-        """After exhausting RETRY_DELAYS on ApiError, streamer returns empty."""
-        errors = [ApiError(500, "srv", "boom")] * (len(RETRY_DELAYS) + 1)
-        client = _StubStreamClient(errors)
+    def test_sse_connect_errors_then_terminal_via_get(self):
+        """SSE keeps failing to connect while the op runs; once the
+        between-attempt GET reports terminal status the streamer
+        stops retrying and returns without ever seeing a completion
+        frame."""
+        op = {"uuid": "op-1", "status": "SUCCESS"}
+        client = _StubStreamClient(
+            [ApiError(500, "srv", "boom")] * 3,
+            get_responses=[
+                _JSONResponse({"status": "EXECUTING"}),
+                _JSONResponse({"status": "EXECUTING"}),
+                _JSONResponse(op),
+            ],
+        )
         with patch("contree_cli.cli.run.time.sleep"):
             summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
         assert summary.completion is None
-        assert len(client.calls) == len(RETRY_DELAYS) + 1
+        assert summary.fallback_op == op
+        assert len(client.sse_calls) == 3
+        assert len(client.get_calls) == 3
 
     def test_sse_error_frame_triggers_reconnect_with_last_event_id(self):
         first = (
@@ -2239,8 +2360,34 @@ class TestStreamEventsUntilClose:
         with patch("contree_cli.cli.run.time.sleep"):
             summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
         assert summary.completion is not None
-        assert len(client.calls) == 2
-        assert client.calls[1][2] == {"Last-Event-Id": "1"}
+        assert len(client.sse_calls) == 2
+        assert client.sse_calls[1][2] == {"Last-Event-Id": "1"}
+
+    def test_broken_pipe_from_stdout_propagates(self, monkeypatch):
+        """`BrokenPipeError` from local stdio write must propagate
+        unchanged — retrying can't fix a closed local pipe and it
+        would be misinterpreted as a remote network error otherwise."""
+        chunk = _frame(
+            id=1,
+            event="stdout",
+            data={
+                "type": "stdout",
+                "spid": 1,
+                "data": {"value": "hi", "encoding": "ascii"},
+            },
+        )
+        client = _StubStreamClient([_SSEResponse(chunk)])
+
+        def raise_broken_pipe(*_args: object, **_kw: object) -> int:
+            raise BrokenPipeError
+
+        monkeypatch.setattr("sys.stdout.buffer.write", raise_broken_pipe)
+        with pytest.raises(BrokenPipeError):
+            _stream_events_until_close(client, "op-1", DefaultFormatter())
+        # Only the initial SSE attempt is made; no retry, no terminal-check
+        # GET (BrokenPipeError bypasses the retry path entirely).
+        assert len(client.sse_calls) == 1
+        assert len(client.get_calls) == 0
 
 
 class TestBuildOpFromSummary:

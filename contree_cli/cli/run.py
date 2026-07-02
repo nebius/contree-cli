@@ -516,18 +516,56 @@ def _build_payload(
     return payload
 
 
+TERMINAL_OP_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
+
+
 @dataclass
 class TerminalSummary:
     """Authoritative end-of-stream snapshot built from the SSE events
     themselves — `cmd_run` consumes this directly instead of doing a
-    second ``GET /operations/{uuid}``.  Stays empty (everything None /
-    "") on streams that ended without a `completion` frame; caller may
-    fall back to a GET in that case."""
+    second ``GET /operations/{uuid}``.
+
+    If SSE ends without a `completion` frame but a between-attempt GET
+    detects the op is already terminal, the full op dict lands in
+    ``fallback_op`` so `cmd_run` can use it directly."""
 
     completion: dict[str, Any] | None = None
     exit_event: dict[str, Any] | None = None
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
+    fallback_op: dict[str, Any] | None = None
+
+
+def _check_terminal_via_get(
+    client: ContreeClient, op_uuid: str, summary: TerminalSummary
+) -> bool:
+    """Poll `GET /v1/operations/{uuid}`; if the op is in a terminal
+    status, park the full response on ``summary.fallback_op`` and
+    return True.  Any GET failure or non-terminal status returns False
+    so the caller keeps retrying SSE."""
+    try:
+        resp = client.request("GET", f"/v1/operations/{op_uuid}")
+        op = json.loads(resp.read())
+    except (ApiError, ValueError) as exc:
+        logger.debug("terminal check GET failed: %s", exc)
+        return False
+    except RETRYABLE_NETWORK_ERRORS as exc:
+        logger.debug("terminal check GET failed: %s", exc)
+        return False
+    if isinstance(op, dict) and op.get("status") in TERMINAL_OP_STATUSES:
+        summary.fallback_op = op
+        return True
+    return False
+
+
+def _stream_backoff_sleep(attempt: int) -> None:
+    """Sleep for `RETRY_DELAYS[attempt]`, capped at the last entry —
+    the loop retries indefinitely, so anything past the sequence just
+    reuses the tail delay."""
+    if attempt <= 0:
+        return
+    idx = min(attempt - 1, len(RETRY_DELAYS) - 1)
+    time.sleep(RETRY_DELAYS[idx])
 
 
 def _stream_events_until_close(
@@ -546,15 +584,21 @@ def _stream_events_until_close(
     ``TerminalSummary`` so the caller can render full stdout/stderr
     without a follow-up GET.
 
-    Returns a ``TerminalSummary``.  ``summary.completion`` is set iff
-    the server delivered a terminal `completion` event — that's the
-    authoritative signal that the operation has reached a terminal
-    state and the caller can skip any final GET.
+    Retries the SSE stream indefinitely — only a `completion` event,
+    a GET-detected terminal status, ``BrokenPipeError`` from local
+    stdout/stderr, or ``KeyboardInterrupt`` breaks the loop.  Between
+    every failed SSE cycle (connect error, mid-stream drop, or clean
+    close without ``completion``) the streamer polls the plain
+    operation endpoint and, if the op is already terminal, parks the
+    full op on ``summary.fallback_op`` and returns.
+
+    ``BrokenPipeError`` from a local stdio write propagates unchanged —
+    it means the shell pipe closed and retrying cannot help; the
+    caller cancels the op and exits.
     """
     is_default = isinstance(formatter, DefaultFormatter)
     attempt = 0
     last_id: int = -1
-    saw_progress = False
     summary = TerminalSummary()
 
     while True:
@@ -569,10 +613,10 @@ def _stream_events_until_close(
             )
         except ApiError as exc:
             logger.debug("event stream open failed (attempt %d): %s", attempt + 1, exc)
-            if attempt >= len(RETRY_DELAYS):
+            if _check_terminal_via_get(client, op_uuid, summary):
                 return summary
-            time.sleep(RETRY_DELAYS[attempt])
             attempt += 1
+            _stream_backoff_sleep(attempt)
             continue
         except RETRYABLE_NETWORK_ERRORS as exc:
             logger.debug(
@@ -580,14 +624,12 @@ def _stream_events_until_close(
                 attempt + 1,
                 exc,
             )
-            if attempt >= len(RETRY_DELAYS):
+            if _check_terminal_via_get(client, op_uuid, summary):
                 return summary
-            time.sleep(RETRY_DELAYS[attempt])
             attempt += 1
+            _stream_backoff_sleep(attempt)
             continue
 
-        closed_cleanly = False
-        server_signalled_error = False
         events_before = last_id
         try:
             for ev in iter_sse_events(resp):
@@ -616,7 +658,6 @@ def _stream_events_until_close(
                             summary.exit_event = ev
                         logger.debug("event: %s", ev)
                     case "sse_error":
-                        server_signalled_error = True
                         logger.warning(
                             "server-side stream error (last_id=%s): %s",
                             last_id,
@@ -627,12 +668,14 @@ def _stream_events_until_close(
                         # to close, return the summary for the caller.
                         summary.completion = ev
                         logger.debug("event: %s", ev)
-                        closed_cleanly = True
-                        break
+                        return summary
                     case _:
                         logger.debug("event: %s", ev)
-            else:
-                closed_cleanly = not server_signalled_error
+        except BrokenPipeError:
+            # Local stdout/stderr was closed by the shell (e.g. piping
+            # into `head`).  Retrying cannot help — the caller cancels
+            # the op and exits.
+            raise
         except RETRYABLE_NETWORK_ERRORS as exc:
             logger.debug(
                 "event stream broken (attempt %d, last_id=%s): %s",
@@ -644,43 +687,17 @@ def _stream_events_until_close(
             with contextlib.suppress(Exception):
                 resp.close()
 
-        if summary.completion is not None:
-            logger.debug(
-                "operation %s terminated via completion event: %s",
-                op_uuid,
-                summary.completion.get("data"),
-            )
+        if _check_terminal_via_get(client, op_uuid, summary):
             return summary
 
-        if closed_cleanly:
-            logger.debug("events completely finished, %s", op_uuid)
-            return summary
-
-        # Reset retry budget on forward progress: if we received at
-        # least one new event before the stream broke / sse_error
-        # fired, the server is alive and Last-Event-Id resumption is
-        # working — keep trying.
+        # Reset retry budget on forward progress: at least one new
+        # event before the stream broke / sse_error fired means the
+        # server is alive and Last-Event-Id resumption is working.
         if last_id > events_before:
             attempt = 0
-            saw_progress = True
-        elif saw_progress:
-            # Made progress before, but this attempt yielded nothing
-            # new — count it against the budget so we don't loop
-            # forever against a server stuck at a bad id.
-            attempt += 1
         else:
             attempt += 1
-
-        if attempt > len(RETRY_DELAYS):
-            logger.warning(
-                "event stream gave up after %d attempts (last_id=%s)",
-                attempt,
-                last_id,
-            )
-            return summary
-        delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS)) - 1] if attempt > 0 else 0
-        if delay:
-            time.sleep(delay)
+        _stream_backoff_sleep(attempt)
 
 
 def _build_op_from_summary(op_uuid: str, summary: TerminalSummary) -> dict[str, Any]:
@@ -934,9 +951,14 @@ def cmd_run(args: RunArgs) -> int | None:
             # Authoritative terminal frame from the server — build the
             # full op dict from the SSE events themselves, no GET.
             op = _build_op_from_summary(op_uuid, summary)
+        elif summary.fallback_op is not None:
+            # SSE couldn't deliver `completion`, but a GET between
+            # retries confirmed the op is terminal — use that dict.
+            op = summary.fallback_op
         else:
-            # Legacy server / stream gave up before completion — fall back
-            # to one GET so we have a status to report.
+            # Safety net: streamer normally loops until either
+            # completion or a terminal GET, so this path is only hit
+            # in tests where the stub queue drains early.
             resp = client.get(f"/v1/operations/{op_uuid}")
             op = json.loads(resp.read())
         cache_key = (op_uuid, "operation")
@@ -948,6 +970,17 @@ def cmd_run(args: RunArgs) -> int | None:
         except (ApiError, KeyboardInterrupt, OSError):
             pass
         raise
+    except BrokenPipeError:
+        # Local stdout/stderr was closed (e.g. `contree run | head`).
+        # Cancel the op, silence further stdio writes, then exit 141
+        # so callers see the SIGPIPE convention (128 + 13).
+        with contextlib.suppress(ApiError, OSError):
+            client.delete(f"/v1/operations/{op_uuid}")
+        with contextlib.suppress(OSError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+        raise SystemExit(141) from None
 
     # 6. Cache terminal operation result
     store.cache[(op_uuid, "operation")] = op
