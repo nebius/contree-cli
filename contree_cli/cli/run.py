@@ -67,7 +67,6 @@ from typing import Any
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.client import (
-    RETRY_DELAYS,
     RETRYABLE_NETWORK_ERRORS,
     ApiError,
     ContreeClient,
@@ -558,14 +557,7 @@ def _check_terminal_via_get(
     return False
 
 
-def _stream_backoff_sleep(attempt: int) -> None:
-    """Sleep for `RETRY_DELAYS[attempt]`, capped at the last entry —
-    the loop retries indefinitely, so anything past the sequence just
-    reuses the tail delay."""
-    if attempt <= 0:
-        return
-    idx = min(attempt - 1, len(RETRY_DELAYS) - 1)
-    time.sleep(RETRY_DELAYS[idx])
+TIGHT_LOOP_FLOOR = 0.5
 
 
 def _stream_events_until_close(
@@ -584,20 +576,21 @@ def _stream_events_until_close(
     ``TerminalSummary`` so the caller can render full stdout/stderr
     without a follow-up GET.
 
-    Retries the SSE stream indefinitely — only a `completion` event,
-    a GET-detected terminal status, ``BrokenPipeError`` from local
-    stdout/stderr, or ``KeyboardInterrupt`` breaks the loop.  Between
-    every failed SSE cycle (connect error, mid-stream drop, or clean
-    close without ``completion``) the streamer polls the plain
-    operation endpoint and, if the op is already terminal, parks the
-    full op on ``summary.fallback_op`` and returns.
+    Loops until one of: `completion` event received, GET-detected
+    terminal status, ``BrokenPipeError`` from a local stdio write, or
+    ``KeyboardInterrupt``.  Backoff between attempts is delegated to
+    ``client.request`` — every SSE reconnect goes through its
+    ``RETRY_DELAYS`` ladder before raising, so an extra streamer-level
+    ramp would double up.  The one floor kept here (``TIGHT_LOOP_FLOOR``)
+    only kicks in when a cycle made no forward progress, guarding
+    against a server that returns immediate empty streams for an
+    executing op.
 
     ``BrokenPipeError`` from a local stdio write propagates unchanged —
     it means the shell pipe closed and retrying cannot help; the
     caller cancels the op and exits.
     """
     is_default = isinstance(formatter, DefaultFormatter)
-    attempt = 0
     last_id: int = -1
     summary = TerminalSummary()
 
@@ -612,22 +605,14 @@ def _stream_events_until_close(
                 headers=headers,
             )
         except ApiError as exc:
-            logger.debug("event stream open failed (attempt %d): %s", attempt + 1, exc)
+            logger.debug("SSE connect failed after client retries: %s", exc)
             if _check_terminal_via_get(client, op_uuid, summary):
                 return summary
-            attempt += 1
-            _stream_backoff_sleep(attempt)
             continue
         except RETRYABLE_NETWORK_ERRORS as exc:
-            logger.debug(
-                "event stream connect error (attempt %d): %s",
-                attempt + 1,
-                exc,
-            )
+            logger.debug("SSE connect network error after client retries: %s", exc)
             if _check_terminal_via_get(client, op_uuid, summary):
                 return summary
-            attempt += 1
-            _stream_backoff_sleep(attempt)
             continue
 
         events_before = last_id
@@ -677,12 +662,7 @@ def _stream_events_until_close(
             # the op and exits.
             raise
         except RETRYABLE_NETWORK_ERRORS as exc:
-            logger.debug(
-                "event stream broken (attempt %d, last_id=%s): %s",
-                attempt + 1,
-                last_id,
-                exc,
-            )
+            logger.debug("SSE stream broken (last_id=%s): %s", last_id, exc)
         finally:
             with contextlib.suppress(Exception):
                 resp.close()
@@ -690,14 +670,10 @@ def _stream_events_until_close(
         if _check_terminal_via_get(client, op_uuid, summary):
             return summary
 
-        # Reset retry budget on forward progress: at least one new
-        # event before the stream broke / sse_error fired means the
-        # server is alive and Last-Event-Id resumption is working.
-        if last_id > events_before:
-            attempt = 0
-        else:
-            attempt += 1
-        _stream_backoff_sleep(attempt)
+        # No forward progress this cycle → briefly floor the loop so a
+        # server that keeps returning immediate EOFs doesn't spin us.
+        if last_id == events_before:
+            time.sleep(TIGHT_LOOP_FLOOR)
 
 
 def _build_op_from_summary(op_uuid: str, summary: TerminalSummary) -> dict[str, Any]:
