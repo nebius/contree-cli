@@ -253,6 +253,20 @@ class TestRetry:
         delays = [call.args[0] for call in mock_sleep.call_args_list]
         assert delays[0] == RETRY_DELAYS[0]
 
+    def test_410_sleeps_once_per_failure(self):
+        """Regression: 410/425 used to `time.sleep` inside the response
+        branch AND at the top of the next iteration — doubling the
+        actual backoff.  With the retry-generator refactor each failure
+        pulls exactly one delay from the ladder."""
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=410, body=b"gone")
+        c.respond(status=200, body=b'{"ok":true}')
+
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            c.request("GET", "/v1/images")
+        assert mock_sleep.call_count == 1
+        assert mock_sleep.call_args_list[0].args[0] == RETRY_DELAYS[0]
+
     def test_invalid_url_is_not_retried(self):
         """InvalidURL is a permanent caller-side error — should raise immediately."""
         import http.client

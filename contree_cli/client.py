@@ -26,7 +26,33 @@ from contree_cli.config import AuthType, ConfigProfile
 
 log = logging.getLogger(__name__)
 
-RETRY_DELAYS = (1, 2, 4, 5, 10, 10, 10)
+RETRY_DELAYS = (0.1, 0.2, 0.5, 1, 2, 5)
+
+
+def retry_generator() -> Iterator[float]:
+    """Return a primed generator that yields successive backoff delays.
+
+    The first ``next(g)`` returns ``RETRY_DELAYS[0]``; subsequent calls
+    walk the ladder and, once exhausted, keep yielding the tail delay
+    forever.  Callers don't have to guard against ``StopIteration`` —
+    ``next(g)`` always returns a valid sleep time — and don't have to
+    do any index arithmetic to derive it.  A caller that wants a
+    finite retry budget bounds it externally (e.g. an attempt counter)."""
+
+    def gen() -> Iterator[float]:
+        # `yield 0` gives a caller who *doesn't* prime a clean way to
+        # sleep uniformly before every attempt (including the first,
+        # which is a no-op).  We prime here so callers who don't want
+        # that get the real first delay straight away.
+        yield 0
+        yield from RETRY_DELAYS
+        while True:
+            yield RETRY_DELAYS[-1]
+
+    g = gen()
+    next(g)
+    return g
+
 
 # Socket-level / connection-level errors that warrant a retry. DNS hiccups
 # (gaierror), refused/reset connections, and broken HTTP framing are all
@@ -324,7 +350,6 @@ class ContreeClient(ABC):
         full_path = self._prefix + path
         last_error: ApiError | None = None
         last_network_error: BaseException | None = None
-        attempts = len(RETRY_DELAYS) + 1
 
         log.debug(
             "%s %s headers=%s body=%s",
@@ -334,25 +359,26 @@ class ContreeClient(ABC):
             BodyFormatter(body, content_type=merged.get("Content-Type", "")),
         )
 
-        for attempt in range(attempts):
-            if last_error is not None or last_network_error is not None:
-                delay = RETRY_DELAYS[attempt - 1]
-                if last_network_error is not None:
-                    log.warning(
-                        "Network error (%s), retrying in %ds…",
-                        type(last_network_error).__name__,
-                        delay,
-                    )
-                else:
-                    assert last_error is not None
-                    log.warning(
-                        "Server error %d, retrying in %ds…",
-                        last_error.status,
-                        delay,
-                    )
-                time.sleep(delay)
+        # Backoff delays come from a primed `retry_generator()`, so each
+        # failure just calls `next(delays)` and gets the next value —
+        # no attempt counter, no off-by-one indexing.  The generator
+        # yields the tail delay forever; the finite retry budget lives
+        # in `retries_left` below.
+        delays = retry_generator()
+        retries_left = len(RETRY_DELAYS)
 
-            if attempt > 0 and hasattr(body, "seek"):
+        def sleep_for_retry(reason_fmt: str, *reason_args: object) -> bool:
+            """Pull the next backoff delay, log the reason, sleep, and
+            rewind the request body if it's seekable.  Returns ``False``
+            when the budget is exhausted so the caller can break out."""
+            nonlocal retries_left
+            if retries_left <= 0:
+                return False
+            retries_left -= 1
+            delay = next(delays)
+            log.warning(reason_fmt + " retrying in %ss…", *reason_args, delay)
+            time.sleep(delay)
+            if body is not None and hasattr(body, "seek"):
                 stream = cast(IO[bytes], body)
                 if not stream.seekable():
                     raise ApiError(
@@ -361,6 +387,9 @@ class ContreeClient(ABC):
                         "Cannot retry: streaming body is not seekable",
                     )
                 stream.seek(0)
+            return True
+
+        while True:
             try:
                 conn = self._connect()
                 conn.request(method, full_path, body, merged)
@@ -374,6 +403,8 @@ class ContreeClient(ABC):
             except RETRYABLE_NETWORK_ERRORS as exc:
                 last_network_error = exc
                 last_error = None
+                if not sleep_for_retry("Network error (%s),", type(exc).__name__):
+                    break
                 continue
 
             # Successful round-trip clears the network-error trail so the
@@ -395,14 +426,6 @@ class ContreeClient(ABC):
                 if log.isEnabledFor(logging.DEBUG):
                     return self.log_and_buffer(method, full_path, resp)
                 return resp
-
-            if resp.status in (410, 425):
-                # Retry-After hint: sleep the next-attempt delay, capped
-                # at the last RETRY_DELAYS entry so `attempt=0` uses 1s
-                # instead of the -1 index wrapping to the tail (10s).
-                time.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
-                last_error = ApiError(resp.status, resp.reason, resp.read().decode())
-                continue
 
             resp_headers = list(resp.getheaders())
             resp_body = resp.read().decode("utf-8", errors="replace")
@@ -426,8 +449,10 @@ class ContreeClient(ABC):
             )
             error = ApiError(resp.status, resp.reason, resp_body)
 
-            if 500 <= resp.status < 600:
+            if resp.status in (410, 425) or 500 <= resp.status < 600:
                 last_error = error
+                if not sleep_for_retry("Server error %d,", resp.status):
+                    break
                 continue
 
             raise error
