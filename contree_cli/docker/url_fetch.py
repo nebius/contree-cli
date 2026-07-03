@@ -23,7 +23,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import IO, cast
 
 from contree_cli.client import ApiError, ContreeClient
 from contree_cli.session import SessionStore
@@ -79,27 +78,25 @@ def fetch_and_upload(
 
     assert source is not None
     try:
-        reader = HashingReader(source)
-        upload_headers: dict[str, str] = {"Content-Type": "application/octet-stream"}
-        content_length = parse_content_length(response_headers)
-        if content_length > 0:
-            upload_headers["Content-Length"] = str(content_length)
-
-        resp = client.request(
-            "POST",
-            "/v1/files",
-            body=cast(IO[bytes], reader),
-            headers=upload_headers,
-        )
-        data = json.loads(resp.read())
+        body_bytes = source.read()  # type: ignore[attr-defined]
     finally:
         close = getattr(source, "close", None)
         if callable(close):
             close()
+    assert isinstance(body_bytes, (bytes, bytearray))
+    body_bytes = bytes(body_bytes)
+
+    resp = client.request(
+        "POST",
+        "/v1/files",
+        body=body_bytes,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    data = json.loads(resp.read())
 
     file_uuid = str(data["uuid"])
-    sha = reader.hasher.hexdigest()
-    size = reader.bytes_read
+    sha = hashlib.sha256(body_bytes).hexdigest()
+    size = len(body_bytes)
 
     write_metadata(
         store,
@@ -193,38 +190,6 @@ def conditional_headers(meta: dict[str, object]) -> dict[str, str]:
     if isinstance(last_modified, str) and last_modified:
         headers["If-Modified-Since"] = last_modified
     return headers
-
-
-def parse_content_length(headers: dict[str, str]) -> int:
-    raw = headers.get("content-length")
-    if not raw:
-        return -1
-    try:
-        return int(raw)
-    except ValueError:
-        return -1
-
-
-class HashingReader:
-    """Read-only adapter that hashes bytes as they flow through.
-
-    Intentionally has no ``seek`` attribute so ``ContreeClient.request``
-    does not attempt to rewind the upstream HTTP body on retry.
-    """
-
-    __slots__ = ("bytes_read", "hasher", "source")
-
-    def __init__(self, source: object) -> None:
-        self.source = source
-        self.hasher = hashlib.sha256()
-        self.bytes_read = 0
-
-    def read(self, amt: int | None = None) -> bytes:
-        chunk = self.source.read() if amt is None else self.source.read(amt)  # type: ignore[attr-defined]
-        if chunk:
-            self.hasher.update(chunk)
-            self.bytes_read += len(chunk)
-        return chunk  # type: ignore[no-any-return]
 
 
 def http_head(url: str, *, timeout: int = DOWNLOAD_TIMEOUT_DEFAULT) -> dict[str, str]:

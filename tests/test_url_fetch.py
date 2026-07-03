@@ -8,7 +8,6 @@ import pytest
 
 import contree_cli.docker.url_fetch as url_fetch
 from contree_cli.docker.url_fetch import (
-    HashingReader,
     fetch_and_upload,
     is_url,
     url_basename,
@@ -60,23 +59,6 @@ class TestSmallHelpers:
 
     def test_validators_match_returns_false_when_no_validators(self):
         assert validators_match({}, {}) is False
-
-
-class TestHashingReader:
-    def test_hashes_and_counts(self):
-        src = FakeStream(b"hello world")
-        r = HashingReader(src)
-        chunks = [r.read(5), r.read(5), r.read(5)]
-        assert b"".join(chunks) == b"hello world"
-        assert r.bytes_read == 11
-        import hashlib
-
-        assert r.hasher.hexdigest() == hashlib.sha256(b"hello world").hexdigest()
-
-    def test_has_no_seek_attribute(self):
-        """ContreeClient.request relies on absent .seek to skip retry-rewind."""
-        r = HashingReader(FakeStream(b"x"))
-        assert not hasattr(r, "seek")
 
 
 class TestFetchAndUpload:
