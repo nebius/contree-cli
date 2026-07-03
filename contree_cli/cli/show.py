@@ -61,7 +61,7 @@ def cmd_show(args: ShowArgs) -> int | None:
 
     cache_key = (op_uuid, "operation")
     cached = store.cache.get(cache_key)
-    if cached is not None:
+    if isinstance(cached, dict) and cached.get("status") in TERMINAL:
         op = cast(dict[str, Any], cached)
     else:
         resp = client.get(f"/v1/operations/{op_uuid}")

@@ -236,16 +236,12 @@ class TestFileEditDownload:
     ):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/etc/config.ini")
-        # Client retries 500s (RETRY_DELAYS has 7 entries -> 8 attempts total)
-        responses = [
-            _api_response({"error": "server error"}, status=500) for _ in range(8)
-        ]
-        with (
-            patch("time.sleep"),
-            pytest.raises(ApiError) as exc_info,
-        ):
+        # 403 is non-retryable, so the caller sees it on the first hit
+        # without any retries or sleep.
+        responses = [_api_response({"error": "forbidden"}, status=403)]
+        with pytest.raises(ApiError) as exc_info:
             _run_file_edit(contree_client, args, responses, store=session_store)
-        assert exc_info.value.status == 500
+        assert exc_info.value.status == 403
 
 
 class TestFileEditNoChanges:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import contextlib
+import io
 import json
 import logging
-from unittest.mock import patch
+from importlib.metadata import PackageNotFoundError
+from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import ContreeTestClient, ContreeTestIAMClient, FakeResponse
@@ -17,6 +20,9 @@ from contree_cli.client import (
     ContreeJWTClient,
     HeaderFormatter,
     PaginatedFetcher,
+    cli_version,
+    decode_event_chunk,
+    iter_sse_events,
     resolve_image,
 )
 
@@ -140,20 +146,25 @@ class TestRetry:
         assert result.body == b'{"ok":true}'
         mock_sleep.assert_called_once_with(RETRY_DELAYS[0])
 
-    def test_exhausts_retries_then_raises(self):
+    def test_retries_until_success(self):
+        """`client.request` retries transient failures without a
+        budget — only success or a non-retryable status ends the
+        loop.  Verified here by queuing many 500s followed by a 200."""
         c = ContreeTestClient("https://contree.dev", "tok")
-        total = len(RETRY_DELAYS) + 1
-        for _ in range(total):
+        failures = 20
+        for _ in range(failures):
             c.respond(status=500, body=b"err")
+        c.respond(status=200, body=b'{"ok":true}')
 
-        with (
-            patch("contree_cli.client.time.sleep") as mock_sleep,
-            pytest.raises(ApiError) as exc_info,
-        ):
-            c.request("GET", "/v1/images")
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            result = c.request("GET", "/v1/images")
 
-        assert exc_info.value.status == 500
-        assert mock_sleep.call_count == len(RETRY_DELAYS)
+        assert result.body == b'{"ok":true}'
+        assert mock_sleep.call_count == failures
+        # First failures walk the ladder, the rest reuse the tail delay.
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays[: len(RETRY_DELAYS)] == list(RETRY_DELAYS)
+        assert all(d == RETRY_DELAYS[-1] for d in delays[len(RETRY_DELAYS) :])
 
     def test_no_retry_on_4xx(self):
         c = ContreeTestClient("https://contree.dev", "tok")
@@ -208,22 +219,41 @@ class TestRetry:
         assert call_count["n"] == 3
         assert mock_sleep.call_count == 2
 
-    def test_retry_exhausted_raises_network_error(self):
-        """When retries run out, the last network error propagates."""
-        import socket
-
+    def test_first_attempt_410_uses_short_delay(self):
+        """410 on the very first attempt sleeps `RETRY_DELAYS[0]`, not
+        the wraparound `RETRY_DELAYS[-1]` from the old `attempt-1` index."""
         c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=410, body=b"gone")
+        c.respond(status=200, body=b'{"ok":true}')
 
-        def always_fails():
-            raise socket.gaierror(8, "nodename nor servname provided")
-
-        c._connect = always_fails  # type: ignore[method-assign]
-
-        with (
-            patch("contree_cli.client.time.sleep"),
-            pytest.raises(socket.gaierror),
-        ):
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
             c.request("GET", "/v1/images")
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays[0] == RETRY_DELAYS[0]
+
+    def test_first_attempt_425_uses_short_delay(self):
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=425, body=b"too early")
+        c.respond(status=200, body=b'{"ok":true}')
+
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            c.request("GET", "/v1/images")
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays[0] == RETRY_DELAYS[0]
+
+    def test_410_sleeps_once_per_failure(self):
+        """Regression: 410/425 used to `time.sleep` inside the response
+        branch AND at the top of the next iteration — doubling the
+        actual backoff.  With the retry-generator refactor each failure
+        pulls exactly one delay from the ladder."""
+        c = ContreeTestClient("https://contree.dev", "tok")
+        c.respond(status=410, body=b"gone")
+        c.respond(status=200, body=b'{"ok":true}')
+
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            c.request("GET", "/v1/images")
+        assert mock_sleep.call_count == 1
+        assert mock_sleep.call_args_list[0].args[0] == RETRY_DELAYS[0]
 
     def test_invalid_url_is_not_retried(self):
         """InvalidURL is a permanent caller-side error — should raise immediately."""
@@ -618,6 +648,62 @@ class TestContreeIAMClient:
             c.request("GET", "/v1/images")
 
 
+class TestCliVersion:
+    """``cli_version()`` must return ``"editable"`` whenever the install is
+    not a regular wheel — either the package is missing from metadata, or
+    PEP 610 ``direct_url.json`` marks the install as editable. The update
+    checker keys off this sentinel to skip PyPI pings during local dev."""
+
+    def make_dist(self, *, version: str, direct_url: str | None) -> MagicMock:
+        dist = MagicMock()
+        dist.version = version
+        dist.read_text.return_value = direct_url
+        return dist
+
+    def test_returns_editable_when_package_not_installed(self):
+        with patch(
+            "contree_cli.client.distribution",
+            side_effect=PackageNotFoundError("contree-cli"),
+        ):
+            assert cli_version() == "editable"
+
+    def test_returns_editable_for_pep610_editable_install(self):
+        dist = self.make_dist(
+            version="0.5.0",
+            direct_url=json.dumps(
+                {
+                    "url": "file:///path/to/contree-cli",
+                    "dir_info": {"editable": True},
+                },
+            ),
+        )
+        with patch("contree_cli.client.distribution", return_value=dist):
+            assert cli_version() == "editable"
+
+    def test_returns_version_for_regular_install(self):
+        dist = self.make_dist(version="0.5.0", direct_url=None)
+        with patch("contree_cli.client.distribution", return_value=dist):
+            assert cli_version() == "0.5.0"
+
+    def test_returns_version_when_direct_url_lacks_editable_flag(self):
+        dist = self.make_dist(
+            version="0.5.0",
+            direct_url=json.dumps(
+                {
+                    "url": "https://files.pythonhosted.org/.../contree_cli.whl",
+                    "archive_info": {},
+                },
+            ),
+        )
+        with patch("contree_cli.client.distribution", return_value=dist):
+            assert cli_version() == "0.5.0"
+
+    def test_returns_version_when_direct_url_is_malformed(self):
+        dist = self.make_dist(version="0.5.0", direct_url="not json {")
+        with patch("contree_cli.client.distribution", return_value=dist):
+            assert cli_version() == "0.5.0"
+
+
 class TestPaginatedFetcherLimit:
     """``limit=`` lives in :class:`PaginatedFetcher` so callers don't repeat
     the page-size math, and a small budget like ``--limit 5`` doesn't pull a
@@ -679,3 +765,122 @@ class TestPaginatedFetcherLimit:
         req = contree_client.get_request(0)
         assert "limit=6" in req.path
         assert "limit=1000" not in req.path
+
+
+# ---------------------------------------------------------------------------
+# SSE parser: iter_sse_events
+# ---------------------------------------------------------------------------
+
+
+def _sse(body: str) -> io.BytesIO:
+    return io.BytesIO(body.encode("utf-8"))
+
+
+class TestIterSseEvents:
+    def test_single_frame(self):
+        body = (
+            "id: 1\nevent: stdout\n"
+            'data: {"type":"stdout","data":{"value":"hi","encoding":"ascii"}}\n\n'
+        )
+        events = list(iter_sse_events(_sse(body)))
+        assert events == [
+            {"type": "stdout", "data": {"value": "hi", "encoding": "ascii"}}
+        ]
+
+    def test_multiple_frames(self):
+        body = (
+            'id: 0\nevent: init\ndata: {"type":"init","data":{}}\n\n'
+            'id: 1\nevent: exit\ndata: {"type":"exit","spid":1,"data":{"code":0}}\n\n'
+        )
+        events = list(iter_sse_events(_sse(body)))
+        assert [e["type"] for e in events] == ["init", "exit"]
+        assert events[1]["spid"] == 1
+
+    def test_keepalive_and_blank_lines_ignored(self):
+        body = (
+            ": keepalive\n"
+            "\n"
+            ": keepalive again\n"
+            'id: 5\nevent: stdout\ndata: {"type":"stdout"}\n\n'
+        )
+        events = list(iter_sse_events(_sse(body)))
+        assert events == [{"type": "stdout"}]
+
+    def test_sse_error_frame_surfaces_as_dict(self):
+        body = (
+            ": stream ended with error, retry since last event id\n\n"
+            "event: sse_error\ndata: upstream closed unexpectedly\n\n"
+        )
+        events = list(iter_sse_events(_sse(body)))
+        assert events == [
+            {"type": "sse_error", "message": "upstream closed unexpectedly"}
+        ]
+
+    def test_sse_error_with_id_carries_id(self):
+        body = "id: 42\nevent: sse_error\ndata: boom\n\n"
+        events = list(iter_sse_events(_sse(body)))
+        assert events == [{"type": "sse_error", "message": "boom", "id": "42"}]
+
+    def test_multiline_data_joined_with_newline(self):
+        body = 'event: stdout\ndata: {"type":"stdout",\ndata: "value":"x"}\n\n'
+        events = list(iter_sse_events(_sse(body)))
+        assert events == [{"type": "stdout", "value": "x"}]
+
+    def test_invalid_json_data_dropped_silently(self):
+        body = 'event: stdout\ndata: not-json\n\nevent: exit\ndata: {"type":"exit"}\n\n'
+        events = list(iter_sse_events(_sse(body)))
+        assert events == [{"type": "exit"}]
+
+    def test_non_dict_json_dropped(self):
+        body = 'event: stdout\ndata: [1,2,3]\n\nevent: exit\ndata: {"type":"exit"}\n\n'
+        events = list(iter_sse_events(_sse(body)))
+        assert events == [{"type": "exit"}]
+
+    def test_frame_at_eof_without_blank_line_still_emits(self):
+        body = 'event: stdout\ndata: {"type":"stdout"}\n'
+        events = list(iter_sse_events(_sse(body)))
+        assert events == [{"type": "stdout"}]
+
+    def test_empty_stream_yields_nothing(self):
+        events = list(iter_sse_events(_sse("")))
+        assert events == []
+
+
+# ---------------------------------------------------------------------------
+# SSE chunk decoder: decode_event_chunk
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeEventChunk:
+    def test_ascii_encoding_default(self):
+        assert decode_event_chunk({"value": "hello"}) == b"hello"
+
+    def test_explicit_ascii(self):
+        assert decode_event_chunk({"value": "hi", "encoding": "ascii"}) == b"hi"
+
+    def test_base64_encoding(self):
+        payload = base64.b64encode(b"\x00\x01\xff").decode("ascii")
+        assert (
+            decode_event_chunk({"value": payload, "encoding": "base64"})
+            == b"\x00\x01\xff"
+        )
+
+    def test_base64_invalid_returns_empty(self):
+        assert (
+            decode_event_chunk({"value": "!!!not-base64!!!", "encoding": "base64"})
+            == b""
+        )
+
+    def test_missing_value_returns_empty(self):
+        assert decode_event_chunk({}) == b""
+
+    def test_empty_value_returns_empty(self):
+        assert decode_event_chunk({"value": ""}) == b""
+
+    def test_non_dict_returns_empty(self):
+        assert decode_event_chunk("not a dict") == b""
+        assert decode_event_chunk(None) == b""
+        assert decode_event_chunk(42) == b""
+
+    def test_non_string_value_returns_empty(self):
+        assert decode_event_chunk({"value": 123}) == b""

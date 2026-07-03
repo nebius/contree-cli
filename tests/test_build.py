@@ -65,7 +65,7 @@ def run_build(
     SESSION_STORE.set(SessionStore(db_path, "placeholder"))
     ctx = copy_context()
     with (
-        patch("contree_cli.docker.kw_run.time.sleep"),
+        patch("contree_cli.cli.run.time.sleep"),
         patch("contree_cli.docker.kw_from.time.sleep"),
     ):
         return ctx.run(cmd_build, args)
@@ -121,7 +121,7 @@ class TestArgparseWiring:
 
 
 class TestSimpleBuild:
-    def test_from_run_creates_two_api_calls(self, context_dir, db_path):
+    def test_from_run_creates_expected_api_calls(self, context_dir, db_path):
         write_dockerfile(
             context_dir,
             "FROM tag:ubuntu:latest\nRUN echo hi\n",
@@ -135,13 +135,20 @@ class TestSimpleBuild:
         ]
         rc = run_build(tc, args, responses, db_path)
         assert rc is None
-        assert tc.request_count == 3
+        # 4 wire calls: FROM's tag lookup, POST instances, SSE events
+        # follow, then the streamer's terminal GET.
+        assert tc.request_count == 4
         assert tc.get_request(0).method == "GET"
         assert "/v1/images" in tc.get_request(0).path
         assert tc.get_request(1).method == "POST"
         assert "/v1/instances" in tc.get_request(1).path
         assert tc.get_request(2).method == "GET"
-        assert "/v1/operations" in tc.get_request(2).path
+        assert "/v1/operations/op-1/events?follow=1" in tc.get_request(2).path
+        assert tc.get_request(3).method == "GET"
+        assert (
+            tc.get_request(3).path[-len("/v1/operations/op-1") :]
+            == "/v1/operations/op-1"
+        )
 
     def test_run_payload_carries_command(self, context_dir, db_path):
         write_dockerfile(
@@ -165,6 +172,52 @@ class TestSimpleBuild:
         assert body["image"] == BASE_IMG
         assert body["command"] == "apt-get update"
         assert body["shell"] is True
+
+    def test_run_streams_stdout_live(self, context_dir, db_path, capsys):
+        """Docker-compat mode: RUN output must reach the user's terminal
+        as the SSE events arrive, not just after the op completes.
+
+        Uses a stubbed streamer that writes a chunk to `sys.stdout.buffer`
+        and returns a completion-populated summary so the build finishes
+        with the streamed image — mirrors what a live SSE `stdout` frame
+        followed by a `completion` frame would produce."""
+        import sys
+
+        from contree_cli.cli.run import TerminalSummary
+
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest\nRUN echo hi\n",
+        )
+        tc = ContreeTestClient()
+
+        def fake_stream(_client, op_uuid, _formatter):
+            sys.stdout.buffer.write(b"hi from RUN\n")
+            sys.stdout.buffer.flush()
+            summary = TerminalSummary()
+            summary.completion = {
+                "type": "completion",
+                "data": {"status": "SUCCESS", "result_image_uuid": NEW_IMG},
+            }
+            summary.exit_event = {"type": "exit", "spid": 1, "data": {"code": 0}}
+            summary.stdout.extend(b"hi from RUN\n")
+            return summary
+
+        with patch(
+            "contree_cli.docker.kw_run._stream_events_until_close",
+            side_effect=fake_stream,
+        ):
+            rc = run_build(
+                tc,
+                BuildArgs(context=str(context_dir)),
+                [make_tag_lookup(BASE_IMG), make_spawn()],
+                db_path,
+            )
+        assert rc is None
+        # The live-streamed chunk lands on stdout before the final
+        # formatter record — verify both are present.
+        out = capsys.readouterr().out
+        assert "hi from RUN" in out
 
 
 class TestCache:
@@ -227,7 +280,9 @@ class TestCache:
             db_path,
         )
         assert rc is None
-        assert second.request_count == 3
+        # 4 wire calls per build: FROM tag lookup, POST instances, SSE
+        # follow, and the streamer's terminal GET.
+        assert second.request_count == 4
 
     def test_no_cache_when_from_layer_is_active_branch(self, context_dir, db_path):
         """Regression: --no-cache must not blow up when the target layer
@@ -431,7 +486,9 @@ class TestTag:
             db_path,
         )
         assert rc is None
-        tag_req = tc.get_request(3)
+        # PATCH lands after: tag lookup (0), spawn (1), SSE events (2),
+        # streamer's terminal GET (3).
+        tag_req = tc.get_request(4)
         assert tag_req.method == "PATCH"
         assert NEW_IMG in tag_req.path
         body = json.loads(tag_req.body.decode())

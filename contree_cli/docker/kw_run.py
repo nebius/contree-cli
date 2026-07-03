@@ -5,18 +5,21 @@ from __future__ import annotations
 import json
 import logging
 import shlex
-import time
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import Any, ClassVar
 
+from contree_cli.cli.run import (
+    TERMINAL_OP_STATUSES,
+    _build_op_from_summary,
+    _stream_events_until_close,
+)
 from contree_cli.client import decode_stream
+from contree_cli.output import DefaultFormatter
 
 from .context import BuildContext
 from .keyword import DockerKeyword, parse_command_form
 
 logger = logging.getLogger(__name__)
-
-TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 
 
 @dataclass(frozen=True, repr=False)
@@ -91,33 +94,42 @@ class RunKeyword(DockerKeyword):
             payload["files"] = ctx.pending_files_payload()
 
         resp = ctx.client.post_json("/v1/instances", payload)
-        op = json.loads(resp.read())
-        op_uuid: str = op["uuid"]
+        spawn_op = json.loads(resp.read())
+        op_uuid: str = spawn_op["uuid"]
         logger.info(
             "RUN spawned op=%s: %s", op_uuid, display_title(parts, self.shell_form)
         )
 
-        op = poll(ctx, op_uuid)
+        op = stream_and_resolve(ctx, op_uuid)
         check_success(op, parts, self.shell_form)
         result = op.get("result") or {}
         assert isinstance(result, dict)
         new_image = result.get("image")
         if not new_image:
             raise RuntimeError("RUN succeeded but no image was produced")
-        log_streams(op)
         return str(new_image), op_uuid
 
 
-def poll(ctx: BuildContext, op_uuid: str) -> dict[str, object]:
-    delay = 0.5
-    while True:
-        time.sleep(delay)
-        resp = ctx.client.get(f"/v1/operations/{op_uuid}")
-        op = json.loads(resp.read())
-        if op["status"] in TERMINAL_STATUSES:
-            return op  # type: ignore[no-any-return]
-        if delay < 5:
-            delay += delay
+def stream_and_resolve(ctx: BuildContext, op_uuid: str) -> dict[str, Any]:
+    """Stream RUN output live (docker-style), then materialise the
+    full op dict.
+
+    Preference order for the op payload matches ``cmd_run``:
+    ``completion`` event → SSE `fallback_op` from a terminal GET →
+    safety-net GET.  When we fell back to the plain endpoint (no
+    live stream), replay the captured stdout/stderr from the op's
+    metadata so build users still see what the RUN produced."""
+    summary = _stream_events_until_close(ctx.client, op_uuid, DefaultFormatter())
+    if summary.completion is not None:
+        return _build_op_from_summary(op_uuid, summary)
+    if summary.fallback_op is not None:
+        log_streams(summary.fallback_op)
+        return summary.fallback_op
+    resp = ctx.client.get(f"/v1/operations/{op_uuid}")
+    op: dict[str, Any] = json.loads(resp.read())
+    if op.get("status") in TERMINAL_OP_STATUSES:
+        log_streams(op)
+    return op
 
 
 def check_success(

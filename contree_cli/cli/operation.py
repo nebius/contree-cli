@@ -13,6 +13,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
 import json
 import logging
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
+from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.cli.show import ShowArgs, cmd_show
 from contree_cli.client import ApiError, ContreeClient, PaginatedFetcher
 from contree_cli.output import OutputFormatter
@@ -496,11 +497,23 @@ def cmd_wait(args: WaitArgs) -> int | None:
     exit_status = 0
     sleep_time = 0.5
 
+    # Op cache is best-effort — `wait` doesn't strictly need the
+    # session store, and the cmd is reachable from contexts that don't
+    # set one (e.g. standalone scripts).
+    try:
+        store = SESSION_STORE.get()
+    except LookupError:
+        store = None
+
     while pending and time.monotonic() < deadline:
         for uuid in list(pending):
             resp = client.get(f"/v1/operations/{uuid}")
             op = json.loads(resp.read())
+
             if op.get("status") in TERMINAL_STATUSES:
+                if store is not None:
+                    with contextlib.suppress(Exception):
+                        store.cache[(uuid, "operation")] = op
                 pending.discard(uuid)
                 exit_code = extract_exit_code(op)
                 formatter(

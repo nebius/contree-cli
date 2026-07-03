@@ -77,6 +77,16 @@ class FakeResponse:
     def read(self, amt: int | None = None) -> bytes:
         return self.body
 
+    def readline(self, size: int = -1) -> bytes:
+        """Empty bytes signals EOF to `iter_sse_events`, which makes any
+        SSE attempt against a non-SSE mock no-op out without raising —
+        the test then exercises the GET fallback as before."""
+        return b""
+
+    def read1(self, amt: int | None = None) -> bytes:
+        """Match BufferedReader.read1 for streaming-style consumers."""
+        return self.body
+
     def getheader(self, name: str, default: str | None = None) -> str | None:
         assert self.headers is not None
         for key, value in self.headers.items():
@@ -113,6 +123,7 @@ class FakeConnection:
     def __init__(self) -> None:
         self.requests: list[RecordedRequest] = []
         self.responses: list[FakeResponse] = []
+        self._last_path: str = ""
 
     def request(
         self,
@@ -131,8 +142,20 @@ class FakeConnection:
             body = b"".join(chunks)
         recorded = body if isinstance(body, (bytes, bytearray, type(None))) else None
         self.requests.append(RecordedRequest(method, path, recorded, headers or {}))
+        self._last_path = path
 
     def getresponse(self) -> FakeResponse:
+        # `/events?follow=1` is the modern wait path — auto-serve an empty
+        # SSE response so the GET-/operations mock the test queued up
+        # isn't consumed by the events probe.  Real tests that want to
+        # exercise the SSE wire format must mock the connection
+        # differently anyway.
+        if "/events" in self._last_path:
+            return FakeResponse(
+                status=200,
+                body=b"",
+                headers={"Content-Type": "text/event-stream"},
+            )
         return self.responses.pop(0)
 
 
