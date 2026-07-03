@@ -146,20 +146,25 @@ class TestRetry:
         assert result.body == b'{"ok":true}'
         mock_sleep.assert_called_once_with(RETRY_DELAYS[0])
 
-    def test_exhausts_retries_then_raises(self):
+    def test_retries_until_success(self):
+        """`client.request` retries transient failures without a
+        budget — only success or a non-retryable status ends the
+        loop.  Verified here by queuing many 500s followed by a 200."""
         c = ContreeTestClient("https://contree.dev", "tok")
-        total = len(RETRY_DELAYS) + 1
-        for _ in range(total):
+        failures = 20
+        for _ in range(failures):
             c.respond(status=500, body=b"err")
+        c.respond(status=200, body=b'{"ok":true}')
 
-        with (
-            patch("contree_cli.client.time.sleep") as mock_sleep,
-            pytest.raises(ApiError) as exc_info,
-        ):
-            c.request("GET", "/v1/images")
+        with patch("contree_cli.client.time.sleep") as mock_sleep:
+            result = c.request("GET", "/v1/images")
 
-        assert exc_info.value.status == 500
-        assert mock_sleep.call_count == len(RETRY_DELAYS)
+        assert result.body == b'{"ok":true}'
+        assert mock_sleep.call_count == failures
+        # First failures walk the ladder, the rest reuse the tail delay.
+        delays = [call.args[0] for call in mock_sleep.call_args_list]
+        assert delays[: len(RETRY_DELAYS)] == list(RETRY_DELAYS)
+        assert all(d == RETRY_DELAYS[-1] for d in delays[len(RETRY_DELAYS) :])
 
     def test_no_retry_on_4xx(self):
         c = ContreeTestClient("https://contree.dev", "tok")
@@ -213,23 +218,6 @@ class TestRetry:
         assert result.body == b'{"ok":true}'
         assert call_count["n"] == 3
         assert mock_sleep.call_count == 2
-
-    def test_retry_exhausted_raises_network_error(self):
-        """When retries run out, the last network error propagates."""
-        import socket
-
-        c = ContreeTestClient("https://contree.dev", "tok")
-
-        def always_fails():
-            raise socket.gaierror(8, "nodename nor servname provided")
-
-        c._connect = always_fails  # type: ignore[method-assign]
-
-        with (
-            patch("contree_cli.client.time.sleep"),
-            pytest.raises(socket.gaierror),
-        ):
-            c.request("GET", "/v1/images")
 
     def test_first_attempt_410_uses_short_delay(self):
         """410 on the very first attempt sleeps `RETRY_DELAYS[0]`, not

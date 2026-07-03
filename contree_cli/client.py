@@ -348,8 +348,6 @@ class ContreeClient(ABC):
             merged.update(headers)
 
         full_path = self._prefix + path
-        last_error: ApiError | None = None
-        last_network_error: BaseException | None = None
 
         log.debug(
             "%s %s headers=%s body=%s",
@@ -359,22 +357,17 @@ class ContreeClient(ABC):
             BodyFormatter(body, content_type=merged.get("Content-Type", "")),
         )
 
-        # Backoff delays come from a primed `retry_generator()`, so each
-        # failure just calls `next(delays)` and gets the next value —
-        # no attempt counter, no off-by-one indexing.  The generator
-        # yields the tail delay forever; the finite retry budget lives
-        # in `retries_left` below.
+        # Backoff delays come from a primed `retry_generator()` — each
+        # failure just calls `next(delays)` and gets the next value.
+        # The generator yields the tail delay forever, and there is no
+        # outer retry budget: transient errors are retried until either
+        # the server returns a non-retryable response or the user hits
+        # Ctrl+C.  Non-retryable 4xx responses raise immediately.
         delays = retry_generator()
-        retries_left = len(RETRY_DELAYS)
 
-        def sleep_for_retry(reason_fmt: str, *reason_args: object) -> bool:
+        def sleep_for_retry(reason_fmt: str, *reason_args: object) -> None:
             """Pull the next backoff delay, log the reason, sleep, and
-            rewind the request body if it's seekable.  Returns ``False``
-            when the budget is exhausted so the caller can break out."""
-            nonlocal retries_left
-            if retries_left <= 0:
-                return False
-            retries_left -= 1
+            rewind the request body if it's seekable."""
             delay = next(delays)
             log.warning(reason_fmt + " retrying in %ss…", *reason_args, delay)
             time.sleep(delay)
@@ -387,7 +380,6 @@ class ContreeClient(ABC):
                         "Cannot retry: streaming body is not seekable",
                     )
                 stream.seek(0)
-            return True
 
         while True:
             try:
@@ -401,15 +393,8 @@ class ContreeClient(ABC):
                 # would just spin through the back-off ladder for nothing.
                 raise
             except RETRYABLE_NETWORK_ERRORS as exc:
-                last_network_error = exc
-                last_error = None
-                if not sleep_for_retry("Network error (%s),", type(exc).__name__):
-                    break
+                sleep_for_retry("Network error (%s),", type(exc).__name__)
                 continue
-
-            # Successful round-trip clears the network-error trail so the
-            # final raise below doesn't pick up stale failure context.
-            last_network_error = None
 
             if (resp.getheader("Content-Encoding", "") or "").lower() == "gzip":
                 resp = cast(http.client.HTTPResponse, GzipResponse(resp))
@@ -450,17 +435,10 @@ class ContreeClient(ABC):
             error = ApiError(resp.status, resp.reason, resp_body)
 
             if resp.status in (410, 425) or 500 <= resp.status < 600:
-                last_error = error
-                if not sleep_for_retry("Server error %d,", resp.status):
-                    break
+                sleep_for_retry("Server error %d,", resp.status)
                 continue
 
             raise error
-
-        if last_network_error is not None:
-            raise last_network_error
-        assert last_error is not None
-        raise last_error
 
     def log_and_buffer(
         self,

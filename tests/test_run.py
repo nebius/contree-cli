@@ -621,13 +621,11 @@ class TestFileUpload:
         )
         args = _default_args(file=[mf])
 
-        # Client retries 500s (RETRY_DELAYS has 7 entries -> 8 attempts)
-        responses = [
-            _api_response({"error": "server error"}, status=500) for _ in range(8)
-        ]
+        # 403 is non-retryable, so the caller sees it on the first hit.
+        responses = [_api_response({"error": "forbidden"}, status=403)]
         with pytest.raises(ApiError) as exc_info:
             _run_cmd(contree_client, args, responses, store=session_store)
-        assert exc_info.value.status == 500
+        assert exc_info.value.status == 403
 
     def test_local_file_cache_skips_api_file_lookup(
         self, contree_client, session_store, tmp_path
