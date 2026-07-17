@@ -136,19 +136,19 @@ class TestCmdExport:
         # Refused before any API call.
         assert contree_client.calls_for("inspect_image_archive") == []
 
-    def test_plain_wire_stream_gets_gzipped(
+    def test_default_output_is_the_served_stream(
         self, contree_client, session_store, tmp_path
     ):
-        """If the server ever serves the archive uncompressed, the
-        default output is still valid gzip."""
+        """The default output is byte-identical to what the server
+        serves with compressed=True; the CLI never re-encodes it."""
         dest = tmp_path / "out.tar.gz"
         _run_cmd(
             contree_client,
-            [b"plain-", b"tar-bytes"],
+            [b"served-", b"bytes"],
             store=session_store,
             output=str(dest),
         )
-        assert gzip.decompress(dest.read_bytes()) == b"plain-tar-bytes"
+        assert dest.read_bytes() == b"served-bytes"
 
     def test_decompress_flag(self, contree_client, session_store, tmp_path):
         dest = tmp_path / "out"

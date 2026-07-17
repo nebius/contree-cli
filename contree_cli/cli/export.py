@@ -18,7 +18,6 @@ import argparse
 import logging
 import sys
 import time
-import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,8 +31,6 @@ from contree_cli.output import DefaultFormatter
 from contree_cli.types import FLAGS
 
 logger = logging.getLogger(__name__)
-
-GZIP_MAGIC = b"\x1f\x8b"
 
 EPILOG = """\
 examples:
@@ -95,33 +92,6 @@ def wants_plain_tar(args: ExportArgs) -> bool:
     return args.output.endswith(".tar")
 
 
-def gzip_passthrough(chunks: Iterator[bytes]) -> Iterator[bytes]:
-    """Yield the served stream, guaranteeing gzip output.
-
-    The server compresses every response, so normally the bytes flow
-    through untouched. If the stream ever arrives plain (no gzip
-    magic), it is compressed locally so the default output stays a
-    valid ``.tar.gz``.
-    """
-    first = b""
-    iterator = iter(chunks)
-    for chunk in iterator:
-        if chunk:
-            first = chunk
-            break
-    if not first:
-        return
-    if first.startswith(GZIP_MAGIC):
-        yield first
-        yield from iterator
-        return
-    compressor = zlib.compressobj(wbits=31)
-    yield compressor.compress(first)
-    for chunk in iterator:
-        yield compressor.compress(chunk)
-    yield compressor.flush()
-
-
 def write_stream(chunks: Iterator[bytes], sink: IO[bytes]) -> int:
     """Pump chunks into *sink* with periodic progress on stderr."""
     written = 0
@@ -162,14 +132,11 @@ def cmd_export(args: ExportArgs) -> int | None:
     path = store.resolve_path(args.path)
     uuid = client.resolve_image(store.current_image)
 
-    plain = wants_plain_tar(args)
     chunks: Iterator[bytes] = client.inspect_image_archive(
         uuid,
         path,
-        compressed=not plain,
+        compressed=not wants_plain_tar(args),
     )
-    if not plain:
-        chunks = gzip_passthrough(chunks)
 
     start = time.monotonic()
     try:
