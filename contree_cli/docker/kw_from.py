@@ -50,6 +50,9 @@ class FromKeyword(DockerKeyword):
         if ctx.last_image:
             seal_stage(ctx)
         ctx.current_stage_alias = self.alias
+        ctx.env.clear()
+        ctx.workdir = "/"
+        ctx.user = ""
 
         ref = ctx.substitute(self.image_ref)
         image_uuid = resolve_or_import(ctx, ref)

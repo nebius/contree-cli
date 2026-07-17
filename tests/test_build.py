@@ -776,6 +776,39 @@ class TestMultistage:
         final = tc.calls_for("spawn_instance")[2].args[0]
         assert "su -s" in final
 
+    def test_stage_state_reset_on_from(self, context_dir, db_path):
+        """USER, ENV, and WORKDIR do not leak into the next stage."""
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest AS build\n"
+            "USER app\n"
+            "ENV FOO=bar\n"
+            "WORKDIR /src\n"
+            "RUN make\n"
+            "FROM tag:ubuntu:latest\n"
+            "RUN id\n",
+        )
+        tc = ContreeTestClient()
+        mocks = [
+            make_tag_lookup(BASE_IMG),
+            make_spawn("op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_tag_lookup(BASE_IMG),
+            make_spawn("op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+        ]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc is None
+        first, second = tc.calls_for("spawn_instance")
+        assert "su -s" in first.args[0]
+        assert first.kwargs["cwd"] == "/src"
+        assert first.kwargs["env"] == {"FOO": "bar"}
+        assert "su -s" not in second.args[0]
+        assert second.kwargs["cwd"] is ...
+        assert second.kwargs["env"] is ...
+
     def test_stage_with_pending_files_sealed_via_closer(self, context_dir, db_path):
         """A stage ending with a local COPY is committed by the closer
         RUN before the next FROM starts."""
