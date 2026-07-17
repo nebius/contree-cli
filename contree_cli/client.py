@@ -106,5 +106,5 @@ def client_from_profile(
     return CliClient.from_profile(
         profile,
         timeout=timeout,
-        retry=RetryPolicy(max_attempts=None),
+        retry=RetryPolicy(max_attempts=None, retry_unsafe=True),
     )

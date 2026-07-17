@@ -52,6 +52,13 @@ class TestClientFromProfile:
         assert isinstance(retry, RetryPolicy)
         assert retry.max_attempts is None
 
+    def test_retries_unsafe_methods(self, test_client_double):
+        """POST/PATCH calls (spawn, import, upload) keep their 410/425
+        retries: the server signals those before processing the request."""
+        profile = Profile(name="p", url="https://contree.dev", token="tok")
+        retry = client_from_profile(profile).constructed_with["retry"]
+        assert retry.retry_unsafe is True
+
     def test_jwt_profile_requires_url(self):
         profile = Profile(name="p", url="", token="tok")
         with pytest.raises(ValueError, match="No URL configured"):
