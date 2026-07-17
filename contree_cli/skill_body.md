@@ -3,31 +3,16 @@
 {intro}
 
 Use `contree` from PATH. If it is missing, ask the user to install it: `uv tool install contree-cli`, `pipx install contree-cli`, or `pip install contree-cli`.
-
-## Codex Sandbox
-
-`contree` needs network access and write access to its data directory: `$CONTREE_HOME`, or `$XDG_CONFIG_HOME/contree`, or `~/.config/contree`.
-
-For default Codex config:
-
-```toml
-[sandbox_workspace_write]
-network_access = true
-writable_roots = ["~/.config/contree"]
-```
-
-If the user overrides `CONTREE_HOME` or `XDG_CONFIG_HOME`, the writable root must point at the resolved ConTree data directory. Without this, the CLI can fail with `sqlite3.OperationalError`. If the sandbox cannot be configured, stop and ask the user.
-
+{sandbox}
 ## Required Workflow
 
-{first_step}
-4. If syntax or behavior is unclear, consult the built-in manual before retrying: `contree agent <topic>` or `contree <command> --help`. Useful topics: `sessions`, `images`, `files`, `execution`, `output`, `profiles`, `command_safety`, `all_commands`, `all`.
-5. Do not run bare or mutating auth commands. Agents may run read-only `contree -f json auth ls` / `auth profiles`; if auth is missing or invalid, ask the user to run `contree auth`.
-6. Choose one explicit session key, then pass `-S <key>` on every current-session command: `use`, `run`, `cd`, `env`, `ls`, `cat`, `cp`, `file`, implicit-current-image `tag`, and current-session `session show/branch/checkout/rollback/wait`.
-7. Before `use`, list available images with a prefix. Do not assume a tag exists: `contree images --prefix python`, `contree images --prefix ubuntu`, `contree images --prefix compiler/`. An empty result just means that prefix has no tags in this project — broaden or vary the prefix (`python` vs `python-`, `compiler/` vs `compiler/python/`) before importing or rebuilding.
-8. Bootstrap: `contree -S <key> use <tag-or-image-from-list>` then `contree -S <key> cd /root`.
-9. Inspect first with `ls`, `cat`, `session show`, `ps`/`op ls`, or `op show`. Mutate in small rollbackable steps.
-10. After installing tools or setting up an environment, tag the result: `contree -S <key> tag <purpose/base:tag>`.
+1. If syntax or behavior is unclear, consult the built-in manual before retrying: `contree agent <topic>` or `contree <command> --help`. Useful topics: `sessions`, `images`, `files`, `execution`, `output`, `profiles`, `command_safety`, `all_commands`, `all`.
+2. Do not run bare or mutating auth commands. Agents may run read-only `contree -o json auth ls` / `auth profiles`; if auth is missing or invalid, ask the user to run `contree auth`.
+3. Choose one explicit session key, then pass `-S <key>` on every current-session command: `use`, `run`, `cd`, `env`, `ls`, `cat`, `cp`, `file`, implicit-current-image `tag`, and current-session `session show/branch/checkout/rollback/wait`.
+4. Before `use`, list available images with a prefix. Do not assume a tag exists: `contree images --prefix python`, `contree images --prefix ubuntu`, `contree images --prefix compiler/`. An empty result just means that prefix has no tags in this project; broaden or vary the prefix (`python` vs `python-`, `compiler/` vs `compiler/python/`) before importing or rebuilding.
+5. Bootstrap: `contree -S <key> use <tag-or-image-from-list>` then `contree -S <key> cd /root`.
+6. Inspect first with `ls`, `cat`, `session show`, `ps`/`op ls`, or `op show`. Mutate in small rollbackable steps.
+7. After installing tools or setting up an environment, tag the result: `contree -S <key> tag <purpose/base:tag>`.
 
 Project-scoped or explicit-target commands usually do not need `-S`: `images`, `auth ls/profiles`, `op ls/show/wait/cancel`, `skill`, `agent`, `build`, `session list`, `session show NAME`, and help.
 
@@ -60,8 +45,8 @@ Directory attachments recurse and exclude common junk such as `.git`, hidden fil
 
 ## Detached Work
 
-- Start detached: `contree -S <key> -f json run -d --disposable -- pytest tests/a`.
-- Capture UUIDs with global `-f json` before `run`; default detached output is not reliable for `jq`.
+- Start detached: `contree -S <key> -o json run -d --disposable -- pytest tests/a`.
+- Capture UUIDs with global `-o json` before `run`; default detached output is not reliable for `jq`.
 - `op wait UUID...` is a pure observer. It polls, prints one row per completion with the server-reported `status` (`SUCCESS`/`FAILED`/`CANCELLED`) and a separate `exit_code` column for the sandbox process. It does not advance session state. The CLI's own exit code is 1 when any op finished non-`SUCCESS`, or the sandbox `exit_code` when a `SUCCESS` op exited non-zero, so `op wait && next` still composes naturally.
 - `op wait --all` is project-wide. Prefer explicit UUIDs when multiple agents or shells may share the project.
 - `session wait` with no UUIDs drains detached operations spawned from this session's local cache. Successful non-disposable runs advance the active branch; disposable runs are recorded as disposable branches.
@@ -77,15 +62,15 @@ Directory attachments recurse and exclude common junk such as `.git`, hidden fil
 
 ## Output And Automation
 
-- Global flags go before the subcommand: `contree -f json images --prefix python`.
-- Prefer structured output in automation: `json`, `json-pretty`, `csv`, or `tsv`. `toml` is available only on Python 3.11+.
+- Global flags go before the subcommand: `contree -o json images --prefix python`.
+- Prefer structured output in automation: `json`, `json-pretty`, `csv`, or `tsv`. Human-oriented formats are `plain`, `table`, and `default`; `toml` needs Python 3.11+. The authoritative format list is whatever `contree --help` shows on this install.
 - `json` is line-delimited for streaming and multi-row commands.
 - Default `run` output prints raw stdout/stderr, not a structured row.
 - `cat` and `cp` are content-oriented; do not parse them as table/json listings.
 
 ## Operation References
 
-Anywhere `--help` shows a positional named `UUID_OR_REF` (`op show`, `op cancel`, `op wait`, top-level `show`/`kill`, `session wait`) the CLI accepts both real operation UUIDs and current-session history refs. Refs require `-S <key>` and a history entry whose `operation_uuid` is set (`use` entries have none — error is "has no operation UUID"). Accepted forms:
+Anywhere `--help` shows a positional named `UUID_OR_REF` (`op show`, `op cancel`, `op wait`, top-level `show`/`kill`, `session wait`) the CLI accepts both real operation UUIDs and current-session history refs. Refs require `-S <key>` and a history entry whose `operation_uuid` is set (`use` entries have none; the error is "has no operation UUID"). Accepted forms:
 
 | Form | Meaning |
 |---|---|
@@ -97,7 +82,7 @@ Anywhere `--help` shows a positional named `UUID_OR_REF` (`op show`, `op cancel`
 
 When unsure, use `session show` to find the absolute id and pass that.
 
-`contree op show --raw UUID_OR_REF...` (also `contree show --raw ...`) prints each operation's full server payload as JSONL — one compact JSON object per line, no derived columns, no stdout/stderr decoding. Use it when the flat row hides what you need (`metadata`, `resources`, raw `result.state`, …) or pipe it into `jq -c`.
+`contree op show --raw UUID_OR_REF...` (also `contree show --raw ...`) prints each operation's full server payload as JSONL: one compact JSON object per line, no derived columns, no stdout/stderr decoding. Use it when the flat row hides what you need (`metadata`, `resources`, raw `result.state`, ...) or pipe it into `jq -c`.
 
 ## Subagents
 
@@ -118,4 +103,4 @@ contree agent profiles
 contree <command> --help
 ```
 
-{fallback}{references}
+{fallback}

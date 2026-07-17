@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import abc
 import os
-import shutil
 import sqlite3
-import tempfile
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -59,6 +57,10 @@ def default_claude_home() -> Path:
     return Path.home() / ".claude"
 
 
+def default_agents_home() -> Path:
+    return Path.home() / ".agents"
+
+
 # ── registry ─────────────────────────────────────────────
 
 
@@ -80,6 +82,22 @@ def connect_registry() -> Iterator[sqlite3.Connection]:
 
 def normalize_install_path(path: Path) -> str:
     return str(path.expanduser())
+
+
+def prune_empty_parents(path: Path) -> None:
+    """Remove empty skill-layout parents (`skills`, `agents`, dot-dirs) of path.
+
+    Stops at the first directory that is not part of a skill layout or is
+    not empty, so project and home directories are never touched.
+    """
+    for directory in path.parents:
+        name = directory.name
+        if name not in {"skills", "agents"} and not name.startswith("."):
+            return
+        try:
+            directory.rmdir()
+        except OSError:
+            return
 
 
 def remember_installed(skill: Skill) -> None:
@@ -113,15 +131,25 @@ This skill is installed by `contree skill install` (version `{version}`). \
 It uses the `contree` CLI from PATH.\
 """
 
-BUNDLED_FIRST_STEP = """\
-1. Use `contree` from PATH — no bundled wrapper needed.
-2. Output formats (global `-f` flag BEFORE the subcommand):
-   `-f json` (JSONL), `-f json-pretty`, `-f csv`, `-f tsv`,
-   `-f plain`, `-f table`, `-f default`, and `-f toml` on Python 3.11+.
-   The authoritative list is whatever `contree --help` shows on this
-   install — if `toml` is missing there, this Python lacks `tomllib`
-   and `-f toml` will fail with an argparse error.
-3. For the full built-in manual: `contree agent`\
+CODEX_SANDBOX = """\
+
+## Codex Sandbox
+
+`contree` needs network access and write access to its data directory, \
+which resolved to `{contree_home}` when this skill was installed.
+
+Codex config for that directory:
+
+```toml
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["{contree_home}"]
+```
+
+If `CONTREE_HOME` or `XDG_CONFIG_HOME` changes, the writable root must \
+point at the newly resolved ConTree data directory. Without this, the CLI \
+can fail with `sqlite3.OperationalError`. If the sandbox cannot be \
+configured, stop and ask the user.
 """
 
 BUNDLED_FALLBACK = """\
@@ -132,7 +160,7 @@ BUNDLED_FALLBACK = """\
 # 1) Discover what images are available -- do NOT assume a tag exists.
 contree images --prefix ubuntu         # narrow listing (preferred)
 # Fallback for when you don't know the prefix shape -- much slower:
-# contree -f plain images | grep -i ubuntu
+# contree -o plain images | grep -i ubuntu
 
 # 2) Bootstrap a session against a tag actually present in the listing.
 contree -S <key> use <image-or-tag-from-list>
@@ -141,20 +169,7 @@ contree -S <key> use <image-or-tag-from-list>
 #    pipes / redirects / && / ; / variable expansion.
 contree -S <key> run -- true
 contree -S <key> run -- uname -a
-
-# 4) See the full manual / per-command help.
-contree agent                          # full manual
-contree <command> --help               # per-command help
 ```\
-"""
-
-BUNDLED_REFERENCES = """\
-
-## Where to look next
-
-- Run `contree agent` for the full built-in manual.
-- Run `contree agent <topic>` for details on a specific topic.
-- Run `contree <command> --help` for per-command syntax.
 """
 
 SUBAGENT_DESCRIPTION = """\
@@ -170,11 +185,9 @@ Claude-compatible Markdown format. It assumes the `contree` CLI is installed \
 and available on `PATH`.\
 """
 
-SUBAGENT_FIRST_STEP = "1. Use the local `contree` executable from `PATH`."
-
 AGENT_DESCRIPTION = (
     "Use proactively when the user needs sandboxed execution "
-    "through ConTree — sessions, images, run, rollback, tagging."
+    "through ConTree: sessions, images, run, rollback, tagging."
 )
 
 AGENT_TEMPLATE = """\
@@ -182,10 +195,7 @@ AGENT_TEMPLATE = """\
 name: {name}
 description: >-
   {description}
-tools:
-  - Bash
-  - Read
-  - Grep
+tools: Bash, Read, Grep
 skills:
   - contree
 ---
@@ -201,7 +211,7 @@ Run `contree agent <topic>` for details on a specific topic.
 """
 
 OPENAI_DESCRIPTION = """\
-Run ConTree workflows through a bundled dependency-free CLI\
+Operate ConTree sandboxes through the contree CLI\
 """
 
 OPENAI_TEMPLATE = """\
@@ -238,14 +248,11 @@ class Skill(abc.ABC):
     def intro(self) -> str:
         return BUNDLED_INTRO.format(version=skill_version())
 
-    def first_step(self) -> str:
-        return BUNDLED_FIRST_STEP
+    def sandbox(self) -> str:
+        return ""
 
     def fallback(self) -> str:
         return BUNDLED_FALLBACK
-
-    def references(self) -> str:
-        return BUNDLED_REFERENCES
 
     def frontmatter(self) -> str:
         return f'---\nname: "{self.name}"\ndescription: "{self.description}"\n---\n'
@@ -253,9 +260,8 @@ class Skill(abc.ABC):
     def body(self) -> str:
         return skill_body_template().format(
             intro=self.intro(),
-            first_step=self.first_step(),
+            sandbox=self.sandbox(),
             fallback=self.fallback(),
-            references=self.references(),
         )
 
     def render(self) -> str:
@@ -275,12 +281,23 @@ class Skill(abc.ABC):
         return cls.home_dir() / "skills"
 
     @classmethod
+    def project_path(cls, root: Path) -> Path:
+        return root / f".{cls.kind}" / "skills" / SKILL_NAME
+
+    @classmethod
+    def global_path(cls) -> Path:
+        return cls.skills_dir() / SKILL_NAME
+
+    @classmethod
     def resolve_path(cls, hint: str) -> Path:
         if not hint:
-            return (Path(f".{cls.kind}") / "skills" / SKILL_NAME).resolve()
+            return cls.project_path(Path()).resolve()
         if hint == "~":
-            return cls.skills_dir() / SKILL_NAME
-        return Path(hint).expanduser().resolve()
+            return cls.global_path()
+        path = Path(hint).expanduser().resolve()
+        if is_skill_target(path):
+            return path
+        return cls.project_path(path)
 
     @property
     def installed_version(self) -> str:
@@ -298,22 +315,20 @@ class Skill(abc.ABC):
 
     @property
     def exists(self) -> bool:
-        return self.path.exists()
+        return (self.path / "SKILL.md").is_file()
+
+    def owned_files(self) -> tuple[Path, ...]:
+        """Files this install writes; the only paths remove() may touch."""
+        return (
+            self.path / "SKILL.md",
+            self.path / ".version",
+            self.path / "agents" / "openai.yaml",
+        )
 
     def install(self, *, force: bool = False) -> None:
-        if self.path.exists() and not force:
+        if self.exists and not force:
             raise FileExistsError(self.path)
-
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=f"{SKILL_NAME}-",
-            dir=self.path.parent,
-        ) as tmp_str:
-            tmp = Path(tmp_str)
-            self.build_tree(tmp)
-            if self.path.exists():
-                shutil.rmtree(self.path)
-            tmp.replace(self.path)
+        self.build_tree(self.path)
 
     def build_tree(self, dest: Path) -> None:
         dest.mkdir(parents=True, exist_ok=True)
@@ -325,7 +340,13 @@ class Skill(abc.ABC):
         (agents / "openai.yaml").write_text(self.openai_yaml(), encoding="utf-8")
 
     def remove(self) -> None:
-        shutil.rmtree(self.path)
+        for file in self.owned_files():
+            if file.is_file():
+                file.unlink()
+        for directory in (self.path / "agents", self.path):
+            with suppress(OSError):
+                directory.rmdir()
+        prune_empty_parents(self.path)
 
     def __hash__(self) -> int:
         return hash((self.kind, self.path))
@@ -359,6 +380,8 @@ class ClaudeSkill(Skill):
 
 @dataclass(frozen=True)
 class CodexSkill(Skill):
+    """Codex reads skills from `.agents/skills` trees; rules stay in CODEX_HOME."""
+
     kind: str = "codex"
 
     @classmethod
@@ -366,8 +389,24 @@ class CodexSkill(Skill):
         return default_codex_home()
 
     @classmethod
+    def skills_dir(cls) -> Path:
+        return default_agents_home() / "skills"
+
+    @classmethod
+    def project_path(cls, root: Path) -> Path:
+        return root / ".agents" / "skills" / SKILL_NAME
+
+    @classmethod
     def rules_path(cls) -> Path:
         return cls.home_dir() / "rules" / f"{SKILL_NAME}.rules"
+
+    def sandbox(self) -> str:
+        home = config_mod.CONTREE_HOME
+        try:
+            display = str(Path("~") / home.relative_to(Path.home()))
+        except ValueError:
+            display = str(home)
+        return CODEX_SANDBOX.format(contree_home=display)
 
     def install(self, *, force: bool = False) -> None:
         super().install(force=force)
@@ -424,12 +463,16 @@ class ClaudeSubagentSkill(Skill):
         return default_claude_home()
 
     @classmethod
-    def resolve_path(cls, hint: str) -> Path:
-        if not hint:
-            return (Path(".claude") / "agents" / f"{SKILL_NAME}-subagent.md").resolve()
-        if hint == "~":
-            return cls.home_dir() / "agents" / f"{SKILL_NAME}-subagent.md"
-        return Path(hint).expanduser().resolve()
+    def project_path(cls, root: Path) -> Path:
+        return root / ".claude" / "agents" / f"{SKILL_NAME}-subagent.md"
+
+    @classmethod
+    def global_path(cls) -> Path:
+        return cls.home_dir() / "agents" / f"{SKILL_NAME}-subagent.md"
+
+    @property
+    def exists(self) -> bool:
+        return self.path.is_file()
 
     @property
     def description(self) -> str:
@@ -438,13 +481,7 @@ class ClaudeSubagentSkill(Skill):
     def intro(self) -> str:
         return SUBAGENT_INTRO
 
-    def first_step(self) -> str:
-        return SUBAGENT_FIRST_STEP
-
     def fallback(self) -> str:
-        return ""
-
-    def references(self) -> str:
         return ""
 
     def frontmatter(self) -> str:
@@ -452,7 +489,7 @@ class ClaudeSubagentSkill(Skill):
             "---\n"
             f"name: {self.name}\n"
             f"description: {self.description}\n"
-            f"allowed-tools: {self.allowed_tools}\n"
+            "tools: Bash, Read, Grep\n"
             "---\n"
         )
 
@@ -464,23 +501,28 @@ class ClaudeSubagentSkill(Skill):
 
     def remove(self) -> None:
         self.path.unlink()
+        prune_empty_parents(self.path)
 
 
 @dataclass(frozen=True)
 class ClaudeAgentSkill(Skill):
     kind: str = "claude-agent"
 
+    @property
+    def exists(self) -> bool:
+        return self.path.is_file()
+
     @classmethod
     def home_dir(cls) -> Path:
         return default_claude_home()
 
     @classmethod
-    def resolve_path(cls, hint: str) -> Path:
-        if not hint:
-            return (Path(".claude") / "agents" / f"{SKILL_NAME}.md").resolve()
-        if hint == "~":
-            return cls.home_dir() / "agents" / f"{SKILL_NAME}.md"
-        return Path(hint).expanduser().resolve()
+    def project_path(cls, root: Path) -> Path:
+        return root / ".claude" / "agents" / f"{SKILL_NAME}.md"
+
+    @classmethod
+    def global_path(cls) -> Path:
+        return cls.home_dir() / "agents" / f"{SKILL_NAME}.md"
 
     def render(self) -> str:
         return AGENT_TEMPLATE.format(
@@ -496,6 +538,7 @@ class ClaudeAgentSkill(Skill):
 
     def remove(self) -> None:
         self.path.unlink()
+        prune_empty_parents(self.path)
 
 
 # ── Skill type registry ──────────────────────────────────
@@ -515,10 +558,20 @@ SKILL_BY_KIND: dict[str, type[Skill]] = {cls.kind: cls for cls in ALL_SKILL_TYPE
 PATH_MARKERS: dict[str, type[Skill]] = {
     ".claude": ClaudeSkill,
     ".codex": CodexSkill,
+    ".agents": CodexSkill,
     "opencode": OpenCodeSkill,
     "agents": AmpSkill,
     ".cline": ClineSkill,
 }
+
+
+def is_skill_target(path: Path) -> bool:
+    """True when path points at a skill artifact rather than a project root."""
+    if path.suffix == ".md" or path.name == SKILL_NAME:
+        return True
+    if (path / "SKILL.md").is_file():
+        return True
+    return any(marker in path.parts for marker in PATH_MARKERS)
 
 
 def skill_from_spec(spec: str) -> Skill:
@@ -526,17 +579,31 @@ def skill_from_spec(spec: str) -> Skill:
 
     claude:       → ClaudeSkill(path=$PWD/.claude/skills/contree)
     claude:~      → ClaudeSkill(path=~/.claude/skills/contree)
-    codex:~       → CodexSkill(path=~/.codex/skills/contree)
+    claude:DIR    → ClaudeSkill(path=DIR/.claude/skills/contree)
     ./path        → guessed class with explicit path
     """
     if ":" in spec:
         kind, hint = spec.split(":", 1)
-        hint = hint.lstrip("/")
         skill_cls = SKILL_BY_KIND.get(kind)
         if skill_cls is not None:
             return skill_cls(path=skill_cls.resolve_path(hint))
     path = Path(spec).expanduser().resolve()
     return guess_skill(path)
+
+
+def skills_from_spec(spec: str) -> tuple[Skill, ...]:
+    """Parse a CLI spec into one or more Skill instances.
+
+    kind:HINT specs and paths that point at a skill artifact resolve to a
+    single skill. Any other directory path is a project root: it expands
+    to every kind at its project location under that root.
+    """
+    if ":" in spec:
+        return (skill_from_spec(spec),)
+    path = Path(spec).expanduser().resolve()
+    if is_skill_target(path):
+        return (guess_skill(path),)
+    return tuple(project_install_specs(path))
 
 
 CLAUDE_SKILL_TYPES: frozenset[type[Skill]] = frozenset(
@@ -559,6 +626,24 @@ def default_install_specs() -> Iterable[Skill]:
         for cls in ALL_SKILL_TYPES:
             if cls in CLAUDE_SKILL_TYPES:
                 specs.append(skill_from_spec(f"{cls.kind}:~"))
+    return specs
+
+
+def project_install_specs(root: Path) -> Iterable[Skill]:
+    """Return skill instances for installing every kind under a project root.
+
+    Same gating as the global default: Claude-based types require
+    ``~/.claude`` to exist, all other types are included unconditionally.
+    """
+    specs: list[Skill] = [
+        cls(path=cls.project_path(root))
+        for cls in ALL_SKILL_TYPES
+        if cls not in CLAUDE_SKILL_TYPES
+    ]
+    if default_claude_home().is_dir():
+        for cls in ALL_SKILL_TYPES:
+            if cls in CLAUDE_SKILL_TYPES:
+                specs.append(cls(path=cls.project_path(root)))
     return specs
 
 
