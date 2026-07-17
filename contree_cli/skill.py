@@ -403,9 +403,9 @@ class CodexSkill(Skill):
     def sandbox(self) -> str:
         home = config_mod.CONTREE_HOME
         try:
-            display = str(Path("~") / home.relative_to(Path.home()))
+            display = "~/" + home.relative_to(Path.home()).as_posix()
         except ValueError:
-            display = str(home)
+            display = home.as_posix()
         return CODEX_SANDBOX.format(contree_home=display)
 
     def install(self, *, force: bool = False) -> None:
@@ -598,7 +598,7 @@ def skills_from_spec(spec: str) -> tuple[Skill, ...]:
     single skill. Any other directory path is a project root: it expands
     to every kind at its project location under that root.
     """
-    if ":" in spec:
+    if spec.split(":", 1)[0] in SKILL_BY_KIND:
         return (skill_from_spec(spec),)
     path = Path(spec).expanduser().resolve()
     if is_skill_target(path):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
@@ -429,7 +430,10 @@ class TestContreeHomeInSkill:
         data_home = tmp_path / "contree-data"
         monkeypatch.setattr(config_mod, "CONTREE_HOME", data_home)
         body = CodexSkill(path=tmp_path / "codex").body()
-        assert f'writable_roots = ["{data_home}"]' in body
+        assert re.search(r'writable_roots = \["[^"]*contree-data"\]', body)
+        # TOML basic strings treat backslash as an escape; the path must
+        # be rendered with forward slashes on every platform
+        assert "\\" not in body
 
     def test_codex_sandbox_contracts_home_prefix(self, monkeypatch) -> None:
         monkeypatch.setattr(config_mod, "CONTREE_HOME", Path.home() / "custom-contree")
@@ -445,7 +449,7 @@ class TestContreeHomeInSkill:
         dest = tmp_path / ".codex" / "skills" / SKILL_NAME
         assert cmd_skill_install(SkillInstallArgs(specs=_specs(dest))) is None
         text = (dest / "SKILL.md").read_text(encoding="utf-8")
-        assert f'writable_roots = ["{data_home}"]' in text
+        assert re.search(r'writable_roots = \["[^"]*contree-data"\]', text)
 
     def test_registry_db_lives_under_contree_home(
         self, tmp_path: Path, config_dir: Path
