@@ -402,6 +402,21 @@ class TestProjectRootSpecs:
         skills = skills_from_spec(str(installed))
         assert skills == (ClaudeSkill(path=installed),)
 
+    def test_project_root_inside_agent_home_expands(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A project living inside .claude/.codex/.agents is still a root."""
+        claude_home = tmp_path / ".claude-home"
+        claude_home.mkdir()
+        monkeypatch.setattr(
+            "contree_cli.skill.default_claude_home", lambda: claude_home
+        )
+        root = tmp_path / ".claude" / "projects" / "proj"
+        root.mkdir(parents=True)
+        skills = skills_from_spec(str(root))
+        assert len(skills) == len(ALL_SKILL_TYPES)
+        assert all(str(s.path).startswith(str(root)) for s in skills)
+
     def test_install_remove_cycle_leaves_project_clean(
         self, tmp_path: Path, config_dir: Path, monkeypatch
     ) -> None:

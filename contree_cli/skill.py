@@ -566,12 +566,16 @@ PATH_MARKERS: dict[str, type[Skill]] = {
 
 
 def is_skill_target(path: Path) -> bool:
-    """True when path points at a skill artifact rather than a project root."""
+    """True when path points at a skill artifact rather than a project root.
+
+    Only signals of the artifact itself count (`SKILL.md` inside, the
+    skill basename, an `.md` file); the directories the path goes
+    through do not, so a project living inside `.claude`, `.codex`, or
+    `.agents` still expands as a project root.
+    """
     if path.suffix == ".md" or path.name == SKILL_NAME:
         return True
-    if (path / "SKILL.md").is_file():
-        return True
-    return any(marker in path.parts for marker in PATH_MARKERS)
+    return (path / "SKILL.md").is_file()
 
 
 def skill_from_spec(spec: str) -> Skill:
