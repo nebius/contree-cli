@@ -4,7 +4,13 @@ import posixpath
 from pathlib import PurePosixPath
 from unittest.mock import MagicMock, patch
 
-from conftest import ContreeTestClient
+from conftest import ContreeTestClient, make_file_item
+from contree_client.exceptions import ContreeAPIError
+from contree_client.models import (
+    DirectoryList,
+    ImageListResponse,
+    OperationSummary,
+)
 
 from contree_cli.session import ImageCache, Session
 from contree_cli.shell.completer import ShellCompleter
@@ -22,16 +28,7 @@ def _make_file(
     is_dir: bool = False,
     is_symlink: bool = False,
 ) -> dict:
-    return {
-        "path": path,
-        "size": 128,
-        "mode": 0o644,
-        "owner": "root",
-        "group": "root",
-        "mtime": 1700000000,
-        "is_dir": is_dir,
-        "is_symlink": is_symlink,
-    }
+    return make_file_item(path, is_dir=is_dir, is_symlink=is_symlink)
 
 
 def _path_completer(
@@ -41,7 +38,10 @@ def _path_completer(
 ) -> tuple[ShellCompleter, ContreeTestClient]:
     """Build a completer with ContreeTestClient that returns given files."""
     client = ContreeTestClient()
-    client.respond_json({"path": "/etc", "files": files})
+    client.mock(
+        "inspect_image_list",
+        DirectoryList.from_dict({"path": "/etc", "files": files}),
+    )
 
     store = MagicMock()
     store.session = Session(
@@ -445,18 +445,8 @@ class TestContainerPathCompletion:
             last_title="test",
             updated_at="2025-01-01",
         )
-        # Queue a response that will cause an error when parsed
-        client.fake.responses.append(
-            type(
-                "ErrorResp",
-                (),
-                {
-                    "status": 500,
-                    "reason": "Error",
-                    "read": lambda self, amt=None: b"error",
-                },
-            )()
-        )
+        # Make the listing call fail with an API error
+        client.mock("inspect_image_list", error=ContreeAPIError(500, "error"))
         completer = _make_completer(client=client, store=store)
 
         results = _complete_line(
@@ -646,7 +636,7 @@ def _image_completer(
 ) -> tuple[ShellCompleter, ContreeTestClient]:
     """Build a completer with ContreeTestClient that returns given images."""
     client = ContreeTestClient()
-    client.respond_json({"images": images})
+    client.mock("list_images", ImageListResponse.from_dict({"images": images}))
 
     store = MagicMock()
     store.cache = cache
@@ -724,6 +714,70 @@ class TestImageCompletion:
         assert "tag:common/rust/ubuntu:noble " in results
         assert "aaaa-1111 " in results
 
+    def test_tag_prefix_forwarded_to_api(self, image_cache):
+        """The typed tag prefix must reach the server-side filter, not
+        just the client-side startswith pass over the first page."""
+        images = [_make_image("aaaa-1111", tag="ubuntu:latest")]
+        completer, client = _image_completer(images, image_cache)
+
+        _complete_line(
+            completer,
+            "tag:ubu",
+            "contree use tag:ubu",
+            begidx=12,
+        )
+
+        calls = client.calls_for("list_images")
+        assert len(calls) == 1
+        assert calls[0].kwargs["tag"] == "ubu"
+
+    def test_bare_tag_prefix_forwarded_to_api(self, image_cache):
+        images = [_make_image("aaaa-1111", tag="ubuntu:latest")]
+        completer, client = _image_completer(images, image_cache)
+
+        _complete_line(
+            completer,
+            "ubu",
+            "contree use ubu",
+            begidx=12,
+        )
+
+        calls = client.calls_for("list_images")
+        assert len(calls) == 1
+        assert calls[0].kwargs["tag"] == "ubu"
+
+    def test_empty_text_lists_without_filter(self, image_cache):
+        images = [_make_image("aaaa-1111", tag="ubuntu:latest")]
+        completer, client = _image_completer(images, image_cache)
+
+        _complete_line(
+            completer,
+            "",
+            "contree use ",
+            begidx=12,
+        )
+
+        calls = client.calls_for("list_images")
+        assert len(calls) == 1
+        assert calls[0].kwargs["tag"] is None
+
+    def test_uuid_prefix_probes_unfiltered_page(self, image_cache):
+        """A hex-looking text cannot be tag-filtered server-side; the
+        completer also matches UUIDs from the unfiltered first page."""
+        images = [_make_image("a1b2c3d4-5678-9abc-def0-111111111111")]
+        completer, client = _image_completer(images, image_cache)
+
+        results = _complete_line(
+            completer,
+            "a1b2",
+            "contree use a1b2",
+            begidx=12,
+        )
+
+        assert "a1b2c3d4-5678-9abc-def0-111111111111 " in results
+        tags = [call.kwargs["tag"] for call in client.calls_for("list_images")]
+        assert tags == ["a1b2", None]
+
     def test_image_cache_persists(self, image_cache):
         """Second call returns cached data without hitting the API."""
         images = [_make_image("aaaa-1111", tag="old/tag")]
@@ -736,12 +790,9 @@ class TestImageCompletion:
             begidx=12,
         )
         assert "tag:old/tag " in results1
+        assert len(client.calls_for("list_images")) == 1
 
         # Second call -- should NOT call the API again (cached)
-        # Queue a different response that should NOT be used
-        client.respond_json(
-            {"images": [_make_image("bbbb-2222", tag="new/tag")]},
-        )
         results2 = _complete_line(
             completer,
             "tag:",
@@ -749,9 +800,9 @@ class TestImageCompletion:
             begidx=12,
         )
 
-        # Still returns cached data
+        # Still returns cached data, no new API call recorded
         assert "tag:old/tag " in results2
-        assert "tag:new/tag " not in results2
+        assert len(client.calls_for("list_images")) == 1
 
     def test_no_client_returns_empty(self):
         completer = _make_completer(client=None)
@@ -765,8 +816,7 @@ class TestImageCompletion:
 
     def test_api_error_returns_empty(self):
         client = ContreeTestClient()
-        # Queue an error response
-        client.respond(status=500, body=b"error")
+        client.mock("list_images", error=ContreeAPIError(500, "error"))
         completer = _make_completer(client=client)
 
         results = _complete_line(
@@ -831,11 +881,11 @@ class TestImageCompletion:
 
 def _make_operation(
     uuid: str,
-    state: str = "SUCCESS",
+    status: str = "SUCCESS",
 ) -> dict[str, object]:
     return {
         "uuid": uuid,
-        "state": state,
+        "status": status,
         "kind": "instance",
         "created_at": "2025-01-01",
     }
@@ -847,7 +897,10 @@ def _op_completer(
 ) -> tuple[ShellCompleter, ContreeTestClient]:
     """Build a completer with ContreeTestClient that returns given operations."""
     client = ContreeTestClient()
-    client.respond_json({"operations": operations})
+    client.mock(
+        "list_operations",
+        [OperationSummary.from_dict(op) for op in operations],
+    )
 
     store = MagicMock()
     store.cache = cache
@@ -894,7 +947,7 @@ class TestOperationCompletion:
 
     def test_operation_empty_on_api_failure(self):
         client = ContreeTestClient()
-        client.respond(status=500, body=b"error")
+        client.mock("list_operations", error=ContreeAPIError(500, "error"))
         completer = _make_completer(client=client)
 
         results = _complete_line(
@@ -1119,7 +1172,7 @@ class TestFormatCompletion:
         results = _complete_line(
             completer,
             "",
-            "-f ",
+            "-o ",
             begidx=3,
         )
         from contree_cli.output import FORMATTERS
@@ -1127,13 +1180,13 @@ class TestFormatCompletion:
         for name in FORMATTERS:
             assert name + " " in results
 
-    def test_contree_f_flag_completes_formats(self):
-        """'contree -f <TAB>' completes format names."""
+    def test_contree_o_flag_completes_formats(self):
+        """'contree -o <TAB>' completes format names."""
         completer = _make_completer()
         results = _complete_line(
             completer,
             "",
-            "contree -f ",
+            "contree -o ",
             begidx=11,
         )
         from contree_cli.output import FORMATTERS
@@ -1302,7 +1355,7 @@ class TestArgparseDrivenCompletion:
         results = _complete_line(
             completer,
             "",
-            "contree -f ",
+            "contree -o ",
             begidx=11,
         )
         names = [r.rstrip(" ") for r in results]

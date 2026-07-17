@@ -4,12 +4,17 @@ import stat
 import sys
 
 import pytest
+from contree_client.profiles import (
+    AUTH_TYPE_IAM,
+    AUTH_TYPE_JWT,
+    DEFAULT_IAM_URL,
+    PROFILE_PREFIX,
+    Profile,
+)
 
 import contree_cli.config as config_mod
 from contree_cli.config import (
-    AuthType,
     Config,
-    ConfigProfile,
     get_default_path,
 )
 
@@ -21,7 +26,7 @@ from contree_cli.config import (
 class TestSaveAndLoad:
     def test_save_creates_file(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok123",
             url="https://test.dev",
@@ -30,7 +35,7 @@ class TestSaveAndLoad:
 
     def test_load_reads_saved_profile(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok123",
             url="https://test.dev",
@@ -42,12 +47,12 @@ class TestSaveAndLoad:
 
     def test_save_multiple_profiles(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok1",
             url="https://test.dev",
         )
-        cfg["staging"] = ConfigProfile(
+        cfg["staging"] = Profile(
             name="staging",
             token="tok2",
             url="https://staging.dev",
@@ -57,12 +62,12 @@ class TestSaveAndLoad:
 
     def test_save_overwrites_existing(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="old",
             url="https://old.dev",
         )
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="new",
             url="https://new.dev",
@@ -76,7 +81,7 @@ class TestSaveAndLoad:
         assert p.name == "default"
         assert p.token is None
         assert p.url == ""
-        assert p.auth_type == AuthType.JWT
+        assert p.auth_type == AUTH_TYPE_JWT
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +93,7 @@ class TestLoadConfigPath:
     def test_load_from_explicit_path(self, tmp_path):
         cfg_file = tmp_path / "custom.ini"
         cfg = Config(path=cfg_file)
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok_custom",
             url="https://custom.dev",
@@ -106,7 +111,7 @@ class TestLoadConfigPath:
 class TestProfileResolution:
     def test_defaults_to_default_profile(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://test.dev",
@@ -116,12 +121,12 @@ class TestProfileResolution:
 
     def test_uses_switched_profile(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok1",
             url="https://test.dev",
         )
-        cfg["staging"] = ConfigProfile(
+        cfg["staging"] = Profile(
             name="staging",
             token="tok2",
             url="https://staging.dev",
@@ -134,12 +139,12 @@ class TestProfileResolution:
 
     def test_env_profile_overrides_config(self, config_dir, monkeypatch):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok1",
             url="https://test.dev",
         )
-        cfg["staging"] = ConfigProfile(
+        cfg["staging"] = Profile(
             name="staging",
             token="tok2",
             url="https://staging.dev",
@@ -151,7 +156,7 @@ class TestProfileResolution:
 
     def test_env_token_does_not_override_config(self, config_dir, monkeypatch):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="cfg_token",
             url="https://test.dev",
@@ -162,7 +167,7 @@ class TestProfileResolution:
 
     def test_env_url_does_not_override_config(self, config_dir, monkeypatch):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://custom.dev",
@@ -174,14 +179,14 @@ class TestProfileResolution:
     def test_url_falls_back_for_jwt_when_missing(self, config_dir):
         """JWT profile with url key removed falls back to empty string."""
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://test.dev",
         )
         cp = configparser.ConfigParser()
         cp.read(config_dir / "auth.ini")
-        cp.remove_option(Config.PROFILE_PREFIX + "default", "url")
+        cp.remove_option(PROFILE_PREFIX + "default", "url")
         with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
@@ -190,19 +195,19 @@ class TestProfileResolution:
     def test_url_falls_back_for_iam_when_missing(self, config_dir):
         """IAM profile with url key removed falls back to IAM default."""
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://iam.test",
-            auth_type=AuthType.IAM,
+            auth_type=AUTH_TYPE_IAM,
         )
         cp = configparser.ConfigParser()
         cp.read(config_dir / "auth.ini")
-        cp.remove_option(Config.PROFILE_PREFIX + "default", "url")
+        cp.remove_option(PROFILE_PREFIX + "default", "url")
         with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
-        assert p.url == Config.DEFAULT_IAM_URL
+        assert p.url == DEFAULT_IAM_URL
 
     def test_nonexistent_profile_returns_defaults(self, config_dir, monkeypatch):
         monkeypatch.setenv("CONTREE_PROFILE", "nonexistent")
@@ -210,7 +215,7 @@ class TestProfileResolution:
         assert p.name == "nonexistent"
         assert p.token is None
         assert p.url == ""
-        assert p.auth_type == AuthType.JWT
+        assert p.auth_type == AUTH_TYPE_JWT
 
 
 # ---------------------------------------------------------------------------
@@ -221,46 +226,46 @@ class TestProfileResolution:
 class TestAuthType:
     def test_default_type_is_jwt(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://test.dev",
         )
         p = Config().resolve()
-        assert p.auth_type == AuthType.JWT
+        assert p.auth_type == AUTH_TYPE_JWT
 
     def test_iam_type_stored_and_loaded(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://iam.test",
-            auth_type=AuthType.IAM,
+            auth_type=AUTH_TYPE_IAM,
             project="aiproject-x",
         )
         p = Config().resolve()
-        assert p.auth_type == AuthType.IAM
+        assert p.auth_type == AUTH_TYPE_IAM
         assert p.project == "aiproject-x"
 
     def test_legacy_profile_without_type_is_jwt(self, config_dir):
         """Profile saved without type key (legacy) defaults to jwt."""
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://old.dev",
         )
         cp = configparser.ConfigParser()
         cp.read(config_dir / "auth.ini")
-        cp.remove_option(Config.PROFILE_PREFIX + "default", "type")
+        cp.remove_option(PROFILE_PREFIX + "default", "type")
         with open(config_dir / "auth.ini", "w") as f:
             cp.write(f)
         p = Config().resolve()
-        assert p.auth_type == AuthType.JWT
+        assert p.auth_type == AUTH_TYPE_JWT
 
     def test_project_none_when_not_set(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://test.dev",
@@ -270,11 +275,11 @@ class TestAuthType:
 
     def test_env_project_does_not_override_config(self, config_dir, monkeypatch):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://iam.test",
-            auth_type=AuthType.IAM,
+            auth_type=AUTH_TYPE_IAM,
             project="aiproject-cfg",
         )
         monkeypatch.setenv("CONTREE_PROJECT", "aiproject-env")
@@ -283,18 +288,18 @@ class TestAuthType:
 
     def test_save_clears_project_when_none(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://iam.test",
-            auth_type=AuthType.IAM,
+            auth_type=AUTH_TYPE_IAM,
             project="aiproject-old",
         )
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://test.dev",
-            auth_type=AuthType.JWT,
+            auth_type=AUTH_TYPE_JWT,
         )
         p = Config().resolve()
         assert p.project is None
@@ -308,7 +313,7 @@ class TestAuthType:
 class TestConfigProfileDataclass:
     def test_frozen(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok",
             url="https://test.dev",
@@ -319,15 +324,17 @@ class TestConfigProfileDataclass:
 
     def test_repr_masks_token(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="secret_tok",
             url="https://test.dev",
         )
         p = Config().resolve()
+        # The library Profile hides the token from repr entirely
+        # (field(repr=False)).
         r = repr(p)
         assert "secret_tok" not in r
-        assert "***" in r
+        assert "token" not in r
 
     def test_repr_none_token(self, config_dir):
         p = Config().resolve()
@@ -343,12 +350,12 @@ class TestConfigProfileDataclass:
 class TestSwitchProfile:
     def test_switch_updates_default(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="tok1",
             url="https://test.dev",
         )
-        cfg["staging"] = ConfigProfile(
+        cfg["staging"] = Profile(
             name="staging",
             token="tok2",
             url="https://staging.dev",
@@ -372,7 +379,7 @@ class TestSwitchProfile:
 class TestAuthFilePermissions:
     def test_file_mode_is_0600(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="secret-token",
             url="https://test.dev",
@@ -383,14 +390,14 @@ class TestAuthFilePermissions:
 
     def test_rewrite_keeps_0600(self, config_dir):
         cfg = Config()
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="t1",
             url="https://test.dev",
         )
         path = config_dir / "auth.ini"
         os.chmod(path, 0o644)
-        cfg["default"] = ConfigProfile(
+        cfg["default"] = Profile(
             name="default",
             token="t2",
             url="https://test.dev",

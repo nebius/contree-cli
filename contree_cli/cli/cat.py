@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import cast
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
-from contree_cli.client import resolve_image
 from contree_cli.output import DefaultFormatter
 
 logger = logging.getLogger(__name__)
@@ -54,15 +53,14 @@ def cmd_cat(args: CatArgs) -> int | None:
     store = SESSION_STORE.get()
     image = store.current_image
     path = store.resolve_path(args.path)
-    uuid = resolve_image(client, image)
+    uuid = client.resolve_image(image)
 
     cache_key = (uuid, f"download:{path}")
     cached = store.cache.get(cache_key)
     if cached is not None:
-        data = base64.b64decode(cast(str, cached))
+        data = base64.b64decode(cast("str", cached))
     else:
-        resp = client.get(f"/v1/inspect/{uuid}/download", params={"path": path})
-        data = resp.read()
+        data = client.inspect_image_download(uuid, path)
         store.cache[cache_key] = base64.b64encode(data).decode("ascii")
 
     if not sys.stdout.isatty():

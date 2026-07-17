@@ -13,7 +13,7 @@ contree cd /app
 contree run -- ls           # runs in /app
 contree cd /etc
 contree cat os-release      # reads /etc/os-release
-contree cd                  # reset to sandbox default
+contree cd                  # print current working directory
 ```
 
 ## Help output
@@ -26,9 +26,9 @@ contree cd                  # reset to sandbox default
 `cd` stores the path in the session state. Subsequent `run`, `ls`, `cat`,
 and `cp` commands resolve relative paths against it.
 
-`cd` without arguments resets to the sandbox's default working directory.
+`cd` without arguments prints the current working directory.
 
 :::{note}
-`cd` does not validate that the path exists in the sandbox. Errors
-surface only when the next command uses the invalid path.
+`cd` validates the target against the image filesystem via the
+inspect API and reports an error when the directory does not exist.
 :::

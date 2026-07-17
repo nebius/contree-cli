@@ -11,6 +11,7 @@ from contree_cli.cli import (
     cd,
     cp,
     env,
+    export,
     file,
     images,
     ls,
@@ -235,6 +236,7 @@ register(
 register("ls", "List files in image", ls.setup_parser)
 register("cat", "Show file content from image", cat.setup_parser)
 register("cp", "Copy file from image to local path", cp.setup_parser)
+register("export", "Export image rootfs or a subtree as tar.gz", export.setup_parser)
 register("file", "Manage files in session image", file.setup_parser, aliases=["f"])
 register(
     "session",

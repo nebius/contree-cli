@@ -161,9 +161,9 @@ Detached workflow:
   contree show UUID                      view result
   contree op wait UUID                   block until terminal
 
-Fan-out + join (use -f json BEFORE run so jq sees JSON):
-  A=$(contree -f json run -d -- make a | jq -r .uuid)
-  B=$(contree -f json run -d -- make b | jq -r .uuid)
+Fan-out + join (use -o json BEFORE run so jq sees JSON):
+  A=$(contree -o json run -d -- make a | jq -r .uuid)
+  B=$(contree -o json run -d -- make b | jq -r .uuid)
   contree op wait "$A" "$B"              wait for both; one row each
   contree op wait --all --timeout 600    or block on every active op
 
@@ -172,15 +172,15 @@ More: contree run --help
 Output formats
 ==============
 
-Global -f flag goes before the subcommand:
+Global -o flag goes before the subcommand:
 
-  contree -f json images           one JSON object per line
-  contree -f json-pretty ps        pretty JSON array
-  contree -f csv images            CSV with header
-  contree -f tsv ps                tab-separated
+  contree -o json images           one JSON object per line
+  contree -o json-pretty ps        pretty JSON array
+  contree -o csv images            CSV with header
+  contree -o tsv ps                tab-separated
 
 Scripting:
-  contree -f json images | jq -r '.uuid'
+  contree -o json images | jq -r '.uuid'
   contree ps -q | xargs -I {} contree show {}
 
 More: contree --help

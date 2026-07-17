@@ -42,7 +42,7 @@ from contree_cli.shell.sources import (
 from contree_cli.shell.trie import Handler, PrefixRouter
 
 if TYPE_CHECKING:
-    from contree_cli.client import ContreeClient
+    from contree_cli.client import CliClient
     from contree_cli.session import ImageCache, SessionStore
 
 log = logging.getLogger(__name__)
@@ -63,7 +63,8 @@ BUILTIN_BARE_COMMANDS: tuple[str, ...] = (
     "ls",
     "cat",
     "--format",
-    "-f",
+    "--output",
+    "-o",
 )
 
 
@@ -73,7 +74,7 @@ class ShellCompleter:
     def __init__(
         self,
         commands: dict[str, CommandInfo],
-        client: ContreeClient | None = None,
+        client: CliClient | None = None,
         store: SessionStore | None = None,
         root_parser: ShellArgumentParser | None = None,
     ) -> None:
@@ -159,7 +160,8 @@ class ShellCompleter:
         # Format flag belongs to the trie so "--format <TAB>" works as a
         # standalone shell builtin (intercepted in repl.execute).
         r[("--format",)] = self.handler_format
-        r[("-f",)] = self.handler_format
+        r[("--output",)] = self.handler_format
+        r[("-o",)] = self.handler_format
 
         # Register every contree command name (and aliases) as router roots
         # so first-token completion still lists them. Their values are
@@ -175,8 +177,8 @@ class ShellCompleter:
     ) -> list[str]:
         """Resolve a builtin via the trie."""
         node, depth = self.router.resolve(tuple(tokens))
-        # Format flag value: "--format <TAB>" or "-f <TAB>".
-        if tokens and tokens[-1] in ("--format", "-f"):
+        # Format flag value: "--format <TAB>" or "-o <TAB>".
+        if tokens and tokens[-1] in ("--format", "--output", "-o"):
             return self.handler_format((), text, ctx)
         if node.value is not None:
             remaining = tuple(tokens[depth:])

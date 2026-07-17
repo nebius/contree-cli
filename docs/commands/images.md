@@ -16,17 +16,17 @@ contree images
 # Filter by tag prefix
 contree images --prefix=ubuntu
 
-# Only tagged images
-contree images --tagged
+# Include untagged intermediate images too
+contree images -a
 
 # Images created in the last hour
 contree images --since=1h
 
-# Find a specific image by UUID prefix
-contree images --uuid=3f2a7b
+# Find a specific image by UUID
+contree images --uuid=3f2a7b1c-9d2e-4f60-8a1b-5c3d7e9f0a2b
 
 # JSON output for scripting
-contree -f json images --tagged | jq -r '.tag'
+contree -o json images | jq -r '.tag'
 ```
 
 ## Help output

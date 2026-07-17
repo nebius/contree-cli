@@ -11,8 +11,9 @@ import sys
 from dataclasses import dataclass
 from functools import cached_property
 
+from contree_client.exceptions import ContreeAPIError
+
 from contree_cli import FORMATTER, IN_SHELL, PROFILE, SESSION_STORE, ArgumentsProtocol
-from contree_cli.client import ApiError
 from contree_cli.output import FORMATTERS, OutputFormatter
 from contree_cli.session import SessionStore
 from contree_cli.shell.cache import SourceCache
@@ -101,7 +102,8 @@ EDITOR_ALIASES = frozenset({"vim", "vi", "nvim", "nano"})
 # Aliases for ``help <topic>`` lookup.
 HELP_ALIASES: dict[str, str] = {
     "quit": "exit",
-    "-f": "--format",
+    "-o": "--format",
+    "--output": "--format",
     "vi": "vim",
 }
 
@@ -202,7 +204,7 @@ BUILTIN_HELP: dict[str, str] = {
     ),
     "exit": "Usage: exit | quit\n\nExit the interactive shell (Ctrl-D also works).",
     "--format": (
-        "Usage: --format [NAME] | -f [NAME]\n"
+        "Usage: --format [NAME] | --output [NAME] | -o [NAME]\n"
         "\n"
         "Change the output format for the session, or show the current\n"
         "format name when called without arguments.\n"
@@ -394,7 +396,7 @@ class ContreeShell:
             case "clear":
                 sys.stdout.write("\033[2J\033[H")
                 sys.stdout.flush()
-            case "--format" | "-f":
+            case "--format" | "--output" | "-o":
                 self.handle_format_command(tokens[1:])
             case "cd":
                 self.handle_cd(tokens[1:])
@@ -517,7 +519,7 @@ class ContreeShell:
         before = self.session_snapshot()
         try:
             handler(loader.from_args(ns))
-        except ApiError as exc:
+        except ContreeAPIError as exc:
             print(f"API error: {exc}", file=sys.stderr)
         except KeyboardInterrupt:
             print()
@@ -556,7 +558,7 @@ class ContreeShell:
         before = self.session_snapshot()
         try:
             cmd_run(args)
-        except ApiError as exc:
+        except ContreeAPIError as exc:
             print(f"API error: {exc}", file=sys.stderr)
         except KeyboardInterrupt:
             print()

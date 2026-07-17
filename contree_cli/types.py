@@ -24,7 +24,7 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         # global
         "version": ("-v", "--version"),
         "config": ("-c", "--config"),
-        "format": ("-f", "--format"),
+        "format": ("-o", "--format", "--output"),
         "log_level": ("-L", "--log-level"),
         "session": ("-S", "--session"),
         "project": ("-P", "--project"),
@@ -33,7 +33,7 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         # shared across commands
         "all": ("-a", "--all"),
         "delete": ("-U", "--delete", "--rm"),
-        "force": ("-y", "--force"),
+        "force": ("-f", "-y", "--force"),
         "kind": ("-k", "--kind"),
         "quiet": ("-q", "--quiet"),
         "since": ("--since",),
@@ -76,6 +76,8 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "tag_name": ("--tag",),
         "build_arg": ("--build-arg",),
         "no_cache": ("--no-cache",),
+        # export
+        "decompress": ("--decompress",),
     }
 )
 
@@ -169,10 +171,6 @@ else:
         if value.endswith("Z"):
             value = value[:-1] + "+00:00"
         return datetime.fromisoformat(value).astimezone(tz=timezone.utc)
-
-
-def isoformat_datetime(dt: datetime) -> str:
-    return dt.astimezone(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 _INTERVAL_RE = re.compile(r"([+-]?\d+)([smhdMy]?)")

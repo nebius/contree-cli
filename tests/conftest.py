@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import atexit
-import http.client
-import json
 import os
 import shutil
 import tempfile
+from collections import deque
 from collections.abc import Generator
-from dataclasses import dataclass
 from pathlib import Path
 
 # Redirect CONTREE_HOME to a throwaway directory BEFORE importing
@@ -22,12 +20,13 @@ atexit.register(shutil.rmtree, CONTREE_HOME_TMP, ignore_errors=True)
 # The CONTREE_HOME override above MUST run before any contree_cli import
 # touches contree_cli.config, hence the deferred import block below.
 import pytest  # noqa: E402
+from contree_client import testing  # noqa: E402
+from contree_client.profiles import Profile  # noqa: E402
+from contree_client.runtime import RequestSpec, ResponseData  # noqa: E402
 
 import contree_cli.arguments  # noqa: E402, F401  populates COMMAND_REGISTRY
 import contree_cli.config as config_mod  # noqa: E402
 from contree_cli import CLIENT, PROFILE  # noqa: E402
-from contree_cli.client import ContreeClient, ContreeIAMClient  # noqa: E402
-from contree_cli.config import ConfigProfile  # noqa: E402
 from contree_cli.session import ImageCache, SessionStore  # noqa: E402
 
 for var in (
@@ -43,159 +42,49 @@ for var in (
     os.environ.pop(var, None)
 
 
-@pytest.fixture(autouse=True)
-def sequential_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Force PaginatedFetcher to use concurrency=1 in tests.
+class ContreeTestClient(testing.ContreeClient):
+    """Method-level mock double for CLI handler tests.
 
-    The mock client's response queue is FIFO and not thread-safe;
-    parallel fetches would race on it. Sequential keeps tests
-    deterministic without affecting handler logic under test.
+    API methods are mocked per operation via ``client.mock("name",
+    result_model)`` (see ``contree_client.testing``); calls are
+    recorded and available through ``calls_for("name")``.
+
+    Two CLI handlers bypass the typed surface with a hand-built
+    ``RequestSpec`` (`ls` text mode and the `session wait` session_key
+    filter); ``respond_raw()`` queues buffered responses for those, and
+    ``raw_requests`` records the specs for assertions.
     """
-    for mod in (
-        "contree_cli.cli.operation",
-        "contree_cli.cli.images",
-        "contree_cli.cli.file",
-    ):
-        monkeypatch.setattr(f"{mod}.CONTREE_CONCURRENCY", 1, raising=False)
 
-
-@dataclass
-class FakeResponse:
-    """Minimal HTTPResponse-compatible object for tests."""
-
-    status: int = 200
-    reason: str = ""
-    body: bytes = b"{}"
-    headers: dict[str, str] | None = None
-
-    def __post_init__(self) -> None:
-        if not self.reason:
-            self.reason = "OK" if self.status < 300 else "Error"
-        if self.headers is None:
-            self.headers = {}
-
-    def read(self, amt: int | None = None) -> bytes:
-        return self.body
-
-    def readline(self, size: int = -1) -> bytes:
-        """Empty bytes signals EOF to `iter_sse_events`, which makes any
-        SSE attempt against a non-SSE mock no-op out without raising —
-        the test then exercises the GET fallback as before."""
-        return b""
-
-    def read1(self, amt: int | None = None) -> bytes:
-        """Match BufferedReader.read1 for streaming-style consumers."""
-        return self.body
-
-    def getheader(self, name: str, default: str | None = None) -> str | None:
-        assert self.headers is not None
-        for key, value in self.headers.items():
-            if key.lower() == name.lower():
-                return value
-        return default
-
-    def getheaders(self) -> list[tuple[str, str]]:
-        assert self.headers is not None
-        return list(self.headers.items())
-
-    @staticmethod
-    def json(body: object, *, status: int = 200) -> FakeResponse:
-        return FakeResponse(
-            status=status,
-            body=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-
-
-@dataclass
-class RecordedRequest:
-    """A single HTTP request captured by FakeConnection."""
-
-    method: str
-    path: str
-    body: bytes | None
-    headers: dict[str, str]
-
-
-class FakeConnection:
-    """Drop-in replacement for http.client.HTTPConnection in tests."""
-
-    def __init__(self) -> None:
-        self.requests: list[RecordedRequest] = []
-        self.responses: list[FakeResponse] = []
-        self._last_path: str = ""
-
-    def request(
+    def __init__(
         self,
-        method: str,
-        path: str,
-        body: object = None,
+        url: str = "https://contree.dev",
+        token: str = "tok",
+        project: str | None = None,
+    ) -> None:
+        super().__init__(token, base_url=url, project=project)
+        self.raw_responses: deque[ResponseData] = deque()
+        self.raw_requests: list[RequestSpec] = []
+
+    def respond_raw(
+        self,
+        *,
+        status: int = 200,
+        body: bytes = b"",
         headers: dict[str, str] | None = None,
     ) -> None:
-        if hasattr(body, "read") and not isinstance(body, (bytes, bytearray)):
-            chunks: list[bytes] = []
-            while True:
-                chunk = body.read(64 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            body = b"".join(chunks)
-        recorded = body if isinstance(body, (bytes, bytearray, type(None))) else None
-        self.requests.append(RecordedRequest(method, path, recorded, headers or {}))
-        self._last_path = path
+        self.raw_responses.append(
+            ResponseData(status=status, headers=headers or {}, body=body)
+        )
 
-    def getresponse(self) -> FakeResponse:
-        # `/events?follow=1` is the modern wait path — auto-serve an empty
-        # SSE response so the GET-/operations mock the test queued up
-        # isn't consumed by the events probe.  Real tests that want to
-        # exercise the SSE wire format must mock the connection
-        # differently anyway.
-        if "/events" in self._last_path:
-            return FakeResponse(
-                status=200,
-                body=b"",
-                headers={"Content-Type": "text/event-stream"},
-            )
-        return self.responses.pop(0)
+    def request(self, spec: RequestSpec) -> ResponseData:
+        self.raw_requests.append(spec)
+        if self.raw_responses:
+            return self.raw_responses.popleft()
+        raise testing.unmocked(spec)
 
 
-class ContreeTestClient(ContreeClient):
-    """Test client with FakeConnection and Bearer auth."""
-
-    def __init__(self, url: str = "https://contree.dev", token: str = "tok") -> None:
-        super().__init__(url, token)
-        self.fake = FakeConnection()
-
-    def _build_headers(self) -> dict[str, str]:
-        return {"Authorization": "Hello"}
-
-    def _connect(self) -> http.client.HTTPConnection:
-        return self.fake  # type: ignore[return-value]
-
-    # -- response helpers --
-
-    def respond(self, *, status: int = 200, body: bytes = b"{}") -> None:
-        self.fake.responses.append(FakeResponse(status=status, body=body))
-
-    def respond_json(self, body: object, *, status: int = 200) -> None:
-        self.fake.responses.append(FakeResponse.json(body, status=status))
-
-    # -- request introspection --
-
-    @property
-    def request_count(self) -> int:
-        return len(self.fake.requests)
-
-    @property
-    def request_paths(self) -> list[str]:
-        return [r.path for r in self.fake.requests]
-
-    def get_request(self, index: int = -1) -> RecordedRequest:
-        return self.fake.requests[index]
-
-
-class ContreeTestIAMClient(ContreeIAMClient):
-    """IAM client that uses FakeConnection instead of real HTTP."""
+class ContreeTestIAMClient(ContreeTestClient):
+    """Test double configured like an IAM profile (project set)."""
 
     def __init__(
         self,
@@ -204,27 +93,39 @@ class ContreeTestIAMClient(ContreeIAMClient):
         project: str = "aiproject-test",
     ) -> None:
         super().__init__(url, token, project)
-        self.fake = FakeConnection()
 
-    def _connect(self) -> http.client.HTTPConnection:
-        return self.fake  # type: ignore[return-value]
 
-    def respond(self, *, status: int = 200, body: bytes = b"{}") -> None:
-        self.fake.responses.append(FakeResponse(status=status, body=body))
+def make_file_item(path: str, **overrides: object) -> dict[str, object]:
+    """Full FileItem payload exactly as the inspect API returns it.
 
-    def respond_json(self, body: object, *, status: int = 200) -> None:
-        self.fake.responses.append(FakeResponse.json(body, status=status))
-
-    @property
-    def request_count(self) -> int:
-        return len(self.fake.requests)
-
-    @property
-    def request_paths(self) -> list[str]:
-        return [r.path for r in self.fake.requests]
-
-    def get_request(self, index: int = -1) -> RecordedRequest:
-        return self.fake.requests[index]
+    The contree-client `FileItem` model requires every field, so test
+    fixtures must always send the complete realistic shape. Overrides
+    replace individual fields; `is_regular` is derived from the other
+    type flags unless overridden explicitly.
+    """
+    item: dict[str, object] = {
+        "path": path,
+        "size": 128,
+        "owner": "root",
+        "group": "root",
+        "uid": 0,
+        "gid": 0,
+        "mode": 0o644,
+        "mtime": 1700000000,
+        "nlink": 1,
+        "is_dir": False,
+        "is_regular": True,
+        "is_symlink": False,
+        "is_socket": False,
+        "is_fifo": False,
+        "symlink_to": "",
+    }
+    item.update(overrides)
+    if "is_regular" not in overrides:
+        item["is_regular"] = not (
+            item["is_dir"] or item["is_symlink"] or item["is_socket"] or item["is_fifo"]
+        )
+    return item
 
 
 # ---------------------------------------------------------------------------
@@ -235,14 +136,14 @@ class ContreeTestIAMClient(ContreeIAMClient):
 @pytest.fixture()
 def contree_client() -> ContreeTestClient:
     tc = ContreeTestClient()
-    CLIENT.set(tc)
+    CLIENT.set(tc)  # type: ignore[arg-type]
     return tc
 
 
 @pytest.fixture()
 def iam_client() -> ContreeTestIAMClient:
     tc = ContreeTestIAMClient()
-    CLIENT.set(tc)
+    CLIENT.set(tc)  # type: ignore[arg-type]
     return tc
 
 
@@ -259,9 +160,9 @@ def config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture()
-def profile() -> Generator[ConfigProfile]:
+def profile() -> Generator[Profile]:
     """Set PROFILE context var to a test profile, reset after."""
-    p = ConfigProfile(name="test", url="http://localhost", token="tok")
+    p = Profile(name="test", url="http://localhost", token="tok")
     token = PROFILE.set(p)
     yield p  # type: ignore[misc]
     PROFILE.reset(token)

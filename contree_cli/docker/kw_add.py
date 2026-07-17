@@ -54,8 +54,9 @@ class AddKeyword(DockerKeyword):
 
     def execute(self, ctx: BuildContext) -> None:
         if self.from_stage:
-            logger.warning("ADD --from=%s not supported, skipping", self.from_stage)
-            return
+            raise ValueError(
+                "ADD does not support --from; use COPY --from for stage copies"
+            )
 
         sub_dest = ctx.substitute(self.dest)
         if not posixpath.isabs(sub_dest):

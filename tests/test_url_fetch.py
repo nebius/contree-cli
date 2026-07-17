@@ -5,6 +5,7 @@ import urllib.error
 from unittest.mock import patch
 
 import pytest
+from contree_client.models import FileResponse
 
 import contree_cli.docker.url_fetch as url_fetch
 from contree_cli.docker.url_fetch import (
@@ -69,7 +70,11 @@ class TestFetchAndUpload:
         head_headers = {"etag": '"first"'}
         get_headers = {"etag": '"first"', "content-length": str(len(body))}
 
-        contree_client.respond_json({"uuid": "remote-1", "sha256": "x"})
+        # POST /v1/files replies with the full FileResponse payload.
+        contree_client.mock(
+            "ensure_file",
+            FileResponse(uuid="remote-1", sha256="x", size=len(body)),
+        )
 
         with (
             patch.object(url_fetch, "http_head", return_value=head_headers),
@@ -90,9 +95,9 @@ class TestFetchAndUpload:
         assert cached["url"] == self.URL
         assert cached["etag"] == '"first"'
 
-        upload_req = contree_client.get_request(0)
-        assert upload_req.method == "POST"
-        assert "/v1/files" in upload_req.path
+        upload_calls = contree_client.calls_for("ensure_file")
+        assert len(upload_calls) == 1
+        assert upload_calls[0].args == (body,)
 
     def test_head_validators_skip_download(self, contree_client, session_store):
         cache_key = url_cache_key(self.URL)
@@ -112,7 +117,7 @@ class TestFetchAndUpload:
         assert result.file_uuid == "remote-cached"
         assert result.sha256 == "cached-sha"
         get_mock.assert_not_called()
-        assert contree_client.request_count == 0
+        assert contree_client.calls == []
 
     def test_get_304_skips_upload(self, contree_client, session_store):
         cache_key = url_cache_key(self.URL)
@@ -135,7 +140,7 @@ class TestFetchAndUpload:
             result = fetch_and_upload(self.URL, contree_client, session_store)
 
         assert result.file_uuid == "remote-cached"
-        assert contree_client.request_count == 0
+        assert contree_client.calls == []
 
 
 class TestHttpHelpers:
@@ -149,6 +154,7 @@ class TestHttpHelpers:
         )
         with patch("urllib.request.urlopen", side_effect=err):
             assert url_fetch.http_head("https://x") == {}
+        assert err.closed
 
     def test_http_get_stream_translates_304_to_status_only(self):
         class FakeHeaders:

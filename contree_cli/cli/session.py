@@ -23,6 +23,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from contree_client.models import ACTIVE_STATUSES, TERMINAL_STATUSES
+from contree_client.runtime import RequestSpec, error_for_response
+
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.output import DefaultFormatter
 from contree_cli.refs import resolve_operation_uuids
@@ -38,9 +41,6 @@ for coding agents:
   use `session show` to inspect history DAG before destructive navigation
   `session wait [OPS...]` waits for active or specified operations
 """
-
-WAIT_TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
-ACTIVE_STATUSES = frozenset({"PENDING", "ASSIGNED", "EXECUTING"})
 
 
 @dataclass(frozen=True)
@@ -656,15 +656,21 @@ def cmd_wait(args: WaitArgs) -> int | None:
         if pending_ops:
             op_ids = list(pending_ops)
         else:
-            resp = client.get("/v1/operations")
-            operations = json.loads(resp.read())
+            # The session_key field is not part of the OperationSummary
+            # model in contree-client, so the typed list_operations()
+            # would drop it. Fetch the raw payload to keep the
+            # per-session filter working.
+            response = client.request(RequestSpec(method="GET", path="/operations"))
+            if response.status != 200:
+                raise error_for_response(response)
+            operations = json.loads(response.body)
             api_op_ids: list[str] = []
             for op in operations:
                 if op.get("status") not in ACTIVE_STATUSES:
                     continue
                 op_session = op.get("session_key")
                 if op_session == session.session_key:
-                    api_op_ids.append(op["uuid"])
+                    api_op_ids.append(str(op["uuid"]))
             op_ids = api_op_ids
             if not op_ids:
                 print("No active operations for this session.", file=sys.stderr)
@@ -680,10 +686,9 @@ def cmd_wait(args: WaitArgs) -> int | None:
     for op_id in op_ids:
         sleep_time = 0.5
         while True:
-            resp = client.get(f"/v1/operations/{op_id}")
-            op = json.loads(resp.read())
+            op = client.get_operation_status(op_id).to_dict()
             status = op.get("status", "")
-            if status in WAIT_TERMINAL_STATUSES:
+            if status in TERMINAL_STATUSES:
                 metadata = op.get("metadata") or {}
                 instance_result = metadata.get("result") or {}
                 state = instance_result.get("state") or {}

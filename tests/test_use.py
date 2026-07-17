@@ -4,7 +4,7 @@ import json
 from contextvars import copy_context
 from unittest.mock import patch
 
-from conftest import ContreeTestClient, FakeResponse
+from conftest import ContreeTestClient
 
 from contree_cli import FORMATTER, SESSION_STORE
 from contree_cli.cli.use import UseArgs, cmd_use
@@ -17,30 +17,17 @@ def _run_cmd(
     args: UseArgs,
     *,
     store: SessionStore,
-    responses: list[FakeResponse] | None = None,
+    images_response: dict | None = None,
     formatter=None,
 ):
-    """Run cmd_use with mocked HTTP client and real SessionStore."""
-    if responses:
-        tc.fake.responses.extend(responses)
+    """Run cmd_use with mocked client and real SessionStore."""
+    if images_response is not None:
+        tc.mock("inspect_find_image_by_tag", images_response["images"][0]["uuid"])
 
     SESSION_STORE.set(store)
     FORMATTER.set(formatter or DefaultFormatter())
     ctx = copy_context()
-
-    created: list[SessionStore] = []
-    _orig = SessionStore.__init__
-
-    def _tracking_init(self, db_path, session_key):
-        _orig(self, db_path, session_key)
-        created.append(self)
-
-    with patch.object(SessionStore, "__init__", _tracking_init):
-        rc = ctx.run(cmd_use, args)
-
-    for s in created:
-        s.close()
-    return rc
+    return ctx.run(cmd_use, args)
 
 
 class TestUseWithImage:
@@ -66,16 +53,15 @@ class TestUseWithImage:
 
     def test_resolves_tag(self, contree_client, session_store):
         args = UseArgs(image="tag:latest", new=False)
-        images_resp = FakeResponse.json(
-            {"images": [{"uuid": "resolved-uuid"}]},
-        )
         _run_cmd(
             contree_client,
             args,
             store=session_store,
-            responses=[images_resp],
+            images_response={"images": [{"uuid": "resolved-uuid"}]},
         )
         assert session_store.current_image == "resolved-uuid"
+        calls = contree_client.calls_for("inspect_find_image_by_tag")
+        assert calls[0].args == ("latest",)
 
 
 class TestUseNoArgs:
@@ -113,6 +99,8 @@ class TestUseNew:
         assert "CONTREE_SESSION" in out
         # Key should NOT be the original "test" key
         assert "test" not in out
+        assert session_store.session_key != "test"
+        assert session_store.current_image == "a1b2c3d4-5678-9abc-def0-111111111111"
 
     def test_new_warns_on_tty(self, contree_client, session_store, profile, caplog):
         args = UseArgs(image="a1b2c3d4-5678-9abc-def0-111111111111", new=True)

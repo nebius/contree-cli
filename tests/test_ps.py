@@ -5,10 +5,10 @@ from contextvars import copy_context
 
 import pytest
 from conftest import ContreeTestClient
+from contree_client.models import OperationSummary
 
 from contree_cli import FORMATTER
 from contree_cli.cli.operation import (
-    PAGE_SIZE,
     STATUS_CHOICES,
 )
 from contree_cli.cli.operation import (
@@ -22,12 +22,10 @@ from contree_cli.types import parse_interval
 
 
 def _run_cmd(tc: ContreeTestClient, operations, *, formatter=None, **kwargs):
-    return _run_cmd_pages(tc, [operations], formatter=formatter, **kwargs)
-
-
-def _run_cmd_pages(tc: ContreeTestClient, pages, *, formatter=None, **kwargs):
-    for page in pages:
-        tc.respond_json(page)
+    tc.mock(
+        "iter_operations",
+        [OperationSummary.from_dict(op) for op in operations],
+    )
 
     FORMATTER.set(formatter or CSVFormatter())
     ctx = copy_context()
@@ -39,6 +37,10 @@ def _run_cmd_pages(tc: ContreeTestClient, pages, *, formatter=None, **kwargs):
 
     args = PsArgs(**kwargs)
     ctx.run(cmd_ps, args)
+
+
+def _list_calls(tc: ContreeTestClient):
+    return tc.calls_for("iter_operations")
 
 
 def _make_op(i, *, status="EXECUTING", kind="instance", duration=1.5):
@@ -103,17 +105,17 @@ class TestCmdPs:
 
 
 class TestPsDynamicFields:
-    """`emit_op` propagates every scalar field the API returns."""
+    """List rows carry every scalar field of the OperationSummary schema."""
 
     def test_unknown_top_level_field_appears_in_row(self, contree_client, capsys):
-        """Server-side additions (e.g. ``cost``) show up without code changes."""
+        """Schema fields the handler does not hardcode show up in the row."""
         op = _make_op(0)
-        op["cost"] = 0.0042
-        op["project_id"] = "proj-abc"
+        op["consumed_cpu"] = 0.0042
+        op["result_image_uuid"] = "img-result"
         _run_cmd(contree_client, [op], formatter=JSONFormatter())
         parsed = json.loads(capsys.readouterr().out)
-        assert parsed["cost"] == 0.0042
-        assert parsed["project_id"] == "proj-abc"
+        assert parsed["consumed_cpu"] == 0.0042
+        assert parsed["result_image_uuid"] == "img-result"
 
     def test_nested_dict_field_skipped(self, contree_client, capsys):
         """Nested structures (metadata, result) are filtered out of the row."""
@@ -133,14 +135,13 @@ class TestPsDynamicFields:
         parsed = json.loads(capsys.readouterr().out)
         assert "tags" not in parsed
 
-    def test_new_datetime_field_parsed(self, contree_client, capsys):
-        """``finished_at``/``updated_at`` are auto-parsed like ``created_at``."""
+    def test_created_at_passes_through_iso(self, contree_client, capsys):
+        """``created_at`` reaches the row as the ISO instant the API sent."""
         op = _make_op(0)
-        op["finished_at"] = "2025-06-01T01:00:00Z"
+        op["created_at"] = "2025-06-01T01:00:00Z"
         _run_cmd(contree_client, [op], formatter=JSONFormatter())
         parsed = json.loads(capsys.readouterr().out)
-        # JSONFormatter serialises datetimes via _json_default -> isoformat.
-        assert parsed["finished_at"].startswith("2025-06-01T01:00:00")
+        assert parsed["created_at"].startswith("2025-06-01T01:00:00")
 
     def test_error_is_always_last_column(self, contree_client, capsys):
         """``error`` is pinned to the trailing position regardless of API order."""
@@ -160,78 +161,101 @@ class TestPsDynamicFields:
         assert parsed["error"] == "boom"
 
     def test_error_last_even_when_added_field_present(self, contree_client, capsys):
-        """A new server field appears before ``error`` in the row."""
+        """A schema field the handler does not hardcode appears before ``error``."""
         op = _make_op(0, status="FAILED")
         op["error"] = "oom"
-        op["cost"] = 0.01  # server field added after `error` in the response
+        op["image_size"] = 2048  # schema field placed after `error` in the response
         _run_cmd(contree_client, [op], formatter=JSONFormatter())
         parsed = json.loads(capsys.readouterr().out)
         keys = list(parsed.keys())
         assert keys[-1] == "error"
-        assert "cost" in keys
-        assert keys.index("cost") < keys.index("error")
+        assert "image_size" in keys
+        assert keys.index("image_size") < keys.index("error")
 
 
 class TestPsParams:
     def test_status_param(self, contree_client):
         _run_cmd(contree_client, [], status="FAILED")
-        assert "status=FAILED" in contree_client.request_paths[0]
+        assert _list_calls(contree_client)[0].kwargs["status"] == "FAILED"
 
     def test_kind_param(self, contree_client):
         _run_cmd(contree_client, [], kind="instance")
-        assert "kind=instance" in contree_client.request_paths[0]
+        assert _list_calls(contree_client)[0].kwargs["kind"] == "instance"
 
     def test_since_param(self, contree_client):
+        """The parsed datetime goes to the client as-is; the library
+        owns the wire formatting (format_time_param)."""
+        from datetime import datetime
+
         _run_cmd(contree_client, [], since="1h")
-        path = contree_client.request_paths[0]
-        assert "since=" in path
+        since = _list_calls(contree_client)[0].kwargs["since"]
+        assert isinstance(since, datetime)
 
     def test_until_param(self, contree_client):
+        from datetime import datetime
+
         _run_cmd(contree_client, [], until="2025-01-01")
-        path = contree_client.request_paths[0]
-        assert "until=" in path
+        until = _list_calls(contree_client)[0].kwargs["until"]
+        assert isinstance(until, datetime)
 
     def test_no_filters_no_extra_params(self, contree_client):
         _run_cmd(contree_client, [])
-        path = contree_client.request_paths[0]
-        assert "kind" not in path
+        kwargs = _list_calls(contree_client)[0].kwargs
+        assert kwargs["kind"] is None
+        assert kwargs["since"] is None
+        assert kwargs["until"] is None
 
 
 class TestPsPagination:
-    def test_single_page(self, contree_client):
+    """Offset pagination itself is the library's job (iter_operations);
+    the CLI contract is a single iterator pass with the record budget
+    forwarded as limit."""
+
+    def test_single_iterator_pass(self, contree_client):
         ops = [_make_op(i) for i in range(5)]
         _run_cmd(contree_client, ops)
-        assert contree_client.request_count == 1
+        assert len(_list_calls(contree_client)) == 1
 
-    def test_multi_page(self, contree_client, capsys):
-        page1 = [_make_op(i) for i in range(PAGE_SIZE)]
-        page2 = [_make_op(i) for i in range(PAGE_SIZE, PAGE_SIZE + 3)]
-        _run_cmd_pages(contree_client, [page1, page2])
-        assert contree_client.request_count == 2
+    def test_limit_forwarded_with_probe(self, contree_client):
+        """--show-max N asks the iterator for N+1 records so truncation
+        is detectable."""
+        _run_cmd(contree_client, [], show_max=7)
+        assert _list_calls(contree_client)[0].kwargs["limit"] == 8
+
+    def test_no_show_max_means_unbounded(self, contree_client):
+        _run_cmd(contree_client, [], show_max=None)
+        assert _list_calls(contree_client)[0].kwargs["limit"] is None
+
+    def test_long_stream_fully_emitted(self, contree_client, capsys):
+        ops = [_make_op(i) for i in range(25)]
+        _run_cmd(contree_client, ops, show_max=None)
         out = capsys.readouterr().out
-        assert f"op-{PAGE_SIZE + 2}" in out
+        assert "op-0" in out
+        assert "op-24" in out
 
-    def test_offset_increments(self, contree_client):
-        page1 = [_make_op(i) for i in range(PAGE_SIZE)]
-        page2 = []
-        _run_cmd_pages(contree_client, [page1, page2], show_max=None)
-        paths = contree_client.request_paths
-        assert "offset=0" in paths[0]
-        assert f"offset={PAGE_SIZE}" in paths[1]
+    def test_progress_logged_per_page(self, contree_client, caplog):
+        """Every consumed page reports progress, so `ps -a` over a big
+        history does not look hung while the next page loads."""
+        import logging
 
-    def test_pages_flushed_progressively(self, contree_client, capsys):
-        """Each full page is flushed as it completes (streaming output)."""
-        page1 = [_make_op(i) for i in range(PAGE_SIZE)]
-        page2 = [_make_op(i) for i in range(PAGE_SIZE, PAGE_SIZE + 3)]
-        _run_cmd_pages(
-            contree_client,
-            [page1, page2],
-            show_max=None,
-        )
-        out = capsys.readouterr().out
-        # All rows from both pages should appear in output.
-        assert f"op-{PAGE_SIZE - 1}" in out
-        assert f"op-{PAGE_SIZE + 2}" in out
+        ops = [_make_op(i) for i in range(2500)]
+        with caplog.at_level(logging.INFO, logger="contree_cli.cli.operation"):
+            _run_cmd(contree_client, ops, show_max=None, all=True)
+        progress = [
+            r.getMessage() for r in caplog.records if "loading more" in r.getMessage()
+        ]
+        assert progress == [
+            "Fetched 1000 operations, loading more...",
+            "Fetched 2000 operations, loading more...",
+        ]
+
+    def test_no_progress_log_for_short_stream(self, contree_client, caplog):
+        import logging
+
+        ops = [_make_op(i) for i in range(5)]
+        with caplog.at_level(logging.INFO, logger="contree_cli.cli.operation"):
+            _run_cmd(contree_client, ops, show_max=None, all=True)
+        assert "loading more" not in caplog.text
 
 
 class TestPsActiveFilter:
@@ -239,7 +263,7 @@ class TestPsActiveFilter:
         """Default ps sends status=EXECUTING to the server for filtering."""
         ops = [_make_op(0, status="EXECUTING")]
         _run_cmd(contree_client, ops)
-        assert "status=EXECUTING" in contree_client.request_paths[0]
+        assert _list_calls(contree_client)[0].kwargs["status"] == "EXECUTING"
         out = capsys.readouterr().out
         assert "op-0" in out
 
@@ -267,19 +291,19 @@ class TestPsActiveFilter:
         _run_cmd(contree_client, ops, quiet=True)
         lines = capsys.readouterr().out.strip().splitlines()
         assert lines == ["op-0"]
-        assert "status=EXECUTING" in contree_client.request_paths[0]
+        assert _list_calls(contree_client)[0].kwargs["status"] == "EXECUTING"
 
     def test_all_flag_no_status_param(self, contree_client):
         """--all flag does not send a status filter to the server."""
         ops = [_make_op(0)]
         _run_cmd(contree_client, ops, all=True)
-        assert "status=" not in contree_client.request_paths[0]
+        assert _list_calls(contree_client)[0].kwargs["status"] is None
 
     def test_all_with_explicit_status(self, contree_client, capsys):
         """--all combined with --status sends the status filter."""
         ops = [_make_op(0, status="FAILED")]
         _run_cmd(contree_client, ops, all=True, status="FAILED")
-        assert "status=FAILED" in contree_client.request_paths[0]
+        assert _list_calls(contree_client)[0].kwargs["status"] == "FAILED"
         assert "op-0" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
@@ -294,16 +318,16 @@ class TestPsActiveFilter:
     ):
         """Single-letter status shortcuts are expanded."""
         _run_cmd(contree_client, [], status=short)
-        assert f"status={full}" in contree_client.request_paths[0]
+        assert _list_calls(contree_client)[0].kwargs["status"] == full
 
 
 class TestPsShowMax:
     def test_show_max_truncates_output(self, contree_client, capsys):
-        """show_max caps emitted ops; probe runs after for more."""
-        page = [_make_op(i) for i in range(5)]
-        _run_cmd_pages(
+        """show_max caps emitted ops mid-page."""
+        ops = [_make_op(i) for i in range(5)]
+        _run_cmd(
             contree_client,
-            [page, [_make_op(99)]],  # main + probe
+            ops,
             show_max=3,
             all=True,
         )
@@ -314,10 +338,10 @@ class TestPsShowMax:
         assert "op-3" not in out
 
     def test_show_max_logs_warning(self, contree_client, caplog):
-        page = [_make_op(i) for i in range(5)]
-        _run_cmd_pages(
+        ops = [_make_op(i) for i in range(5)]
+        _run_cmd(
             contree_client,
-            [page, [_make_op(99)]],  # probe finds more
+            ops,
             show_max=3,
             all=True,
         )
@@ -347,38 +371,34 @@ class TestPsShowMax:
         assert "Output truncated" not in caplog.text
 
     def test_show_max_stops_pagination(self, contree_client):
-        """show_max stops mid-page; short first page is detected without a probe."""
+        """show_max stops mid-page without fetching further pages."""
         ops = [_make_op(i) for i in range(10)]
-        _run_cmd_pages(
+        _run_cmd(
             contree_client,
-            [ops],
+            ops,
             show_max=3,
             all=True,
         )
-        # Short page (10 < PAGE_SIZE) is enough to know we've seen all data;
-        # no need for the historical probe request.
-        assert contree_client.request_count == 1
+        assert len(_list_calls(contree_client)) == 1
 
-    def test_show_max_across_pages(self, contree_client, capsys):
-        """show_max truncates across page boundaries."""
-        page1 = [_make_op(i) for i in range(PAGE_SIZE)]
-        page2 = [_make_op(i) for i in range(PAGE_SIZE, PAGE_SIZE + 5)]
-        _run_cmd_pages(
+    def test_show_max_truncates_stream(self, contree_client, capsys):
+        ops = [_make_op(i) for i in range(12)]
+        _run_cmd(
             contree_client,
-            [page1, page2, [_make_op(99)]],  # main pages + probe
-            show_max=PAGE_SIZE + 2,
+            ops,
+            show_max=10,
             all=True,
         )
         out = capsys.readouterr().out
-        assert f"op-{PAGE_SIZE + 1}" in out
-        assert f"op-{PAGE_SIZE + 2}" not in out
+        assert "op-9" in out
+        assert "op-10" not in out
 
     def test_show_max_one_shows_one(self, contree_client, capsys):
         """show_max=1 emits exactly one op (no off-by-one)."""
         ops = [_make_op(0), _make_op(1)]
-        _run_cmd_pages(
+        _run_cmd(
             contree_client,
-            [ops, [_make_op(99)]],  # main + probe
+            ops,
             show_max=1,
             all=True,
         )
@@ -386,12 +406,12 @@ class TestPsShowMax:
         assert "op-0" in out
         assert "op-1" not in out
 
-    def test_show_max_no_warning_when_probe_empty(self, contree_client, caplog):
-        """Empty probe means we hit show_max but there's nothing more."""
-        page = [_make_op(i) for i in range(3)]
-        _run_cmd_pages(
+    def test_show_max_no_warning_when_stream_fits(self, contree_client, caplog):
+        """Exactly show_max ops in the stream means nothing was cut."""
+        ops = [_make_op(i) for i in range(3)]
+        _run_cmd(
             contree_client,
-            [page, []],  # probe empty
+            ops,
             show_max=3,
             all=True,
         )
@@ -401,9 +421,11 @@ class TestPsShowMax:
         """TableFormatter buffer is flushed before the warning is logged."""
         import logging
 
-        page = [_make_op(i) for i in range(5)]
-        for response in (page, [_make_op(99)]):
-            contree_client.respond_json(response)
+        ops = [_make_op(i) for i in range(5)]
+        contree_client.mock(
+            "iter_operations",
+            [OperationSummary.from_dict(op) for op in ops],
+        )
 
         FORMATTER.set(TableFormatter())
         ctx = copy_context()

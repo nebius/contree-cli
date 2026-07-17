@@ -7,25 +7,36 @@ import logging
 import os
 import select
 from contextvars import copy_context
-from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import ContreeTestClient, FakeResponse
+from conftest import ContreeTestClient
+from contree_client.exceptions import (
+    ContreeAPIError,
+    NotFoundError,
+    SSEStreamError,
+)
+from contree_client.models import (
+    File,
+    FileResponse,
+    InstanceSpawnResponse,
+    OperationEvent,
+    OperationResponse,
+    StreamRepr,
+)
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.cli.run import (
     RunArgs,
     TerminalSummary,
-    _build_op_from_summary,
     _expand_mapped_files,
     _is_excluded,
     _local_file_cache_kind,
     _read_piped_stdin,
-    _stream_events_until_close,
+    build_op_from_summary,
     cmd_run,
+    stream_events_until_close,
 )
-from contree_cli.client import ApiError
 from contree_cli.mapped_file import MappedFile
 from contree_cli.output import DefaultFormatter, JSONFormatter
 from contree_cli.session import SessionStore
@@ -35,15 +46,15 @@ IMG_NEW = "c3d4e5f6-789a-bcde-f012-333333333333"
 IMG_NEW2 = "d4e5f6a7-89ab-cdef-0123-444444444444"
 IMG_SOME = "b2c3d4e5-6789-abcd-ef01-222222222222"
 
-
-def _spawn_response(uuid: str = "op-1") -> FakeResponse:
-    return FakeResponse.json(
-        {"uuid": uuid, "status": "PENDING"},
-        status=201,
-    )
+# A prepared mock outcome: (operation name, result model or exception).
+MockSpec = tuple[str, object]
 
 
-def _op_response(
+def _spawn_response(uuid: str = "op-1") -> MockSpec:
+    return ("spawn_instance", InstanceSpawnResponse.from_dict({"uuid": uuid}))
+
+
+def op_body(
     uuid: str = "op-1",
     status: str = "SUCCESS",
     *,
@@ -54,7 +65,8 @@ def _op_response(
     error: str | None = None,
     image: str = IMG_NEW,
     state_extra: dict | None = None,
-) -> FakeResponse:
+) -> dict:
+    """Full GET /v1/operations/{uuid} payload as the API returns it."""
     state: dict = {}
     if exit_code is not None:
         state["exit_code"] = exit_code
@@ -67,21 +79,97 @@ def _op_response(
             "stderr": stderr,
             "state": state or None,
         }
-    return FakeResponse.json(
-        {
-            "uuid": uuid,
-            "kind": "instance",
-            "status": status,
-            "error": error,
-            "duration": duration,
-            "metadata": {"result": instance_result},
-            "result": {"image": image, "tag": "latest"},
-        }
+    # OperationInstanceMetadata requires `command` and `image` on the
+    # wire; the API always echoes the spawn parameters back here.
+    return {
+        "uuid": uuid,
+        "kind": "instance",
+        "status": status,
+        "error": error,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "duration": duration,
+        "metadata": {
+            "command": "echo",
+            "image": IMG_UUID,
+            "shell": False,
+            "result": instance_result,
+        },
+        "result": {"image": image, "tag": "latest"},
+    }
+
+
+def _op_response(uuid: str = "op-1", status: str = "SUCCESS", **kwargs) -> MockSpec:
+    return (
+        "get_operation_status",
+        OperationResponse.from_dict(op_body(uuid, status, **kwargs)),
     )
 
 
-def _api_response(body: dict, *, status: int = 200) -> FakeResponse:
-    return FakeResponse.json(body, status=status)
+def tag_lookup(uuid: str) -> MockSpec:
+    """GET /v1/images?tag=... resolution result."""
+    return ("inspect_find_image_by_tag", uuid)
+
+
+def file_info_response(uuid: str) -> MockSpec:
+    """GET /v1/files/{sha256} dedup hit: the full File record."""
+    return (
+        "get_file",
+        File.from_dict(
+            {
+                "uuid": uuid,
+                "sha256": "0" * 64,
+                "size": 7,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            }
+        ),
+    )
+
+
+def file_missing_response() -> MockSpec:
+    """GET /v1/files/{sha256} dedup miss: 404."""
+    return ("get_file", NotFoundError(404, "not found"))
+
+
+def file_upload_response(uuid: str, sha256: str = "0" * 64) -> MockSpec:
+    """POST /v1/files success: uuid + sha256 + size."""
+    return ("upload_file", FileResponse(uuid=uuid, sha256=sha256, size=7))
+
+
+def apply_mocks(tc: ContreeTestClient, mocks: list[MockSpec]) -> None:
+    """Queue mock outcomes; auto-mock the SSE stream as empty when the
+    test doesn't care about it (the CLI always opens the event stream
+    before falling back to the terminal GET)."""
+    for name, value in mocks:
+        if isinstance(value, BaseException):
+            tc.mock(name, error=value)
+        else:
+            tc.mock(name, value)
+    if all(name != "iter_operation_events" for name, _ in mocks):
+        tc.mock("iter_operation_events", [])
+
+
+def call_ops(tc: ContreeTestClient) -> list[str]:
+    """Operation names of every recorded API call, in order."""
+    return [c.operation for c in tc.calls]
+
+
+def spawn_payload(tc: ContreeTestClient, index: int = 0) -> dict:
+    """Reassemble the spawn_instance call into the wire-payload shape
+    the old tests asserted against: positional (command, image) merged
+    with the kwargs, FileSpec/StreamRepr models rendered as dicts."""
+    call = tc.calls_for("spawn_instance")[index]
+    payload: dict = {"command": call.args[0], "image": call.args[1], **call.kwargs}
+    files = payload.get("files")
+    if isinstance(files, dict):
+        payload["files"] = {
+            path: spec.to_dict() if hasattr(spec, "to_dict") else spec
+            for path, spec in files.items()
+        }
+    stdin = payload.get("stdin")
+    if stdin is not None and hasattr(stdin, "to_dict"):
+        payload["stdin"] = stdin.to_dict()
+    return payload
 
 
 def _tty_stdin() -> MagicMock:
@@ -94,19 +182,19 @@ def _tty_stdin() -> MagicMock:
 def _run_cmd(
     tc: ContreeTestClient,
     args: RunArgs,
-    responses: list[FakeResponse],
+    mocks: list[MockSpec],
     *,
     store: SessionStore,
     formatter=None,
     stdin_mock: MagicMock | None = None,
 ):
-    """Run cmd_run with mocked HTTP responses and mocked sleep.
+    """Run cmd_run with prepared method-level mocks and mocked sleep.
 
-    The fake connection auto-serves empty SSE responses for any
-    GET /events path so existing tests can stay shaped as
-    `[spawn, op]` without knowing the CLI now opens an SSE first.
+    Tests that invoke cmd_run twice on the same client must queue all
+    mocks in the first call (outcome queues are FIFO with a sticky
+    tail) and pass [] on the second.
     """
-    tc.fake.responses.extend(responses)
+    apply_mocks(tc, mocks)
 
     FORMATTER.set(formatter or JSONFormatter())
     SESSION_STORE.set(store)
@@ -141,12 +229,11 @@ class TestDetach:
         assert "op-1" in out
 
     def test_detach_no_poll_request(self, contree_client, session_store):
-        """Only 1 HTTP request (the POST spawn), no GET poll."""
+        """Only the spawn call is made, no status poll."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(detach=True)
         _run_cmd(contree_client, args, [_spawn_response()], store=session_store)
-        assert contree_client.request_count == 1
-        assert contree_client.get_request(0).method == "POST"
+        assert call_ops(contree_client) == ["spawn_instance"]
 
     def test_detach_shows_status(self, contree_client, session_store, capsys):
         session_store.set_image(IMG_UUID, kind="test")
@@ -168,36 +255,43 @@ class TestDetach:
 
 class TestPollLoop:
     def test_poll_until_success(self, contree_client, session_store, capsys):
-        """SSE follow=1 makes the API serve the terminal state directly —
-        the CLI no longer polls through intermediate PENDING snapshots."""
+        """The event stream closes without a completion frame; the
+        terminal-check GET serves the final state directly."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 0
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["status"] == "SUCCESS"
 
-    def test_unknown_field_passes_through(self, contree_client, session_store, capsys):
-        """New server fields on the operation reach JSON output as-is."""
+    def test_unknown_field_filtered_by_typed_client(
+        self, contree_client, session_store, capsys
+    ):
+        """Typed response models keep only spec fields: unknown server
+        fields are dropped by contree-client instead of passing through
+        to JSON output, while known fields still land as-is."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        op_body = json.loads(_op_response(status="SUCCESS", exit_code=0).body)
-        op_body["session_key"] = "sess-1"
-        op_body["future_field"] = "anything"
-        responses = [_spawn_response(), FakeResponse.json(op_body)]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        body = op_body(status="SUCCESS", exit_code=0)
+        body["future_field"] = "anything"
+        mocks: list[MockSpec] = [
+            _spawn_response(),
+            ("get_operation_status", OperationResponse.from_dict(body)),
+        ]
+        _run_cmd(contree_client, args, mocks, store=session_store)
         parsed = json.loads(capsys.readouterr().out)
-        assert parsed["session_key"] == "sess-1"
-        assert parsed["future_field"] == "anything"
+        assert "future_field" not in parsed
+        assert parsed["status"] == "SUCCESS"
+        assert parsed["uuid"] == "op-1"
 
     def test_poll_default_shows_stdout(self, contree_client, session_store, capsys):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(
                 status="SUCCESS",
@@ -208,7 +302,7 @@ class TestPollLoop:
         rc = _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             formatter=DefaultFormatter(),
         )
@@ -219,32 +313,32 @@ class TestPollLoop:
     def test_poll_until_failed(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="FAILED", exit_code=None, error="timeout"),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 1
 
     def test_poll_until_cancelled(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="CANCELLED", exit_code=None),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 1
 
     def test_failed_with_exit_code(self, contree_client, session_store):
         """FAILED with exit code (e.g. timeout kill) returns the exit code."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="FAILED", exit_code=137, error="timeout"),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 137
 
     def test_timed_out_logs_warning(self, contree_client, session_store, caplog):
@@ -255,7 +349,7 @@ class TestPollLoop:
         """
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(timeout=60)
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(
                 status="SUCCESS",
@@ -264,7 +358,7 @@ class TestPollLoop:
             ),
         ]
         with caplog.at_level(logging.WARNING, logger="contree_cli.cli.run"):
-            _run_cmd(contree_client, args, responses, store=session_store)
+            _run_cmd(contree_client, args, mocks, store=session_store)
 
         records = [r for r in caplog.records if "timed out" in r.getMessage()]
         assert len(records) == 1
@@ -277,12 +371,12 @@ class TestPollLoop:
         """A non-timeout FAILED keeps emitting at FATAL severity."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="FAILED", exit_code=1, error="oom"),
         ]
         with caplog.at_level(logging.WARNING, logger="contree_cli.cli.run"):
-            _run_cmd(contree_client, args, responses, store=session_store)
+            _run_cmd(contree_client, args, mocks, store=session_store)
 
         ended = [r for r in caplog.records if "ended with status" in r.getMessage()]
         assert len(ended) == 1
@@ -294,32 +388,32 @@ class TestPollLoop:
         """Plain SUCCESS does not emit a timeout warning."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
         with caplog.at_level(logging.WARNING, logger="contree_cli.cli.run"):
-            _run_cmd(contree_client, args, responses, store=session_store)
+            _run_cmd(contree_client, args, mocks, store=session_store)
         assert [r for r in caplog.records if "timed out" in r.getMessage()] == []
 
     def test_exit_code_propagated(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=42),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 42
 
     def test_success_no_exit_code(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=None),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc is None
 
 
@@ -328,16 +422,14 @@ class TestPollLoop:
 
 class TestCtrlC:
     @staticmethod
-    def _run_ctrl_c(
-        responses: list[FakeResponse], store: SessionStore
-    ) -> ContreeTestClient:
-        """Run cmd_run with the events stream raising KeyboardInterrupt
-        — simulates the user hitting Ctrl-C while the CLI was waiting
+    def _run_ctrl_c(mocks: list[MockSpec], store: SessionStore) -> ContreeTestClient:
+        """Run cmd_run with the events stream raising KeyboardInterrupt,
+        simulating the user hitting Ctrl-C while the CLI was waiting
         on SSE for the operation to terminate."""
         store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         tc = ContreeTestClient()
-        tc.fake.responses.extend(responses)
+        apply_mocks(tc, mocks)
 
         CLIENT.set(tc)
         FORMATTER.set(JSONFormatter())
@@ -346,7 +438,7 @@ class TestCtrlC:
 
         with (
             patch(
-                "contree_cli.cli.run._stream_events_until_close",
+                "contree_cli.cli.run.stream_events_until_close",
                 side_effect=KeyboardInterrupt,
             ),
             patch("contree_cli.cli.run.sys.stdin", _tty_stdin()),
@@ -356,25 +448,24 @@ class TestCtrlC:
         return tc
 
     def test_ctrl_c_cancels_operation(self, session_store):
-        """On KeyboardInterrupt during the wait, DELETE is sent."""
+        """On KeyboardInterrupt during the wait, the op is cancelled."""
         tc = self._run_ctrl_c(
             [
                 _spawn_response(),
-                _api_response({}, status=202),
+                ("cancel_operation", None),
             ],
             session_store,
         )
-        methods = [r.method for r in tc.fake.requests]
-        assert "DELETE" in methods
-        delete_req = next(r for r in tc.fake.requests if r.method == "DELETE")
-        assert "/v1/operations/op-1" in delete_req.path
+        cancels = tc.calls_for("cancel_operation")
+        assert len(cancels) == 1
+        assert cancels[0].args == ("op-1",)
 
     def test_ctrl_c_delete_failure_still_raises(self, session_store):
-        """If DELETE fails, KeyboardInterrupt is still re-raised."""
+        """If the cancel fails, KeyboardInterrupt is still re-raised."""
         self._run_ctrl_c(
             [
                 _spawn_response(),
-                _api_response({"error": "not found"}, status=404),
+                ("cancel_operation", NotFoundError(404, "not found")),
             ],
             session_store,
         )
@@ -388,12 +479,12 @@ class TestBrokenPipe:
 
     @staticmethod
     def _run_broken_pipe(
-        responses: list[FakeResponse], store: SessionStore
+        mocks: list[MockSpec], store: SessionStore
     ) -> ContreeTestClient:
         store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         tc = ContreeTestClient()
-        tc.fake.responses.extend(responses)
+        apply_mocks(tc, mocks)
 
         CLIENT.set(tc)
         FORMATTER.set(JSONFormatter())
@@ -402,7 +493,7 @@ class TestBrokenPipe:
 
         with (
             patch(
-                "contree_cli.cli.run._stream_events_until_close",
+                "contree_cli.cli.run.stream_events_until_close",
                 side_effect=BrokenPipeError,
             ),
             patch("contree_cli.cli.run.sys.stdin", _tty_stdin()),
@@ -422,19 +513,21 @@ class TestBrokenPipe:
 
     def test_broken_pipe_cancels_operation(self, session_store):
         tc = self._run_broken_pipe(
-            [_spawn_response(), _api_response({}, status=202)],
+            [_spawn_response(), ("cancel_operation", None)],
             session_store,
         )
-        methods = [r.method for r in tc.fake.requests]
-        assert "DELETE" in methods
-        delete_req = next(r for r in tc.fake.requests if r.method == "DELETE")
-        assert "/v1/operations/op-1" in delete_req.path
+        cancels = tc.calls_for("cancel_operation")
+        assert len(cancels) == 1
+        assert cancels[0].args == ("op-1",)
 
     def test_broken_pipe_delete_failure_still_exits_141(self, session_store):
-        """Even if the DELETE fails, we still exit 141 rather than
+        """Even if the cancel fails, we still exit 141 rather than
         re-raising BrokenPipeError."""
         self._run_broken_pipe(
-            [_spawn_response(), _api_response({"error": "not found"}, status=404)],
+            [
+                _spawn_response(),
+                ("cancel_operation", NotFoundError(404, "not found")),
+            ],
             session_store,
         )
 
@@ -480,7 +573,7 @@ class TestDirectoryAttachments:
 
 class TestFileUpload:
     def test_file_upload(self, contree_client, session_store, tmp_path):
-        """POST /v1/files is called for each attached file."""
+        """upload_file is called for each attached file after dedup miss."""
         session_store.set_image(IMG_UUID, kind="test")
         host_file = tmp_path / "data.txt"
         host_file.write_text("content")
@@ -493,26 +586,21 @@ class TestFileUpload:
         )
         args = _default_args(file=[mf])
 
-        file_resp = _api_response(
-            {"uuid": "file-uuid-1", "sha256": "abc"},
-            status=201,
-        )
-        responses = [
-            _api_response({"error": "not found"}, status=404),  # GET dedup miss
-            file_resp,  # POST /v1/files
+        mocks = [
+            file_missing_response(),  # GET dedup miss
+            file_upload_response("file-uuid-1"),  # POST /v1/files
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 0
 
-        # Verify dedup check then file upload
-        req0 = contree_client.get_request(0)
-        assert req0.method == "GET"
-        assert "/v1/files/" in req0.path
-        req1 = contree_client.get_request(1)
-        assert req1.method == "POST"
-        assert "/v1/files" in req1.path
+        # Verify dedup check then file upload, before the spawn
+        assert call_ops(contree_client)[:3] == [
+            "get_file",
+            "upload_file",
+            "spawn_instance",
+        ]
 
     def test_file_uuid_in_spawn_payload(self, contree_client, session_store, tmp_path):
         """Uploaded file UUID appears in the spawn payload."""
@@ -528,27 +616,21 @@ class TestFileUpload:
         )
         args = _default_args(file=[mf])
 
-        file_resp = _api_response(
-            {"uuid": "file-42", "sha256": "def"},
-            status=201,
-        )
-        responses = [
-            _api_response({"error": "not found"}, status=404),  # GET dedup miss
-            file_resp,
+        mocks = [
+            file_missing_response(),  # GET dedup miss
+            file_upload_response("file-42"),
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
 
-        # GET dedup, POST /v1/files, then POST /v1/instances
-        spawn_req = contree_client.get_request(2)
-        body = json.loads(spawn_req.body)
+        body = spawn_payload(contree_client)
         assert "/app/script.sh" in body["files"]
         assert body["files"]["/app/script.sh"]["uuid"] == "file-42"
         assert body["files"]["/app/script.sh"]["uid"] == 1000
 
     def test_file_dedup_skips_upload(self, contree_client, session_store, tmp_path):
-        """GET /v1/files/... returns 200 -> no POST upload, UUID reused."""
+        """get_file returns the record -> no upload, UUID reused."""
         session_store.set_image(IMG_UUID, kind="test")
         host_file = tmp_path / "data.txt"
         host_file.write_text("content")
@@ -561,24 +643,19 @@ class TestFileUpload:
         )
         args = _default_args(file=[mf])
 
-        responses = [
-            _api_response({"uuid": "existing-uuid"}),  # GET dedup hit
+        mocks = [
+            file_info_response("existing-uuid"),  # GET dedup hit
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 0
 
-        methods = [r.method for r in contree_client.fake.requests]
-        # Only GET (dedup), POST (spawn), GET (poll) -- no POST /v1/files
-        req0 = contree_client.get_request(0)
-        assert req0.method == "GET"
-        assert "/v1/files/" in req0.path
-        assert methods.count("POST") == 1  # only the spawn POST
+        assert call_ops(contree_client)[:2] == ["get_file", "spawn_instance"]
+        assert contree_client.calls_for("upload_file") == []
 
         # Spawn uses the existing UUID
-        spawn_req = contree_client.get_request(1)
-        body = json.loads(spawn_req.body)
+        body = spawn_payload(contree_client)
         assert body["files"]["/app/data.txt"]["uuid"] == "existing-uuid"
 
     def test_file_dedup_logs_reuse(
@@ -597,18 +674,18 @@ class TestFileUpload:
         )
         args = _default_args(file=[mf])
 
-        responses = [
-            _api_response({"uuid": "existing-uuid"}),  # GET dedup hit
+        mocks = [
+            file_info_response("existing-uuid"),  # GET dedup hit
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
         with caplog.at_level(logging.INFO):
-            _run_cmd(contree_client, args, responses, store=session_store)
+            _run_cmd(contree_client, args, mocks, store=session_store)
         assert "File reused:" in caplog.text
         assert "existing-uuid" in caplog.text
 
     def test_file_dedup_non_404_raises(self, contree_client, session_store, tmp_path):
-        """Non-404 error from GET /v1/files propagates."""
+        """Non-404 error from get_file propagates."""
         session_store.set_image(IMG_UUID, kind="test")
         host_file = tmp_path / "data.txt"
         host_file.write_text("content")
@@ -621,10 +698,9 @@ class TestFileUpload:
         )
         args = _default_args(file=[mf])
 
-        # 403 is non-retryable, so the caller sees it on the first hit.
-        responses = [_api_response({"error": "forbidden"}, status=403)]
-        with pytest.raises(ApiError) as exc_info:
-            _run_cmd(contree_client, args, responses, store=session_store)
+        mocks: list[MockSpec] = [("get_file", ContreeAPIError(403, "forbidden"))]
+        with pytest.raises(ContreeAPIError) as exc_info:
+            _run_cmd(contree_client, args, mocks, store=session_store)
         assert exc_info.value.status == 403
 
     def test_local_file_cache_skips_api_file_lookup(
@@ -649,17 +725,17 @@ class TestFileUpload:
         }
 
         args = _default_args(file=[mf])
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
 
-        # spawn + poll only, no GET/POST /v1/files
-        req0 = contree_client.get_request(0)
-        assert req0.method == "POST"
-        assert "/v1/instances" in req0.path
-        body = json.loads(req0.body)
+        # spawn + poll only, no get_file/upload_file
+        assert call_ops(contree_client)[0] == "spawn_instance"
+        assert contree_client.calls_for("get_file") == []
+        assert contree_client.calls_for("upload_file") == []
+        body = spawn_payload(contree_client)
         assert body["files"]["/app/cached.txt"]["uuid"] == "cached-uuid"
 
     def test_local_file_cache_invalidated_when_file_changes(
@@ -684,19 +760,16 @@ class TestFileUpload:
         os.utime(host_file, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
 
         args = _default_args(file=[mf])
-        responses = [
-            _api_response({"uuid": "new-uuid"}),  # GET dedup hit for new content
+        mocks = [
+            file_info_response("new-uuid"),  # GET dedup hit for new content
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
 
-        req0 = contree_client.get_request(0)
-        assert req0.method == "GET"
-        assert "/v1/files/" in req0.path
-        spawn_req = contree_client.get_request(1)
-        spawn_body = json.loads(spawn_req.body)
-        assert spawn_body["files"]["/app/cached-change.txt"]["uuid"] == "new-uuid"
+        assert call_ops(contree_client)[0] == "get_file"
+        body = spawn_payload(contree_client)
+        assert body["files"]["/app/cached-change.txt"]["uuid"] == "new-uuid"
 
 
 class TestParallelUpload:
@@ -771,13 +844,12 @@ class TestSpawnPayload:
         self, tc: ContreeTestClient, args: RunArgs, store: SessionStore
     ) -> dict:
         store.set_image(IMG_UUID, kind="test")
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(tc, args, responses, store=store)
-        spawn_req = tc.get_request(0)
-        return json.loads(spawn_req.body)
+        _run_cmd(tc, args, mocks, store=store)
+        return spawn_payload(tc)
 
     def test_basic_fields(self, contree_client, session_store):
         args = _default_args()
@@ -836,36 +908,32 @@ class TestTagResolution:
     def test_tag_resolved_before_spawn(self, contree_client, session_store):
         session_store.set_image("tag:latest", kind="test")
         args = _default_args()
-        tag_resp = _api_response(
-            {"images": [{"uuid": "resolved-uuid"}]},
-        )
-        responses = [
-            tag_resp,  # GET /v1/images?tag=latest
+        mocks = [
+            tag_lookup("resolved-uuid"),  # GET /v1/images?tag=latest
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
 
-        # First request is the tag lookup
-        req0 = contree_client.get_request(0)
-        assert req0.method == "GET"
-        assert "tag=latest" in req0.path
+        # First call is the tag lookup
+        assert call_ops(contree_client)[0] == "inspect_find_image_by_tag"
+        lookup = contree_client.calls_for("inspect_find_image_by_tag")[0]
+        assert lookup.args == ("latest",)
 
         # Spawn uses resolved UUID
-        spawn_req = contree_client.get_request(1)
-        body = json.loads(spawn_req.body)
+        body = spawn_payload(contree_client)
         assert body["image"] == "resolved-uuid"
 
     def test_uuid_passthrough(self, contree_client, session_store):
         session_store.set_image(IMG_SOME, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        assert contree_client.calls_for("inspect_find_image_by_tag") == []
+        body = spawn_payload(contree_client)
         assert body["image"] == IMG_SOME
 
 
@@ -876,50 +944,46 @@ class TestEnvParsing:
     def test_env_key_value(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(env=["FOO=bar", "BAZ=qux"])
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["env"] == {"FOO": "bar", "BAZ": "qux"}
 
     def test_env_empty_value(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(env=["KEY="])
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["env"] == {"KEY": ""}
 
     def test_no_env_omitted(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(env=[])
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert "env" not in body
 
     def test_session_env_no_auto_preserve(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         session_store.set_env("PATH", "/usr/bin:/bin")
         args = _default_args(env=[])
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["env"] == {"PATH": "/usr/bin:/bin"}
         assert "preserve_env" not in body
 
@@ -927,13 +991,12 @@ class TestEnvParsing:
         session_store.set_image(IMG_UUID, kind="test")
         session_store.set_env("PATH", "/usr/bin:/bin")
         args = _default_args(env=["DEBUG=1"])
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["env"] == {"PATH": "/usr/bin:/bin", "DEBUG": "1"}
         assert "preserve_env" not in body
 
@@ -941,38 +1004,35 @@ class TestEnvParsing:
         session_store.set_image(IMG_UUID, kind="test")
         session_store.set_env("PATH", "/usr/bin:/bin")
         args = _default_args(preserve_env=True)
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["env"] == {"PATH": "/usr/bin:/bin"}
         assert body["preserve_env"] is True
 
     def test_preserve_env_flag(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(preserve_env=True)
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["preserve_env"] is True
 
     def test_preserve_env_with_per_run_env(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(env=["FOO=bar"], preserve_env=True)
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["env"] == {"FOO": "bar"}
         assert body["preserve_env"] is True
 
@@ -982,26 +1042,21 @@ class TestEnvParsing:
         session_store.set_env("PATH", "/usr/bin")
         new_img = "00000000-0000-0000-0000-000000000099"
 
-        # First run: preserve env
+        # First run: preserve env. Mocks for both runs are queued up
+        # front (outcome queues pop in FIFO order across invocations).
         args1 = _default_args(preserve_env=True)
-        responses1 = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=new_img),
-        ]
-        _run_cmd(contree_client, args1, responses1, store=session_store)
-
-        # Clear recorded requests for second run
-        contree_client.fake.requests.clear()
-
-        # Second run: same env, should skip sending it
-        args2 = _default_args()
-        responses2 = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args2, responses2, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args1, mocks, store=session_store)
+
+        # Second run: same env, should skip sending it
+        args2 = _default_args()
+        _run_cmd(contree_client, args2, [], store=session_store)
+        body = spawn_payload(contree_client, index=1)
         assert "env" not in body
 
     def test_preserved_env_resent_after_rollback(self, contree_client, session_store):
@@ -1010,29 +1065,23 @@ class TestEnvParsing:
         session_store.set_env("PATH", "/usr/bin")
         new_img = "00000000-0000-0000-0000-000000000099"
 
-        # Run with preserve
+        # Run with preserve (mocks for both runs queued up front)
         args1 = _default_args(preserve_env=True)
-        responses1 = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=new_img),
+            _spawn_response(),
+            _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args1, responses1, store=session_store)
+        _run_cmd(contree_client, args1, mocks, store=session_store)
 
         # Rollback to original image (no preserved env)
         session_store.rollback(1)
 
-        # Clear recorded requests for next run
-        contree_client.fake.requests.clear()
-
         # Run again: env must be sent because original image has no preserved env
         args2 = _default_args()
-        responses2 = [
-            _spawn_response(),
-            _op_response(status="SUCCESS", exit_code=0),
-        ]
-        _run_cmd(contree_client, args2, responses2, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args2, [], store=session_store)
+        body = spawn_payload(contree_client, index=1)
         assert body["env"] == {"PATH": "/usr/bin"}
 
 
@@ -1046,13 +1095,12 @@ class TestShellMode:
             command_args=["echo", "hello", "world"],
             shell=True,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["command"] == "echo hello world"
         assert body["shell"] is True
         assert "args" not in body
@@ -1063,13 +1111,12 @@ class TestShellMode:
             command_args=["echo", "hello", "world"],
             shell=False,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["command"] == "echo"
         assert body["args"] == ["hello", "world"]
         assert body["shell"] is False
@@ -1085,13 +1132,12 @@ class TestShellMode:
             command_args=["python3", "-c", "print('hello world')"],
             shell=False,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["command"] == "python3"
         assert body["args"] == ["-c", "print('hello world')"]
 
@@ -1101,13 +1147,12 @@ class TestShellMode:
             command_args=["python3", "-c", "print('hello world')"],
             shell=True,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         # shlex.join must round-trip back through shlex.split to the
         # original argv when the remote shell parses the command.
         import shlex
@@ -1126,13 +1171,12 @@ class TestShellMode:
             command_args=["ls", "-la", "/etc"],
             shell=True,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["command"] == "ls -la /etc"
 
     def test_shell_passes_single_expression_verbatim(
@@ -1149,13 +1193,12 @@ class TestShellMode:
             command_args=["echo 1 ; echo 2"],
             shell=True,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["command"] == "echo 1 ; echo 2"
         assert body["shell"] is True
 
@@ -1173,14 +1216,13 @@ class TestStdinHandling:
         monkeypatch.setattr(select, "select", lambda *args, **kwargs: ([], [], []))
 
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store, stdin_mock=fake)
+        _run_cmd(contree_client, args, mocks, store=session_store, stdin_mock=fake)
         # ensure request sent without stdin field
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        body = spawn_payload(contree_client)
         assert "stdin" not in body
 
     def test_reads_ready_stdin(self, contree_client, session_store, monkeypatch):
@@ -1192,13 +1234,12 @@ class TestStdinHandling:
         monkeypatch.setattr(select, "select", lambda *args, **kwargs: ([0], [], []))
 
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store, stdin_mock=fake)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store, stdin_mock=fake)
+        body = spawn_payload(contree_client)
         assert "stdin" in body
         assert body["stdin"]["value"]
 
@@ -1208,11 +1249,11 @@ class TestSessionUpdate:
         """On SUCCESS with new image, session is updated."""
         session_store.set_image(IMG_UUID, kind="use")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         assert session_store.current_image == IMG_NEW
         s = session_store.session
         assert s is not None
@@ -1224,11 +1265,11 @@ class TestSessionUpdate:
         """Disposable runs create disposable branch without changing image."""
         session_store.set_image(IMG_UUID, kind="use")
         args = _default_args(disposable=True)
-        responses = [
+        mocks = [
             _spawn_response("op-dispose"),
             _op_response("op-dispose", status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         assert session_store.current_image == IMG_UUID
         branches = dict(session_store.list_branches())
         assert "disposable-op-dispose" in branches
@@ -1239,8 +1280,12 @@ class TestSessionUpdate:
     ) -> None:
         session_store.set_image(IMG_UUID, kind="use")
         args = _default_args(disposable=True, detach=True)
-        responses = [_spawn_response("op-dispose-det")]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(
+            contree_client,
+            args,
+            [_spawn_response("op-dispose-det")],
+            store=session_store,
+        )
         branches = dict(session_store.list_branches())
         assert "disposable-op-dispose-det" in branches
         assert branches["disposable-op-dispose-det"] is False
@@ -1249,22 +1294,22 @@ class TestSessionUpdate:
         """Disposable runs do not update the session image."""
         session_store.set_image(IMG_UUID, kind="use")
         args = _default_args(disposable=True)
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         assert session_store.current_image == IMG_UUID
 
     def test_failed_does_not_update_session(self, contree_client, session_store):
         """Failed runs do not update the session image."""
         session_store.set_image(IMG_UUID, kind="use")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
-            _op_response(status="FAILED", error="timeout"),
+            _op_response(status="FAILED", exit_code=None, error="timeout"),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         assert session_store.current_image == IMG_UUID
 
 
@@ -1276,11 +1321,11 @@ class TestOperationCaching:
         """Completed run caches the operation so `show` skips the API."""
         session_store.set_image(IMG_UUID, kind="use")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response("op-cached"),
             _op_response("op-cached", status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         cached = session_store.cache.get(("op-cached", "operation"))
         assert cached is not None
         assert cached["status"] == "SUCCESS"
@@ -1289,21 +1334,22 @@ class TestOperationCaching:
         """Failed runs also cache the terminal operation."""
         session_store.set_image(IMG_UUID, kind="use")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response("op-fail"),
-            _op_response("op-fail", status="FAILED", error="boom"),
+            _op_response("op-fail", status="FAILED", exit_code=None, error="boom"),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         cached = session_store.cache.get(("op-fail", "operation"))
         assert cached is not None
         assert cached["status"] == "FAILED"
 
     def test_detach_does_not_cache(self, contree_client, session_store):
-        """Detached runs exit before terminal state — nothing to cache."""
+        """Detached runs exit before terminal state, nothing to cache."""
         session_store.set_image(IMG_UUID, kind="use")
         args = _default_args(detach=True)
-        responses = [_spawn_response("op-detach")]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(
+            contree_client, args, [_spawn_response("op-detach")], store=session_store
+        )
         assert session_store.cache.get(("op-detach", "operation")) is None
 
 
@@ -1321,13 +1367,12 @@ class TestPendingFileInclusion:
         )
         session_store.add_pending_file(hid, "/app/config.ini", "pf-uuid-1")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert "/app/config.ini" in body["files"]
         assert body["files"]["/app/config.ini"]["uuid"] == "pf-uuid-1"
 
@@ -1353,14 +1398,13 @@ class TestPendingFileInclusion:
             mode=0o644,
         )
         args = _default_args(file=[mf])
-        responses = [
-            _api_response({"uuid": "explicit-uuid"}),  # GET dedup hit
+        mocks = [
+            file_info_response("explicit-uuid"),  # GET dedup hit
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(1)  # after GET dedup
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         # Explicit file should win
         assert body["files"]["/app/data.txt"]["uuid"] == "explicit-uuid"
 
@@ -1373,23 +1417,19 @@ class TestPendingFileInclusion:
             title="Change file /a.txt",
         )
         session_store.add_pending_file(hid, "/a.txt", "pf-uuid")
-        # First run -- includes pending file
+        # First run -- includes pending file. Mocks for both runs are
+        # queued up front (FIFO outcome queues, sticky tail).
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
-        ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        # Clear recorded requests before second run
-        contree_client.fake.requests.clear()
-        # Second run -- pending file should NOT be included (last entry is run)
-        responses2 = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW2),
         ]
-        _run_cmd(contree_client, args, responses2, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        # Second run -- pending file should NOT be included (last entry is run)
+        _run_cmd(contree_client, args, [], store=session_store)
+        body = spawn_payload(contree_client, index=1)
         assert "files" not in body
 
     def test_reappears_after_rollback(self, contree_client, session_store):
@@ -1401,27 +1441,22 @@ class TestPendingFileInclusion:
             title="Change file /a.txt",
         )
         session_store.add_pending_file(hid, "/a.txt", "pf-uuid")
-        # Run -- bakes the file in
+        # Run -- bakes the file in (mocks for both runs queued up front)
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
+            _spawn_response(),
+            _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW2),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         assert session_store.pending_files() == []
         # Rollback past the run
         session_store.rollback(1)
         assert len(session_store.pending_files()) == 1
-        # Clear recorded requests before next run
-        contree_client.fake.requests.clear()
         # Next run should include the pending file again
-        responses2 = [
-            _spawn_response(),
-            _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW2),
-        ]
-        _run_cmd(contree_client, args, responses2, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, [], store=session_store)
+        body = spawn_payload(contree_client, index=1)
         assert "/a.txt" in body["files"]
 
 
@@ -1440,7 +1475,7 @@ class TestStdinPassthrough:
         """Piped stdin is included in payload as base64 StreamRepr."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
@@ -1448,46 +1483,45 @@ class TestStdinPassthrough:
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             stdin_mock=self._piped_stdin(stdin_content),
         )
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        body = spawn_payload(contree_client)
         assert "stdin" in body
-        assert body["stdin"]["encoding"] == "base64"
-        assert base64.b64decode(body["stdin"]["value"]) == stdin_content
+        # Printable payloads travel verbatim; the encoding rule lives
+        # in StreamRepr.from_bytes.
+        assert body["stdin"]["encoding"] == "ascii"
+        assert StreamRepr.from_dict(body["stdin"]).as_bytes() == stdin_content
 
     def test_stdin_tty_not_included(self, contree_client, session_store):
         """When stdin is a TTY, no stdin key in payload."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert "stdin" not in body
 
     def test_stdin_empty_not_included(self, contree_client, session_store):
         """Piped but empty stdin does not add stdin key."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             stdin_mock=self._piped_stdin(b""),
         )
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        body = spawn_payload(contree_client)
         assert "stdin" not in body
 
 
@@ -1504,20 +1538,17 @@ class TestInterpreterMode:
             command_args=[str(script)],
             interpreter=True,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 0
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        body = spawn_payload(contree_client)
         assert body["command"] == "/bin/sh"
         assert body["shell"] is True
         assert body["args"] == ["-s"]
-        assert body["stdin"]["encoding"] == "base64"
-        decoded = base64.b64decode(body["stdin"]["value"])
-        assert decoded == b"echo hello\n"
+        assert StreamRepr.from_dict(body["stdin"]).as_bytes() == b"echo hello\n"
 
     def test_extra_args(self, contree_client, session_store, tmp_path):
         """Extra args after script path are passed as -s -- args."""
@@ -1528,13 +1559,12 @@ class TestInterpreterMode:
             command_args=[str(script), "arg1", "arg2"],
             interpreter=True,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["command"] == "/bin/sh"
         assert body["args"] == ["-s", "--", "arg1", "arg2"]
 
@@ -1544,13 +1574,12 @@ class TestInterpreterMode:
         script.write_text("#!/usr/bin/env -S contree run -I\necho hello\n")
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args(command_args=[str(script)])
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
+        _run_cmd(contree_client, args, mocks, store=session_store)
+        body = spawn_payload(contree_client)
         assert body["command"] == str(script)
         assert "stdin" not in body
 
@@ -1563,7 +1592,7 @@ class TestInterpreterMode:
             command_args=[str(script)],
             interpreter=True,
         )
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0),
         ]
@@ -1573,14 +1602,13 @@ class TestInterpreterMode:
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             stdin_mock=piped,
         )
-        spawn_req = contree_client.get_request(0)
-        body = json.loads(spawn_req.body)
-        decoded = base64.b64decode(body["stdin"]["value"])
-        assert decoded == b"echo from script\n"
+        body = spawn_payload(contree_client)
+        stdin = StreamRepr.from_dict(body["stdin"])
+        assert stdin.as_bytes() == b"echo from script\n"
 
 
 # ── Escape sequence sanitization ─────────────────────────────────────
@@ -1593,7 +1621,7 @@ class TestEscapeSanitization:
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         colored = "\033[1;32mgreen\033[0m normal"
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(
                 status="SUCCESS",
@@ -1604,7 +1632,7 @@ class TestEscapeSanitization:
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             formatter=DefaultFormatter(),
         )
@@ -1615,7 +1643,7 @@ class TestEscapeSanitization:
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         raw = "\033[2;5Htext\033[Aup\033[Bdown\033[10Gcol"
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(
                 status="SUCCESS",
@@ -1626,7 +1654,7 @@ class TestEscapeSanitization:
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             formatter=DefaultFormatter(),
         )
@@ -1639,7 +1667,7 @@ class TestEscapeSanitization:
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         raw = "\033[?1049hhtop output\033[?1049l"
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(
                 status="SUCCESS",
@@ -1650,7 +1678,7 @@ class TestEscapeSanitization:
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             formatter=DefaultFormatter(),
         )
@@ -1663,7 +1691,7 @@ class TestEscapeSanitization:
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         raw = "\033[2Jcontent\033[K"
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(
                 status="SUCCESS",
@@ -1674,7 +1702,7 @@ class TestEscapeSanitization:
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             formatter=DefaultFormatter(),
         )
@@ -1687,7 +1715,7 @@ class TestEscapeSanitization:
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         raw = "\033[?25lerror msg\033[?25h"
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(
                 status="SUCCESS",
@@ -1698,7 +1726,7 @@ class TestEscapeSanitization:
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             formatter=DefaultFormatter(),
         )
@@ -1711,7 +1739,7 @@ class TestEscapeSanitization:
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         raw = "\033[2Jcontent"
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(
                 status="SUCCESS",
@@ -1722,7 +1750,7 @@ class TestEscapeSanitization:
         _run_cmd(
             contree_client,
             args,
-            responses,
+            mocks,
             store=session_store,
             formatter=JSONFormatter(),
         )
@@ -1930,9 +1958,15 @@ class TestDetachPendingOps:
         """Multiple detach runs append to cache."""
         session_store.set_image(IMG_UUID, kind="test")
         args1 = _default_args(detach=True)
-        _run_cmd(contree_client, args1, [_spawn_response("op-1")], store=session_store)
+        # Queue both spawn outcomes up front (FIFO with sticky tail)
+        _run_cmd(
+            contree_client,
+            args1,
+            [_spawn_response("op-1"), _spawn_response("op-2")],
+            store=session_store,
+        )
         args2 = _default_args(detach=True)
-        _run_cmd(contree_client, args2, [_spawn_response("op-2")], store=session_store)
+        _run_cmd(contree_client, args2, [], store=session_store)
         pending_key = ("", f"ops:{session_store.session_key}")
         cached = session_store.cache.get(pending_key)
         assert isinstance(cached, list)
@@ -1958,38 +1992,37 @@ class TestUseFlag:
     def test_use_resolves_tag_and_runs(self, contree_client, session_store):
         """--use resolves a tag, sets session image, then runs."""
         args = _default_args(use="tag:ubuntu:latest")
-        responses = [
-            _api_response({"images": [{"uuid": IMG_UUID}]}),
+        mocks = [
+            tag_lookup(IMG_UUID),
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 0
         assert session_store.current_image == IMG_NEW
 
     def test_use_with_uuid(self, contree_client, session_store):
         """--use with a UUID skips tag resolution."""
         args = _default_args(use=IMG_SOME)
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 0
-        req0 = contree_client.get_request(0)
-        assert req0.method == "POST"
-        body = json.loads(req0.body)
+        assert contree_client.calls_for("inspect_find_image_by_tag") == []
+        body = spawn_payload(contree_client)
         assert body["image"] == IMG_SOME
 
     def test_use_works_without_existing_session(self, contree_client, session_store):
         """--use creates a session even when none exists."""
         assert session_store.session is None
         args = _default_args(use=IMG_UUID)
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        rc = _run_cmd(contree_client, args, responses, store=session_store)
+        rc = _run_cmd(contree_client, args, mocks, store=session_store)
         assert rc == 0
         assert session_store.session is not None
         assert session_store.current_image == IMG_NEW
@@ -1997,7 +2030,7 @@ class TestUseFlag:
     def test_use_disposable(self, contree_client, session_store):
         """--use + --disposable sets session to use-image, run doesn't advance."""
         args = _default_args(use=IMG_UUID, disposable=True)
-        responses = [
+        mocks = [
             _spawn_response("op-use-disp"),
             _op_response(
                 "op-use-disp",
@@ -2006,18 +2039,18 @@ class TestUseFlag:
                 image=IMG_NEW,
             ),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         assert session_store.current_image == IMG_UUID
 
     def test_use_creates_history_entry(self, contree_client, session_store):
         """--use creates a 'use' kind history entry before the run."""
         args = _default_args(use="tag:myimage")
-        responses = [
-            _api_response({"images": [{"uuid": IMG_UUID}]}),
+        mocks = [
+            tag_lookup(IMG_UUID),
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         s = session_store.session
         assert s is not None
         assert s.last_kind == "run"
@@ -2029,421 +2062,365 @@ class TestUseFlag:
     ):
         """--use with no command args still switches session image."""
         args = RunArgs(use=IMG_UUID)
-        responses = [
+        mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
-        _run_cmd(contree_client, args, responses, store=session_store)
+        _run_cmd(contree_client, args, mocks, store=session_store)
         assert session_store.session is not None
 
 
 # ---------------------------------------------------------------------------
-# SSE streaming (`_stream_events_until_close` and `_build_op_from_summary`)
+# SSE streaming (`stream_events_until_close` and `build_op_from_summary`)
 # ---------------------------------------------------------------------------
 
 
-class _SSEResponse:
-    """Minimal HTTPResponse-shaped object backed by an in-memory buffer.
-
-    `_stream_events_until_close` only touches `.readline()` (via
-    `iter_sse_events`) and `.close()`; nothing else is needed.
-    """
-
-    def __init__(self, body: bytes | str) -> None:
-        payload = body.encode("utf-8") if isinstance(body, str) else body
-        self.buf = io.BytesIO(payload)
-        self.closed = False
-
-    def readline(self, size: int = -1) -> bytes:
-        return self.buf.readline()
-
-    def close(self) -> None:
-        self.closed = True
+EVENT_TS = "2026-01-01T00:00:00.000000+00:00"
 
 
-class _JSONResponse:
-    """Minimal HTTPResponse-shape for the streamer's between-attempt
-    ``GET /operations/{uuid}`` terminal check.  Only ``.read()`` and
-    ``.close()`` are used."""
-
-    def __init__(self, payload: dict) -> None:
-        self.payload = json.dumps(payload).encode("utf-8")
-        self.closed = False
-
-    def read(self, size: int = -1) -> bytes:
-        return self.payload
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _StubStreamClient:
-    """Stand-in for `ContreeClient` that queues responses for both the
-    SSE `follow=1` endpoint and the between-attempt terminal-status
-    GET.
-
-    `responses` feeds `GET /events?follow=1` calls.  `get_responses`
-    feeds `GET /operations/{uuid}` terminal checks; when it's empty
-    the stub falls back to a non-terminal op (`status=EXECUTING`) so
-    tests that don't care about the check don't have to prime it.
-
-    A queued item may be an `_SSEResponse` / `_JSONResponse` (served
-    as-is), an `Exception` subclass or instance (raised), or `None`
-    (equivalent to an empty response).  All calls are recorded so
-    tests can inspect them via `.calls`, `.sse_calls`, `.get_calls`.
-    """
-
-    NON_TERMINAL: ClassVar[dict[str, str]] = {"status": "EXECUTING"}
-
-    def __init__(
-        self,
-        responses: list,
-        get_responses: list | None = None,
-    ) -> None:
-        self.responses = list(responses)
-        self.get_responses = list(get_responses or [])
-        self.calls: list[tuple[str, str, dict[str, str] | None]] = []
-
-    @property
-    def sse_calls(self) -> list[tuple[str, str, dict[str, str] | None]]:
-        return [c for c in self.calls if "/events" in c[1]]
-
-    @property
-    def get_calls(self) -> list[tuple[str, str, dict[str, str] | None]]:
-        return [c for c in self.calls if "/events" not in c[1]]
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        headers: dict[str, str] | None = None,
-        **_: object,
-    ):
-        self.calls.append((method, path, headers))
-        is_sse = "/events" in path
-        if is_sse:
-            item = self.responses.pop(0)
-        elif self.get_responses:
-            item = self.get_responses.pop(0)
-        else:
-            return _JSONResponse(self.NON_TERMINAL)
-        if isinstance(item, type) and issubclass(item, BaseException):
-            raise item("stub")
-        if isinstance(item, BaseException):
-            raise item
-        if item is None:
-            return _SSEResponse(b"") if is_sse else _JSONResponse(self.NON_TERMINAL)
-        return item
+def full_resources() -> dict:
+    """The complete per-process resource usage block every real `exit`
+    event carries (all counters are required by the API schema)."""
+    counters = (
+        "user_time_us",
+        "sys_time_us",
+        "max_rss_kb",
+        "shared_memory",
+        "unshared_memory",
+        "swaps",
+        "minor_faults",
+        "major_faults",
+        "voluntary_ctx_switches",
+        "involuntary_ctx_switches",
+        "block_input_ops",
+        "block_output_ops",
+        "ipc_msgs_sent",
+        "ipc_msgs_received",
+        "signals_received",
+    )
+    return dict.fromkeys(counters, 0)
 
 
-def _frame(*, id: int, event: str, data: dict | str) -> str:
-    """Build one SSE frame. Mirrors the API contract by embedding `id`
-    inside the JSON `data:` payload as well as the SSE `id:` line
-    (the CLI reads the id from the JSON, not the SSE header)."""
-    if isinstance(data, dict) and "id" not in data:
-        data = {"id": id, **data}
-    data_str = data if isinstance(data, str) else json.dumps(data)
-    return f"id: {id}\nevent: {event}\ndata: {data_str}\n\n"
+def exit_data(code: int = 0, *, timed_out: bool = False, signal: int = -1) -> dict:
+    """Full `exit` event payload as the API emits it."""
+    return {
+        "pid": 4242,
+        "code": code,
+        "signal": signal,
+        "timed_out": timed_out,
+        "duration_ms": 1500,
+        "resources": full_resources(),
+    }
+
+
+def completion_data(status: str = "SUCCESS", **overrides) -> dict:
+    """Full `completion` event payload as the API emits it."""
+    data: dict = {
+        "status": status,
+        "duration_ms": 1500,
+        "result_image_uuid": IMG_NEW,
+        "error": None,
+        "image_size_bytes": 4096,
+    }
+    data.update(overrides)
+    return data
+
+
+def make_event(
+    event_type: str,
+    data: dict,
+    *,
+    event_id: int = 1,
+    spid: int | None = None,
+) -> OperationEvent:
+    """Build a typed OperationEvent the way the SSE decoder does:
+    payloads matching the schema become models, sparse payloads stay
+    raw dicts."""
+    payload: dict = {"id": event_id, "ts": EVENT_TS, "type": event_type, "data": data}
+    if spid is not None:
+        payload["spid"] = spid
+    return OperationEvent.from_dict(payload)
+
+
+def stream_event(
+    kind: str,
+    value: str,
+    *,
+    event_id: int = 1,
+    encoding: str = "ascii",
+) -> OperationEvent:
+    """A stdout/stderr chunk event for the main process (spid=1)."""
+    return make_event(
+        kind,
+        {"value": value, "encoding": encoding},
+        event_id=event_id,
+        spid=1,
+    )
+
+
+def completion_event(
+    status: str = "SUCCESS", *, event_id: int = 2, **overrides
+) -> OperationEvent:
+    return make_event(
+        "completion", completion_data(status, **overrides), event_id=event_id
+    )
+
+
+def executing_response(uuid: str = "op-1") -> OperationResponse:
+    """A non-terminal GET /v1/operations/{uuid} snapshot."""
+    return OperationResponse.from_dict({"uuid": uuid, "status": "EXECUTING"})
 
 
 class TestStreamEventsUntilClose:
-    def test_url_uses_follow_1(self, session_store):
-        """Verifies the endpoint spelling matches the OpenAPI spec (`?follow=1`)."""
-        completion = _frame(
-            id=1,
-            event="completion",
-            data={"type": "completion", "data": {"status": "SUCCESS"}},
-        )
-        client = _StubStreamClient([_SSEResponse(completion)])
-        _stream_events_until_close(client, "op-1", DefaultFormatter())
-        assert client.calls[0][0] == "GET"
-        assert client.calls[0][1] == "/v1/operations/op-1/events?follow=1"
+    def test_stream_opened_with_follow(self):
+        """The streamer subscribes with follow=True so the server keeps
+        the stream open for a running operation."""
+        tc = ContreeTestClient()
+        tc.mock("iter_operation_events", [completion_event()])
+        stream_events_until_close(tc, "op-1", DefaultFormatter())
+        call = tc.calls_for("iter_operation_events")[0]
+        assert call.args == ("op-1",)
+        assert call.kwargs["follow"] is True
 
-    def test_first_call_has_no_last_event_id_header(self, session_store):
-        client = _StubStreamClient(
-            [
-                _SSEResponse(
-                    _frame(
-                        id=1,
-                        event="completion",
-                        data={"type": "completion", "data": {}},
-                    )
-                )
-            ]
-        )
-        _stream_events_until_close(client, "op-x", DefaultFormatter())
-        assert client.calls[0][2] is None
+    def test_first_call_has_no_last_event_id(self):
+        """The first subscribe passes last_event_id=None (nothing to
+        resume from)."""
+        tc = ContreeTestClient()
+        tc.mock("iter_operation_events", [completion_event()])
+        stream_events_until_close(tc, "op-x", DefaultFormatter())
+        call = tc.calls_for("iter_operation_events")[0]
+        assert call.kwargs["last_event_id"] is None
 
     def test_stdout_streamed_live_for_default_formatter(self, capsys):
-        chunk = _frame(
-            id=1,
-            event="stdout",
-            data={
-                "type": "stdout",
-                "spid": 1,
-                "data": {"value": "hello", "encoding": "ascii"},
-            },
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [stream_event("stdout", "hello", event_id=1), completion_event()],
         )
-        completion = _frame(
-            id=2,
-            event="completion",
-            data={"type": "completion", "data": {"status": "SUCCESS"}},
-        )
-        client = _StubStreamClient([_SSEResponse(chunk + completion)])
-        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         out = capsys.readouterr()
         assert out.out == "hello"
         assert bytes(summary.stdout) == b"hello"
 
     def test_stderr_streamed_live_for_default_formatter(self, capsys):
-        chunk = _frame(
-            id=1,
-            event="stderr",
-            data={
-                "type": "stderr",
-                "spid": 1,
-                "data": {"value": "oops\n", "encoding": "ascii"},
-            },
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [
+                stream_event("stderr", "oops\n", event_id=1),
+                completion_event("FAILED", error="boom", result_image_uuid=None),
+            ],
         )
-        completion = _frame(
-            id=2,
-            event="completion",
-            data={"type": "completion", "data": {"status": "FAILED"}},
-        )
-        client = _StubStreamClient([_SSEResponse(chunk + completion)])
-        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         out = capsys.readouterr()
         assert out.err == "oops\n"
         assert bytes(summary.stderr) == b"oops\n"
 
     def test_json_formatter_accumulates_without_printing(self, capsys):
-        chunk = _frame(
-            id=1,
-            event="stdout",
-            data={
-                "type": "stdout",
-                "spid": 1,
-                "data": {"value": "hi", "encoding": "ascii"},
-            },
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [stream_event("stdout", "hi", event_id=1), completion_event()],
         )
-        completion = _frame(
-            id=2,
-            event="completion",
-            data={"type": "completion", "data": {"status": "SUCCESS"}},
-        )
-        client = _StubStreamClient([_SSEResponse(chunk + completion)])
-        summary = _stream_events_until_close(client, "op-1", JSONFormatter())
+        summary = stream_events_until_close(tc, "op-1", JSONFormatter())
         out = capsys.readouterr()
         assert out.out == ""
         assert bytes(summary.stdout) == b"hi"
 
     def test_base64_chunk_decoded(self, capsys):
         payload = base64.b64encode(b"\x00\xff bin").decode("ascii")
-        chunk = _frame(
-            id=1,
-            event="stdout",
-            data={
-                "type": "stdout",
-                "spid": 1,
-                "data": {"value": payload, "encoding": "base64"},
-            },
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [
+                stream_event("stdout", payload, event_id=1, encoding="base64"),
+                completion_event(),
+            ],
         )
-        completion = _frame(
-            id=2,
-            event="completion",
-            data={"type": "completion", "data": {"status": "SUCCESS"}},
-        )
-        client = _StubStreamClient([_SSEResponse(chunk + completion)])
-        summary = _stream_events_until_close(client, "op-1", JSONFormatter())
+        summary = stream_events_until_close(tc, "op-1", JSONFormatter())
         assert bytes(summary.stdout) == b"\x00\xff bin"
 
     def test_exit_event_for_spid_1_stored(self):
-        exit_frame = _frame(
-            id=1,
-            event="exit",
-            data={"type": "exit", "spid": 1, "data": {"code": 0, "timed_out": False}},
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [
+                make_event("exit", exit_data(0), event_id=1, spid=1),
+                completion_event(),
+            ],
         )
-        completion = _frame(
-            id=2,
-            event="completion",
-            data={"type": "completion", "data": {"status": "SUCCESS"}},
-        )
-        client = _StubStreamClient([_SSEResponse(exit_frame + completion)])
-        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         assert summary.exit_event is not None
-        assert summary.exit_event["data"]["code"] == 0
+        assert summary.exit_event.data.code == 0
 
     def test_exit_event_for_non_main_spid_ignored(self):
         """Only spid=1 drives CLI exit code; child spid exits stay unrecorded."""
-        exit_frame = _frame(
-            id=1,
-            event="exit",
-            data={"type": "exit", "spid": 2, "data": {"code": 3, "timed_out": False}},
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [
+                make_event("exit", exit_data(3), event_id=1, spid=2),
+                completion_event(),
+            ],
         )
-        completion = _frame(
-            id=2,
-            event="completion",
-            data={"type": "completion", "data": {"status": "SUCCESS"}},
-        )
-        client = _StubStreamClient([_SSEResponse(exit_frame + completion)])
-        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         assert summary.exit_event is None
 
-    def test_completion_frame_breaks_loop(self):
-        completion = _frame(
-            id=1,
-            event="completion",
-            data={"type": "completion", "data": {"status": "SUCCESS"}},
-        )
-        client = _StubStreamClient([_SSEResponse(completion)])
-        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+    def test_completion_event_breaks_loop(self):
+        tc = ContreeTestClient()
+        tc.mock("iter_operation_events", [completion_event(event_id=1)])
+        summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         assert summary.completion is not None
-        assert summary.completion["data"]["status"] == "SUCCESS"
+        assert summary.completion.data.status == "SUCCESS"
+        assert len(tc.calls_for("iter_operation_events")) == 1
 
     def test_stream_ends_without_completion_falls_back_to_terminal_get(self):
-        """SSE closes cleanly without a `completion` frame — the
+        """SSE closes cleanly without a `completion` event: the
         between-attempt GET check detects the op is terminal and parks
         it on `summary.fallback_op` so the caller doesn't need to GET
         again."""
-        op = {"uuid": "op-1", "status": "SUCCESS", "result": {"image": None}}
-        client = _StubStreamClient(
-            [_SSEResponse(b"")], get_responses=[_JSONResponse(op)]
+        tc = ContreeTestClient()
+        tc.mock("iter_operation_events", [])
+        op = OperationResponse.from_dict(
+            {"uuid": "op-1", "status": "SUCCESS", "result": {"image": None}}
         )
-        summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        tc.mock("get_operation_status", op)
+        summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         assert summary.completion is None
-        assert summary.fallback_op == op
+        assert summary.fallback_op == op.to_dict()
         assert bytes(summary.stdout) == b""
 
     def test_sse_connect_errors_then_terminal_via_get(self):
         """SSE keeps failing to connect while the op runs; once the
         between-attempt GET reports terminal status the streamer
         stops retrying and returns without ever seeing a completion
-        frame."""
-        op = {"uuid": "op-1", "status": "SUCCESS"}
-        client = _StubStreamClient(
-            [ApiError(500, "srv", "boom")] * 3,
-            get_responses=[
-                _JSONResponse({"status": "EXECUTING"}),
-                _JSONResponse({"status": "EXECUTING"}),
-                _JSONResponse(op),
-            ],
+        event."""
+        tc = ContreeTestClient()
+        tc.mock("iter_operation_events", error=ContreeAPIError(502, "boom"))
+        tc.mock("get_operation_status", executing_response())
+        tc.mock("get_operation_status", executing_response())
+        tc.mock(
+            "get_operation_status",
+            OperationResponse.from_dict({"uuid": "op-1", "status": "SUCCESS"}),
         )
-        with patch("contree_cli.cli.run.time.sleep"):
-            summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        # Reconnect sleeps happen inside the library's
+        # follow_operation_events loop.
+        with patch("contree_client.base.time.sleep"):
+            summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         assert summary.completion is None
-        assert summary.fallback_op == op
-        assert len(client.sse_calls) == 3
-        assert len(client.get_calls) == 3
+        assert summary.fallback_op == {"uuid": "op-1", "status": "SUCCESS"}
+        assert len(tc.calls_for("iter_operation_events")) == 3
+        # Three terminal probes inside the library loop plus one final
+        # fetch of the terminal payload for fallback_op.
+        assert len(tc.calls_for("get_operation_status")) == 4
 
-    def test_sse_error_frame_triggers_reconnect_with_last_event_id(self):
-        first = (
-            _frame(
-                id=1,
-                event="stdout",
-                data={
-                    "type": "stdout",
-                    "spid": 1,
-                    "data": {"value": "a", "encoding": "ascii"},
-                },
-            )
-            + "event: sse_error\ndata: boom\n\n"
+    def test_sse_error_triggers_reconnect_with_last_event_id(self):
+        """A mid-stream server error (SSEStreamError after some events)
+        makes the streamer reconnect, resuming from the last received
+        event id."""
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [stream_event("stdout", "a", event_id=1)],
+            error=SSEStreamError("boom", last_event_id=1),
         )
-        completion = _frame(
-            id=2,
-            event="completion",
-            data={"type": "completion", "data": {"status": "SUCCESS"}},
-        )
-        client = _StubStreamClient([_SSEResponse(first), _SSEResponse(completion)])
-        with patch("contree_cli.cli.run.time.sleep"):
-            summary = _stream_events_until_close(client, "op-1", DefaultFormatter())
+        tc.mock("iter_operation_events", [completion_event(event_id=2)])
+        # The op is still running when the terminal check fires between
+        # the two attempts.
+        tc.mock("get_operation_status", executing_response())
+        summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         assert summary.completion is not None
-        assert len(client.sse_calls) == 2
-        assert client.sse_calls[1][2] == {"Last-Event-Id": "1"}
+        calls = tc.calls_for("iter_operation_events")
+        assert len(calls) == 2
+        assert calls[0].kwargs["last_event_id"] is None
+        assert calls[1].kwargs["last_event_id"] == 1
+
+    def test_retry_after_honored_on_api_error(self):
+        """A 425/410-style ContreeAPIError with retry_after sleeps for
+        exactly that delay before reconnecting."""
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            error=ContreeAPIError(425, "too early", retry_after=7),
+        )
+        tc.mock("iter_operation_events", [completion_event()])
+        tc.mock("get_operation_status", executing_response())
+        with patch("contree_cli.cli.run.time.sleep") as sleep_mock:
+            summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
+        assert summary.completion is not None
+        assert sleep_mock.call_args_list[0].args == (7,)
 
     def test_broken_pipe_from_stdout_propagates(self, monkeypatch):
         """`BrokenPipeError` from local stdio write must propagate
-        unchanged — retrying can't fix a closed local pipe and it
+        unchanged: retrying can't fix a closed local pipe and it
         would be misinterpreted as a remote network error otherwise."""
-        chunk = _frame(
-            id=1,
-            event="stdout",
-            data={
-                "type": "stdout",
-                "spid": 1,
-                "data": {"value": "hi", "encoding": "ascii"},
-            },
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [stream_event("stdout", "hi", event_id=1)],
         )
-        client = _StubStreamClient([_SSEResponse(chunk)])
 
-        def raise_broken_pipe(*_args: object, **_kw: object) -> int:
+        def raise_broken_pipe(*args: object, **kw: object) -> int:
             raise BrokenPipeError
 
         monkeypatch.setattr("sys.stdout.buffer.write", raise_broken_pipe)
         with pytest.raises(BrokenPipeError):
-            _stream_events_until_close(client, "op-1", DefaultFormatter())
+            stream_events_until_close(tc, "op-1", DefaultFormatter())
         # Only the initial SSE attempt is made; no retry, no terminal-check
         # GET (BrokenPipeError bypasses the retry path entirely).
-        assert len(client.sse_calls) == 1
-        assert len(client.get_calls) == 0
+        assert len(tc.calls_for("iter_operation_events")) == 1
+        assert tc.calls_for("get_operation_status") == []
 
 
 class TestBuildOpFromSummary:
-    def _completion(self, **overrides) -> dict:
-        base = {
-            "type": "completion",
-            "data": {
-                "status": "SUCCESS",
-                "error": None,
-                "duration_ms": 1500,
-                "image_size_bytes": 4096,
-                "result_image_uuid": IMG_NEW,
-            },
-        }
-        base["data"].update(overrides)
-        return base
+    def _completion(self, **overrides) -> OperationEvent:
+        return make_event("completion", completion_data(**overrides))
 
     def test_shape_carries_status_and_uuid(self):
         summary = TerminalSummary(completion=self._completion())
-        op = _build_op_from_summary("op-1", summary)
+        op = build_op_from_summary("op-1", summary)
         assert op["uuid"] == "op-1"
         assert op["kind"] == "instance"
         assert op["status"] == "SUCCESS"
 
     def test_duration_ms_converted_to_seconds(self):
         summary = TerminalSummary(completion=self._completion(duration_ms=2500))
-        op = _build_op_from_summary("op-1", summary)
+        op = build_op_from_summary("op-1", summary)
         assert op["duration"] == 2.5
 
     def test_duration_missing_falls_back_to_zero(self):
+        """A completion payload that doesn't match the schema is kept
+        as a raw dict by the decoder; missing duration_ms then falls
+        back to zero."""
         summary = TerminalSummary(
-            completion={"type": "completion", "data": {"status": "SUCCESS"}}
+            completion=make_event("completion", {"status": "SUCCESS"})
         )
-        op = _build_op_from_summary("op-1", summary)
+        op = build_op_from_summary("op-1", summary)
         assert op["duration"] == 0.0
 
     def test_result_image_uuid_propagates(self):
         summary = TerminalSummary(completion=self._completion())
-        op = _build_op_from_summary("op-1", summary)
+        op = build_op_from_summary("op-1", summary)
         assert op["result_image_uuid"] == IMG_NEW
         assert op["result"] == {"image": IMG_NEW, "tag": None}
 
     def test_exit_event_drives_state(self):
         summary = TerminalSummary(
             completion=self._completion(),
-            exit_event={
-                "type": "exit",
-                "spid": 1,
-                "data": {"code": 42, "timed_out": True},
-            },
+            exit_event=make_event(
+                "exit",
+                exit_data(42, timed_out=True),
+                event_id=2,
+                spid=1,
+            ),
         )
-        op = _build_op_from_summary("op-1", summary)
+        op = build_op_from_summary("op-1", summary)
         state = op["metadata"]["result"]["state"]
         assert state == {"exit_code": 42, "timed_out": True}
 
     def test_state_is_none_without_exit_event(self):
         summary = TerminalSummary(completion=self._completion())
-        op = _build_op_from_summary("op-1", summary)
+        op = build_op_from_summary("op-1", summary)
         assert op["metadata"]["result"]["state"] is None
 
     def test_stdout_stderr_reassembled_from_bytearrays(self):
@@ -2452,7 +2429,7 @@ class TestBuildOpFromSummary:
             stdout=bytearray(b"hello\n"),
             stderr=bytearray(b"warn\n"),
         )
-        op = _build_op_from_summary("op-1", summary)
+        op = build_op_from_summary("op-1", summary)
         result = op["metadata"]["result"]
         assert result["stdout"]["value"] == "hello\n"
         assert result["stderr"]["value"] == "warn\n"
@@ -2460,8 +2437,10 @@ class TestBuildOpFromSummary:
 
     def test_error_field_passthrough(self):
         summary = TerminalSummary(
-            completion=self._completion(status="FAILED", error="boom")
+            completion=self._completion(
+                status="FAILED", error="boom", result_image_uuid=None
+            )
         )
-        op = _build_op_from_summary("op-1", summary)
+        op = build_op_from_summary("op-1", summary)
         assert op["status"] == "FAILED"
         assert op["error"] == "boom"

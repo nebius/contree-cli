@@ -18,6 +18,7 @@ Agent protocol — follow this sequence for every task:
 4. Inspect first (read-only):
      contree ls /path
      contree cat /path/file
+     contree export /path -F subtree.tar.gz
      contree images --prefix=...
      contree session show
 
@@ -104,7 +105,7 @@ Listing:
   contree images --prefix=python         filter by tag prefix
   contree images -a                      include untagged
   contree images --since 1d              last 24 hours
-  contree -f json images                 JSON output for scripting
+  contree -o json images                 JSON output for scripting
 
 Tagging:
   contree tag my-app:v1.0                tag current session image
@@ -145,7 +146,7 @@ Building from a Dockerfile:
 
   .dockerignore is applied to every COPY/ADD walk on top of the default exclude list (.git, __pycache__, node_modules, etc.).
 
-  build runs in its own session keyed by abspath(CONTEXT) (visible as "session": "build:<hash>" in -f json output). `-S <agent_key>` on `build` is harmless but does not bind the build to your agent session. Verify the resulting image from a normal session:
+  build runs in its own session keyed by abspath(CONTEXT) (visible as "session": "build:<hash>" in -o json output). `-S <agent_key>` on `build` is harmless but does not bind the build to your agent session. Verify the resulting image from a normal session:
     contree build . --tag myapp:dev
     contree -S agent_verify use tag:myapp:dev
     contree -S agent_verify run -D -- myapp --version
@@ -188,7 +189,7 @@ Listing uploaded files:
   contree file ls                 list all uploaded files in the project
   contree file ls --since 1d      narrow by upload time
   contree file ls -q              uuid + sha256 + source only (quiet)
-  contree -f json file ls         JSON output for jq
+  contree -o json file ls         JSON output for jq
 
   Output joins remote files (uuid, sha256, size, created_at) with the local upload cache. The SOURCE column shows whatever this machine used to produce the file:
     - absolute host path for files uploaded via `run --file` / `COPY`;
@@ -243,7 +244,7 @@ Detached mode (-d):
   contree session wait                        block until done + advance branch
   contree session wait UUID1 UUID2            poll only (NO branch advance)
 
-  NOTE: status filtering uses --status, NOT -S. `-S` is the global session flag and only works BEFORE the subcommand. Also, the default `run -d` output is plain/table -- use `contree -f json run -d ...` to capture the UUID via `jq -r .uuid` reliably.
+  NOTE: status filtering uses --status, NOT -S. `-S` is the global session flag and only works BEFORE the subcommand. Also, the default `run -d` output is plain/table -- use `contree -o json run -d ...` to capture the UUID via `jq -r .uuid` reliably.
 
 Operation references (UUID_OR_REF):
   Every positional that `--help` labels `UUID_OR_REF` -- `op show`, `op cancel`, `op wait`, top-level `show`/`kill`, and `session wait` -- accepts either a real operation UUID OR a session-history reference. References are resolved against the active session (the one selected by `-S <key>`) before the API is called, so the same notation works everywhere.
@@ -281,24 +282,24 @@ Monitoring background operations:
 
   Default `op ls`/`ps` lists only `EXECUTING`; `PENDING` and `ASSIGNED` are hidden until `-a` or an explicit `--status`. For a full active snapshot, fetch with `-a` and filter client-side.
 
-  `op wait` is a pure observer: polls and prints one operation record per completion. Default formatter pins uuid, status, exit_code, timed_out, duration first and error last; every other scalar API field appears between them, so column count is not fixed. For scripts use `-f json` (one object per line) or `-f tsv` and select fields explicitly. `status` is the server's word verbatim (orchestration outcome — did the API run the job?); the sandbox process's exit code lives in the separate `exit_code` column. The CLI exit code is 1 when any op finishes non-SUCCESS, or the actual `exit_code` when a SUCCESS op had a non-zero sandbox exit (so `op wait && next-step` still composes naturally with `run -- false`). --timeout (default 60s) caps the wait. Use --all to wait for every currently active op in the project.
+  `op wait` is a pure observer: polls and prints one operation record per completion. Default formatter pins uuid, status, exit_code, timed_out, duration first and error last; every other scalar API field appears between them, so column count is not fixed. For scripts use `-o json` (one object per line) or `-o tsv` and select fields explicitly. `status` is the server's word verbatim (orchestration outcome — did the API run the job?); the sandbox process's exit code lives in the separate `exit_code` column. The CLI exit code is 1 when any op finishes non-SUCCESS, or the actual `exit_code` when a SUCCESS op had a non-zero sandbox exit (so `op wait && next-step` still composes naturally with `run -- false`). --timeout (default 60s) caps the wait. Use --all to wait for every currently active op in the project.
 
   Rule of thumb -- use `op wait` ONLY outside session context: `op wait` is the right tool when the UUIDs came from somewhere else (different session, different agent, `images import`, raw API call) and you only need "is it done yet?". For ops you spawned in *this* session, use `session wait` (no-arg form) instead -- it polls AND advances the active branch to each result image, which `op wait` will not do.
 
   Caveat 1 -- `op wait` does NOT advance session state: each `run -d` (non-disposable) creates a `detached-<op-uuid>` branch pointing at the START image. `op wait` does not move those branches to the result image; the result lives only on the server. After fan-out + wait the session looks the same as before the wait, just with `detached-*` branches accumulated.
 
   PREFERRED fan-out (--disposable, no image-tracking concerns):
-    A=$(contree -S <key> -f json run -d --disposable -- pytest tests/a | jq -r .uuid)
-    B=$(contree -S <key> -f json run -d --disposable -- pytest tests/b | jq -r .uuid)
-    C=$(contree -S <key> -f json run -d --disposable -- pytest tests/c | jq -r .uuid)
+    A=$(contree -S <key> -o json run -d --disposable -- pytest tests/a | jq -r .uuid)
+    B=$(contree -S <key> -o json run -d --disposable -- pytest tests/b | jq -r .uuid)
+    C=$(contree -S <key> -o json run -d --disposable -- pytest tests/c | jq -r .uuid)
     contree -S <key> op wait "$A" "$B" "$C"     block until all complete
     contree -S <key> op show "$A" "$B" "$C"     stdout/stderr per op
 
   Non-disposable fan-out (must recover images manually):
-    A=$(contree -S <key> -f json run -d -- apt-get install -y curl | jq -r .uuid)
-    B=$(contree -S <key> -f json run -d -- apt-get install -y wget | jq -r .uuid)
+    A=$(contree -S <key> -o json run -d -- apt-get install -y curl | jq -r .uuid)
+    B=$(contree -S <key> -o json run -d -- apt-get install -y wget | jq -r .uuid)
     contree -S <key> op wait "$A" "$B"
-    IMG_A=$(contree -f json op show "$A" | jq -r .image)
+    IMG_A=$(contree -o json op show "$A" | jq -r .image)
     contree use "$IMG_A"                    bind chosen result back
 
   Caveat 2 -- `op wait --all` is project-wide: if another agent (or another shell of yours) is running concurrently in the same project, your --all will block on its ops too. The result is still a valid wait, just possibly not over the set you expected. For session-spawned fan-out the correct alternative is `contree -S <key> session wait` (no args): it drains only this session's pending detached ops and advances the active branch with each result image. Reach for `op wait --all` only when you really want a project-wide observer (admin/cleanup tooling).
@@ -362,10 +363,10 @@ Rules for reliable agent workflows:
 3. Why split? Chained runs collapse into one checkpoint. If `make test` fails, you can't rollback to just after `apt install`. Split runs give you granular rollback.
 
 4. Global flags (-f, -S, -p) MUST come before the subcommand:
-   Right:  contree -S key -f json images
-   Wrong:  contree images -S key -f json
+   Right:  contree -S key -o json images
+   Wrong:  contree images -S key -o json
 
-5. Use -f json for structured output in automation: `contree -f json images | jq '.uuid'`.
+5. Use -o json for structured output in automation: `contree -o json images | jq '.uuid'`.
 
 6. Agents must never run `contree auth`. Only users manage auth.
 
@@ -378,23 +379,23 @@ Rules for reliable agent workflows:
 Output formats
 ==============
 
-Global -f flag goes before the subcommand. Always available formats:
+Global -o flag goes before the subcommand. Always available formats:
 
-  contree -f json images           one JSON object per line (JSONL)
-  contree -f json-pretty ps        pretty-printed JSON array
-  contree -f csv images            CSV with header row
-  contree -f tsv ps                tab-separated values
-  contree -f plain images          key: value blocks
+  contree -o json images           one JSON object per line (JSONL)
+  contree -o json-pretty ps        pretty-printed JSON array
+  contree -o csv images            CSV with header row
+  contree -o tsv ps                tab-separated values
+  contree -o plain images          key: value blocks
 
-`-f toml` is available only on Python 3.11+ (it relies on stdlib `tomllib`). On Python 3.10 it is silently absent from --help.
+`-o toml` is available only on Python 3.11+ (it relies on stdlib `tomllib`). On Python 3.10 it is silently absent from --help.
 
 Scripting examples:
-  contree -f json images --prefix=python | jq -r '.uuid'
-  contree -f json ps -a | jq 'select(.status=="SUCCESS")'
-  contree -f csv images > images.csv
+  contree -o json images --prefix=python | jq -r '.uuid'
+  contree -o json ps -a | jq 'select(.status=="SUCCESS")'
+  contree -o csv images > images.csv
   contree ps -q | xargs contree show
 
-Note: `run` with default formatter prints raw stdout/stderr. Use -f json to get structured operation metadata instead.
+Note: `run` with default formatter prints raw stdout/stderr. Use -o json to get structured operation metadata instead.
 
 Profiles
 ========
@@ -450,6 +451,7 @@ All commands
   ls [PATH]               List files in image (no VM)
   cat PATH                Show file content (no VM)
   cp PATH DEST            Download file from image
+  export [PATH]           Export rootfs or a subtree as tar.gz (-F FILE or pipe; --decompress for plain tar)
   cd [PATH]               Change session working directory
   env [KEY=VALUE ...]     Session env vars (-U to unset)
   file edit PATH          Edit remote file via $EDITOR

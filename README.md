@@ -1,7 +1,6 @@
 # contree-cli
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#zero-dependencies)
 [![PyPI](https://img.shields.io/pypi/v/contree-cli.svg)](https://pypi.org/project/contree-cli/)
 
 Command-line client for the [ConTree](https://contree.dev) sandboxing platform — secure, VM-isolated sandboxes with git-like branching for AI agents and developers.
@@ -11,8 +10,9 @@ eval $(contree use tag:ubuntu:latest)   # pick a base image for current session
 contree run apt-get update -qq          # each run snapshots the result
 contree run apt-get install -y curl     # builds on the previous snapshot
 contree session branch experiment       # branch the sandbox state
+contree session checkout experiment     # switch to the branch
 contree run -- make test                # experiment freely
-contree session checkout main           # switch back instantly
+contree session checkout main           # switch back
 contree session rollback -- -2          # or rewind two steps
 ```
 
@@ -26,8 +26,6 @@ contree session rollback -- -2          # or rewind two steps
 - **Instant rollback** — backtrack to any previous checkpoint without rebuilding from scratch
 - **Safe code execution** — run untrusted or LLM-generated code inside VM-level isolation; crashes and side effects stay in the sandbox
 - **Session continuity** — rewind and resume long-running agent workflows with full filesystem context preserved
-
-`contree-cli` talks to the ConTree API. Install it, authenticate with your project token, and create sandboxes, run commands, inspect filesystems, and manage sessions — all from your terminal, shell scripts, or agent toolchains.
 
 ## Install
 
@@ -62,7 +60,7 @@ Verify:
 contree --help
 ```
 
-**Requirements:** Python 3.10+ and nothing else. Zero external dependencies — stdlib only.
+**Requirements:** Python 3.10+.
 
 ## Quick Start
 
@@ -82,7 +80,7 @@ If `--token`/`--url`/`--project` flags are omitted, `contree auth` reads `CONTRE
 contree skill install
 ```
 
-Autodetects installed agents (Claude Code, Codex, OpenCode, Cline, Amp) and installs ConTree skill files into their skill directories. Use `contree skill install -F` to force-overwrite.
+Autodetects installed agents (Claude Code, Codex, OpenCode, Cline, Amp) and installs ConTree skill files into their skill directories. Use `contree skill install -f` to force-overwrite.
 
 ### 3. Start a session
 
@@ -114,7 +112,8 @@ contree cp /app/output.log . # download to local machine
 
 ```bash
 contree session branch experiment     # create a branch
-contree run -- make test              # experiment on it
+contree session checkout experiment   # switch to it
+contree run -- make test              # experiment on the branch
 contree session checkout main         # switch back
 contree session rollback              # undo last run (default: back 1 entry)
 ```
@@ -234,7 +233,7 @@ main:  A ── B ── C ── D
 experiment:        E ── F
 ```
 
-Every `run` creates a checkpoint. Branch to explore alternatives. Roll back to any point. Switch branches instantly.
+Every non-disposable `run` creates a checkpoint in the session history.
 
 ```bash
 contree session                       # show current state
@@ -247,14 +246,14 @@ contree session use other-session     # import image from another session
 
 ## Output Formats
 
-All commands support structured output via `-f`/`--format`:
+All commands support structured output via `-o`/`--format`/`--output`:
 
 ```bash
-contree images -f json                # JSON (one object per line)
-contree images -f json-pretty         # pretty-printed JSON array
-contree ps -f csv                     # RFC 4180 CSV
-contree ps -f tsv                     # tab-separated values
-contree ls -f table                   # ASCII table
+contree -o json images                # JSON (one object per line)
+contree -o json-pretty images         # pretty-printed JSON array
+contree -o csv ps                     # RFC 4180 CSV
+contree -o tsv ps                     # tab-separated values
+contree -o table ls                   # ASCII table
 ```
 
 Pipe JSON output into `jq`, feed CSV into spreadsheets, or parse programmatically in your agent toolchain.
@@ -283,7 +282,7 @@ contree auth --profile=staging        # save staging token
 contree auth --profile=prod           # save production token
 contree auth profiles                 # list all profiles + status probe
 contree auth profiles --offline       # list profiles without network checks
-contree -f json auth profiles         # structured profile health output
+contree -o json auth profiles         # structured profile health output
 contree auth switch staging           # switch active profile
 ```
 
@@ -308,9 +307,9 @@ Read only by `contree auth` (registration-time fallbacks for omitted flags):
 
 Credentials come strictly from the saved profile at runtime. `--token`, `--url`, `--project` CLI flags override profile fields for a single invocation.
 
-## Zero Dependencies
+## Dependencies
 
-`contree-cli` uses only the Python standard library. No `requests`, no `click`, no `rich` — just `http.client`, `argparse`, `json`, `sqlite3`, and friends. It runs anywhere Python 3.10+ is available with nothing to install beyond the package itself.
+`contree-cli` has a single runtime dependency: the `contree-client` library, which provides the HTTP transport and typed API bindings.
 
 ## Development
 
@@ -327,7 +326,7 @@ make check      # lint + types
 make tests      # lint + types + pytest
 ```
 
-The project enforces strict mypy, ruff linting (E/F/W/I/UP/B/SIM/RUF rules), and full test coverage across 23+ test modules.
+The project enforces strict mypy and ruff linting (E/F/W/I/UP/B/SIM/RUF rules).
 
 ## Documentation
 

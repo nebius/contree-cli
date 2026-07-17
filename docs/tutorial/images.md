@@ -66,7 +66,7 @@ contree tag UUID common/python-ml/python:3.11-slim
 Remove a tag:
 
 ```bash
-contree tag -d UUID my-app:v1.0
+contree tag -U UUID my-app:v1.0
 ```
 
 ### Tag rules

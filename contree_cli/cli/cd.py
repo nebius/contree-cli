@@ -10,13 +10,13 @@ The path is validated against the image filesystem via the inspect API.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import posixpath
 from dataclasses import dataclass
 
+from contree_client.exceptions import ContreeAPIError
+
 from contree_cli import CLIENT, SESSION_STORE, ArgumentsProtocol, SetupResult
-from contree_cli.client import ApiError, resolve_image
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +62,9 @@ def cmd_cd(args: CdArgs) -> int | None:
     if session is not None:
         try:
             client = CLIENT.get()
-            uuid = resolve_image(client, session.current_image)
-            resp = client.get(f"/v1/inspect/{uuid}/list", params={"path": new_cwd})
-            data = json.loads(resp.read())
-            if not data:
-                logger.error("cd: %s: not a directory", new_cwd)
-                return 1
-        except ApiError as exc:
+            uuid = client.resolve_image(session.current_image)
+            client.inspect_image_list(uuid, new_cwd)
+        except ContreeAPIError as exc:
             if exc.status == 404:
                 logger.error("cd: %s: no such directory", new_cwd)
                 return 1

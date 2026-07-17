@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 from contextvars import copy_context
 from dataclasses import replace
@@ -9,6 +8,8 @@ from unittest.mock import patch
 
 import pytest
 from conftest import ContreeTestClient
+from contree_client.exceptions import ContreeAPIError, NotFoundError
+from contree_client.models import File, FileResponse, FilesListResponse
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.cli.file import (
@@ -20,43 +21,56 @@ from contree_cli.cli.file import (
     cmd_file_edit,
     cmd_file_ls,
 )
-from contree_cli.client import ApiError
 from contree_cli.output import JSONFormatter
 from contree_cli.session import SessionStore
 
 
-class StreamResponse:
-    """Response that supports chunked reading for stream_response()."""
-
-    def __init__(self, data: bytes, *, status: int = 200):
-        self.status = status
-        self.reason = "OK" if status < 300 else "Error"
-        self._buf = io.BytesIO(data)
-
-    def read(self, amt: int | None = None) -> bytes:
-        return self._buf.read(amt)
-
-    def getheader(self, name: str, default: str | None = None) -> str | None:
-        return default
-
-    def getheaders(self) -> list[tuple[str, str]]:
-        return []
+def file_payload(uuid: str, *, sha256: str = "0" * 64, size: int = 1) -> dict:
+    """Full ``File`` payload as returned by GET /v1/files/{sha256}."""
+    return {
+        "uuid": uuid,
+        "sha256": sha256,
+        "size": size,
+        "created_at": "2026-05-01T00:00:00Z",
+        "updated_at": "2026-05-01T00:00:00Z",
+    }
 
 
-def _api_response(body: bytes | dict, *, status: int = 200) -> StreamResponse:
-    data = json.dumps(body).encode() if isinstance(body, dict) else body
-    return StreamResponse(data, status=status)
+def make_file(uuid: str, *, sha256: str = "0" * 64, size: int = 1) -> File:
+    return File.from_dict(file_payload(uuid, sha256=sha256, size=size))
+
+
+def mock_download(tc: ContreeTestClient, content: bytes | None) -> None:
+    """Mock the image file download stream; None means 404 (no file)."""
+    if content is None:
+        tc.mock(
+            "inspect_image_download_stream",
+            error=NotFoundError(404, "not found"),
+        )
+    else:
+        tc.mock("inspect_image_download_stream", [content])
+
+
+def mock_dedup_miss(tc: ContreeTestClient) -> None:
+    tc.mock("get_file", error=NotFoundError(404, "not found"))
+
+
+def mock_dedup_hit(tc: ContreeTestClient, uuid: str) -> None:
+    tc.mock("get_file", make_file(uuid))
+
+
+def mock_upload(tc: ContreeTestClient, uuid: str) -> None:
+    tc.mock("upload_file", FileResponse(uuid=uuid, sha256="0" * 64, size=1))
 
 
 def _run_file_edit(
     tc: ContreeTestClient,
     args: FileEditArgs,
-    responses: list[StreamResponse],
     *,
     store: SessionStore,
     editor_content: bytes | None = None,
-) -> tuple[int | None]:
-    """Drive ``cmd_file_edit`` with mocked editor + HTTP responses.
+) -> int | None:
+    """Drive ``cmd_file_edit`` with a mocked editor.
 
     The editor mock writes ``editor_content`` directly to the file
     inside the temp dir created by ``cmd_file_edit``. This sidesteps
@@ -64,8 +78,6 @@ def _run_file_edit(
     when paths contain backslashes.
     """
     import tempfile
-
-    tc.fake.responses.extend(responses)
 
     if not args.editor:
         args = replace(args, editor="fake-editor")
@@ -101,11 +113,11 @@ def _run_file_edit(
 def _run_file_ls(
     tc: ContreeTestClient,
     args: FileListArgs,
-    responses: list[StreamResponse],
+    files: list[dict],
     *,
     store: SessionStore,
 ) -> int | None:
-    tc.fake.responses.extend(responses)
+    tc.mock("list_files", FilesListResponse.from_dict({"files": files}))
     CLIENT.set(tc)
     SESSION_STORE.set(store)
     FORMATTER.set(JSONFormatter())
@@ -123,21 +135,15 @@ class TestFileLs:
             "uuid": "file-3",
             "url": "https://example.com/pkg.tgz",
         }
-        responses = [
-            _api_response(
-                {
-                    "files": [
-                        {"uuid": "file-1", "sha256": "abc", "size": 10},
-                        {"uuid": "file-2", "sha256": "def", "size": 20},
-                        {"uuid": "file-3", "sha256": "ghi", "size": 30},
-                    ]
-                }
-            ),
+        files = [
+            file_payload("file-1", sha256="a" * 64, size=10),
+            file_payload("file-2", sha256="d" * 64, size=20),
+            file_payload("file-3", sha256="e" * 64, size=30),
         ]
         rc = _run_file_ls(
             contree_client,
             FileListArgs(limit=10),
-            responses,
+            files,
             store=session_store,
         )
         assert rc is None
@@ -151,24 +157,11 @@ class TestFileLs:
             "uuid": "file-1",
             "local_path": "/host/app.py",
         }
-        responses = [
-            _api_response(
-                {
-                    "files": [
-                        {
-                            "uuid": "file-1",
-                            "sha256": "abc",
-                            "size": 10,
-                            "created_at": "2026-05-01T00:00:00Z",
-                        },
-                    ]
-                }
-            ),
-        ]
+        files = [file_payload("file-1", sha256="a" * 64, size=10)]
         _run_file_ls(
             contree_client,
             FileListArgs(limit=10, quiet=True),
-            responses,
+            files,
             store=session_store,
         )
         row = json.loads(capsys.readouterr().out.strip())
@@ -194,14 +187,12 @@ class TestFileEditDownload:
     def test_downloads_existing_file(self, contree_client, session_store: SessionStore):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/etc/config.ini")
-        download_resp = _api_response(b"original content")
-        dedup_miss = _api_response({"error": "not found"}, status=404)
-        upload_resp = _api_response({"uuid": "file-uuid-1"}, status=201)
-        responses = [download_resp, dedup_miss, upload_resp]
+        mock_download(contree_client, b"original content")
+        mock_dedup_miss(contree_client)
+        mock_upload(contree_client, "file-uuid-1")
         rc = _run_file_edit(
             contree_client,
             args,
-            responses,
             store=session_store,
             editor_content=b"modified content",
         )
@@ -215,14 +206,12 @@ class TestFileEditDownload:
     def test_creates_empty_on_404(self, contree_client, session_store: SessionStore):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/new/file.txt")
-        not_found = _api_response({"error": "not found"}, status=404)
-        dedup_miss = _api_response({"error": "not found"}, status=404)
-        upload_resp = _api_response({"uuid": "file-uuid-2"}, status=201)
-        responses = [not_found, dedup_miss, upload_resp]
+        mock_download(contree_client, None)
+        mock_dedup_miss(contree_client)
+        mock_upload(contree_client, "file-uuid-2")
         rc = _run_file_edit(
             contree_client,
             args,
-            responses,
             store=session_store,
             editor_content=b"new file content",
         )
@@ -236,11 +225,12 @@ class TestFileEditDownload:
     ):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/etc/config.ini")
-        # 403 is non-retryable, so the caller sees it on the first hit
-        # without any retries or sleep.
-        responses = [_api_response({"error": "forbidden"}, status=403)]
-        with pytest.raises(ApiError) as exc_info:
-            _run_file_edit(contree_client, args, responses, store=session_store)
+        contree_client.mock(
+            "inspect_image_download_stream",
+            error=ContreeAPIError(403, "forbidden"),
+        )
+        with pytest.raises(ContreeAPIError) as exc_info:
+            _run_file_edit(contree_client, args, store=session_store)
         assert exc_info.value.status == 403
 
 
@@ -248,19 +238,17 @@ class TestFileEditNoChanges:
     def test_no_changes_skips_upload(self, contree_client, session_store: SessionStore):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/etc/config.ini")
-        download_resp = _api_response(b"same content")
-        responses = [download_resp]
+        mock_download(contree_client, b"same content")
         # editor_content=None means editor doesn't modify the file
         rc = _run_file_edit(
             contree_client,
             args,
-            responses,
             store=session_store,
             editor_content=None,
         )
         assert rc is None
-        # No HTTP calls beyond the download
-        assert contree_client.request_count == 1
+        # No API calls beyond the download
+        assert len(contree_client.calls) == 1
         # No pending files
         assert session_store.pending_files() == []
 
@@ -269,31 +257,27 @@ class TestFileEditDedup:
     def test_dedup_hit_skips_upload(self, contree_client, session_store: SessionStore):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/etc/config.ini")
-        download_resp = _api_response(b"original")
-        dedup_hit = _api_response({"uuid": "existing-uuid"})
-        responses = [download_resp, dedup_hit]
+        mock_download(contree_client, b"original")
+        mock_dedup_hit(contree_client, "existing-uuid")
         rc = _run_file_edit(
             contree_client,
             args,
-            responses,
             store=session_store,
             editor_content=b"modified",
         )
         assert rc is None
         files = session_store.pending_files()
         assert files[0].file_uuid == "existing-uuid"
-        # Only 2 HTTP calls: download + dedup check (no POST upload)
-        assert contree_client.request_count == 2
+        # Only 2 API calls: download + dedup check (no upload)
+        assert len(contree_client.calls) == 2
+        assert contree_client.calls_for("upload_file") == []
 
 
 class TestFileEditEditorFailure:
     def test_editor_nonzero_exit(self, contree_client, session_store: SessionStore):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/etc/config.ini")
-        download_resp = _api_response(b"content")
-
-        tc = contree_client
-        tc.fake.responses.append(download_resp)
+        mock_download(contree_client, b"content")
 
         SESSION_STORE.set(session_store)
         ctx = copy_context()
@@ -312,9 +296,9 @@ class TestFileEditEditorFlag:
     ):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/etc/config.ini", editor="nvim")
-        download_resp = _api_response(b"original")
-        dedup_miss = _api_response({"error": "not found"}, status=404)
-        upload_resp = _api_response({"uuid": "file-uuid-e"}, status=201)
+        mock_download(contree_client, b"original")
+        mock_dedup_miss(contree_client)
+        mock_upload(contree_client, "file-uuid-e")
 
         called_with: list[str] = []
 
@@ -326,8 +310,6 @@ class TestFileEditEditorFlag:
             Path(parts[1]).write_bytes(b"modified")
             return 0
 
-        tc = contree_client
-        tc.fake.responses.extend([download_resp, dedup_miss, upload_resp])
         SESSION_STORE.set(session_store)
         ctx = copy_context()
 
@@ -341,14 +323,12 @@ class TestFileEditHistoryEntry:
     def test_history_entry_created(self, contree_client, session_store: SessionStore):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileEditArgs(path="/etc/config.ini")
-        download_resp = _api_response(b"original")
-        dedup_miss = _api_response({"error": "not found"}, status=404)
-        upload_resp = _api_response({"uuid": "file-uuid"}, status=201)
-        responses = [download_resp, dedup_miss, upload_resp]
+        mock_download(contree_client, b"original")
+        mock_dedup_miss(contree_client)
+        mock_upload(contree_client, "file-uuid")
         _run_file_edit(
             contree_client,
             args,
-            responses,
             store=session_store,
             editor_content=b"modified",
         )
@@ -364,12 +344,9 @@ class TestFileEditHistoryEntry:
 def _run_file_cp(
     tc: ContreeTestClient,
     args: FileCpArgs,
-    responses: list[StreamResponse],
     *,
     store: SessionStore,
 ) -> int | None:
-    tc.fake.responses.extend(responses)
-
     SESSION_STORE.set(store)
     ctx = copy_context()
 
@@ -388,14 +365,9 @@ class TestFileCp:
         src = tmp_path / "app.py"
         src.write_bytes(b"print('hello')")
         args = FileCpArgs(src=str(src), dest="/app/app.py")
-        dedup_miss = _api_response({"error": "not found"}, status=404)
-        upload_resp = _api_response({"uuid": "file-uuid-cp"}, status=201)
-        rc = _run_file_cp(
-            contree_client,
-            args,
-            [dedup_miss, upload_resp],
-            store=session_store,
-        )
+        mock_dedup_miss(contree_client)
+        mock_upload(contree_client, "file-uuid-cp")
+        rc = _run_file_cp(contree_client, args, store=session_store)
         assert rc is None
         files = session_store.pending_files()
         assert len(files) == 1
@@ -412,18 +384,14 @@ class TestFileCp:
         src = tmp_path / "app.py"
         src.write_bytes(b"print('hello')")
         args = FileCpArgs(src=str(src), dest="/app/app.py")
-        dedup_hit = _api_response({"uuid": "existing-uuid"})
-        rc = _run_file_cp(
-            contree_client,
-            args,
-            [dedup_hit],
-            store=session_store,
-        )
+        mock_dedup_hit(contree_client, "existing-uuid")
+        rc = _run_file_cp(contree_client, args, store=session_store)
         assert rc is None
         files = session_store.pending_files()
         assert files[0].file_uuid == "existing-uuid"
-        # Only 1 HTTP call: dedup check (no POST upload)
-        assert contree_client.request_count == 1
+        # Only 1 API call: dedup check (no upload)
+        assert len(contree_client.calls) == 1
+        assert contree_client.calls_for("upload_file") == []
 
     def test_cp_missing_file_returns_error(
         self,
@@ -432,7 +400,7 @@ class TestFileCp:
     ):
         session_store.set_image("a1b2c3d4-5678-9abc-def0-111111111111", kind="use")
         args = FileCpArgs(src="/nonexistent/file.py", dest="/app/file.py")
-        rc = _run_file_cp(contree_client, args, [], store=session_store)
+        rc = _run_file_cp(contree_client, args, store=session_store)
         assert rc == 1
         assert session_store.pending_files() == []
 
@@ -446,14 +414,9 @@ class TestFileCp:
         src = tmp_path / "data.txt"
         src.write_bytes(b"data")
         args = FileCpArgs(src=str(src), dest="/opt/data.txt")
-        dedup_miss = _api_response({"error": "not found"}, status=404)
-        upload_resp = _api_response({"uuid": "file-uuid"}, status=201)
-        _run_file_cp(
-            contree_client,
-            args,
-            [dedup_miss, upload_resp],
-            store=session_store,
-        )
+        mock_dedup_miss(contree_client)
+        mock_upload(contree_client, "file-uuid")
+        _run_file_cp(contree_client, args, store=session_store)
         s = session_store.session
         assert s is not None
         assert s.last_kind == "file"

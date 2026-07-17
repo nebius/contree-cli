@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import logging
 import shlex
 import subprocess
@@ -26,6 +25,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from contree_client.exceptions import NotFoundError
+
 from contree_cli import (
     CLIENT,
     FORMATTER,
@@ -33,18 +34,11 @@ from contree_cli import (
     ArgumentsProtocol,
     SetupResult,
 )
-from contree_cli.client import (
-    ApiError,
-    ContreeClient,
-    PaginatedFetcher,
-    resolve_image,
-    stream_response,
-)
+from contree_cli.client import CliClient
 from contree_cli.config import EDITOR
-from contree_cli.session import CONTREE_CONCURRENCY, SessionStore
+from contree_cli.session import SessionStore
 from contree_cli.types import (
     FLAGS,
-    isoformat_datetime,
     parse_interval,
     positive_int,
 )
@@ -79,8 +73,8 @@ class FileCpArgs(ArgumentsProtocol):
         return cls(src=ns.src, dest=ns.dest)
 
 
+PAGE_SIZE = 1000
 FILE_LIST_LIMIT_DEFAULT = 1000
-FILE_LIST_PAGE_SIZE = PaginatedFetcher.DEFAULT_PAGE_SIZE
 
 
 @dataclass(frozen=True)
@@ -164,7 +158,7 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
             "  contree file ls --since 1d\n"
             "  contree file ls --limit 5000\n"
             "  contree file ls -q              # uuid + sha256 + source\n"
-            "  contree -f json file ls\n"
+            "  contree -o json file ls\n"
         ),
     )
     ls_p.add_argument(
@@ -205,30 +199,16 @@ def _file_sha256(path: Path) -> str:
 
 
 def _upload_and_record(
-    client: ContreeClient,
+    client: CliClient,
     store: SessionStore,
     local_path: Path,
     instance_path: str,
     title: str,
 ) -> str:
     """Upload a local file (with dedup) and record as pending."""
-    sha = _file_sha256(local_path)
-    try:
-        resp = client.get(f"/v1/files/{sha}")
-        file_uuid = json.loads(resp.read())["uuid"]
-        logger.info("File already exists on server (%s)", file_uuid)
-    except ApiError as exc:
-        if exc.status != 404:
-            raise
-        with open(local_path, "rb") as fh:
-            resp = client.request(
-                "POST",
-                "/v1/files",
-                body=fh,
-                headers={"Content-Type": "application/octet-stream"},
-            )
-            file_uuid = json.loads(resp.read())["uuid"]
-        logger.info("Uploaded %s (%s)", instance_path, file_uuid)
+    with open(local_path, "rb") as fh:
+        file_uuid = client.ensure_file(fh).uuid
+    logger.info("Uploaded %s (%s)", instance_path, file_uuid)
 
     history_id = store.set_image(
         store.current_image,
@@ -247,24 +227,18 @@ def _upload_and_record(
 def cmd_file_edit(args: FileEditArgs) -> int | None:
     client = CLIENT.get()
     store = SESSION_STORE.get()
-    image_uuid = resolve_image(client, store.current_image)
+    image_uuid = client.resolve_image(store.current_image)
 
     # 1. Download to temp file (or create empty)
     tmp_dir = Path(tempfile.mkdtemp(prefix="contree-"))
     filename = Path(args.path).name or "file"
     tmp_file = tmp_dir / filename
     try:
-        resp = client.get(
-            f"/v1/inspect/{image_uuid}/download",
-            params={"path": args.path},
-        )
         with tmp_file.open("wb") as f:
-            for chunk in stream_response(resp):
+            for chunk in client.inspect_image_download_stream(image_uuid, args.path):
                 f.write(chunk)
         logger.info("Downloaded %s to %s", args.path, tmp_file)
-    except ApiError as exc:
-        if exc.status != 404:
-            raise
+    except NotFoundError:
         tmp_file.write_bytes(b"")
         logger.info("File %s not found, creating empty file", args.path)
 
@@ -322,41 +296,35 @@ def cmd_file_ls(args: FileListArgs) -> int | None:
 
     sources = store.cache.local_file_paths()
 
-    params: dict[str, str] = {}
-    if args.since is not None:
-        params["since"] = isoformat_datetime(args.since)
-    if args.until is not None:
-        params["until"] = isoformat_datetime(args.until)
-
-    emitted = 0
     hit_limit = False
-    with PaginatedFetcher(
-        client,
-        "/v1/files",
-        params,
-        lambda body: json.loads(body).get("files", []),
-        limit=args.limit,
-        concurrency=CONTREE_CONCURRENCY,
-    ) as fetcher:
-        for page in fetcher:
-            for entry in page:
-                if emitted >= args.limit:
-                    hit_limit = True
-                    break
-                uuid_str = entry.get("uuid")
-                source = sources.get(uuid_str, "") if isinstance(uuid_str, str) else ""
-                if args.quiet:
-                    formatter(
-                        uuid=uuid_str,
-                        sha256=entry.get("sha256", ""),
-                        source=source,
-                    )
-                else:
-                    formatter(**{**entry, "source": source})
-                emitted += 1
-            formatter.flush()
-            if hit_limit:
-                break
+    # Fetch one extra record past the budget so truncation is
+    # detectable and the warning below can fire.
+    files = client.iter_files(
+        since=args.since,
+        until=args.until,
+        page_size=PAGE_SIZE,
+        limit=args.limit + 1,
+    )
+    for emitted, file in enumerate(files):
+        if emitted >= args.limit:
+            hit_limit = True
+            break
+        entry = file.to_dict()
+        uuid_str = entry.get("uuid")
+        source = sources.get(uuid_str, "") if isinstance(uuid_str, str) else ""
+        if args.quiet:
+            formatter(
+                uuid=uuid_str,
+                sha256=entry.get("sha256", ""),
+                source=source,
+            )
+        else:
+            formatter(**{**entry, "source": source})
+        # Buffering formatters (table) print nothing until the end, so
+        # each consumed page reports progress while the next one loads.
+        if (emitted + 1) % PAGE_SIZE == 0:
+            logger.info("Fetched %d files, loading more...", emitted + 1)
+    formatter.flush()
 
     if hit_limit:
         logger.warning(

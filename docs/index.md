@@ -26,15 +26,21 @@ Built for **AI agents that think ahead**:
   workflows with full filesystem context preserved.
 
 `contree-cli` is the command-line client that talks to the ConTree API.
-Install it, authenticate with your project token, and you can create
-sandboxes, run commands, inspect filesystems, and manage sessions -- all
-from your terminal, shell scripts, or agent toolchains.
 
 ```bash
-eval $(contree use tag:ubuntu:latest)   # pick a base image
-contree run apt update -qq              # each run snapshots the result
-contree run apt install -y curl         # builds on the previous snapshot
-contree ls /usr/bin/curl                # inspect without spawning a VM
+contree use tag:ubuntu:latest      # pick an image for current terminal
+contree run apt update -qq         # each run snapshots the result
+contree run apt install -y curl    # builds on the previous snapshot
+contree ls /usr/bin/curl           # inspect without spawning a VM
+```
+
+You can choose name for session by setting the environment variable
+`CONTREE_SESSION`.
+
+```bash
+export CONTREE_SESSION=demo_session  # Pick a name for session manually
+contree use tag:ubuntu:latest        # pick an image for demo_session
+contree run -- find /root            # run commands
 ```
 
 ## Get started
@@ -88,9 +94,8 @@ JSON, CSV, and TSV output. Detached runs, operation monitoring,
 shebang scripts — built for automation.
 :::
 
-:::{grid-item-card} Zero Dependencies
-Zero external packages. Stdlib-only Python, runs anywhere 3.10+ is
-available.
+:::{grid-item-card} Lightweight
+A single runtime dependency: the `contree-client` library.
 :::
 
 :::{grid-item-card} Multi-Profile

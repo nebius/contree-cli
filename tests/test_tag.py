@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import json
 from contextvars import copy_context
 
 import pytest
 from conftest import ContreeTestClient
+from contree_client.exceptions import ContreeAPIError, NotFoundError
+from contree_client.models import Image
 
 from contree_cli import SESSION_STORE
 from contree_cli.cli.tag import TagArgs, cmd_tag
-from contree_cli.client import ApiError
 from contree_cli.session import SessionStore
 
 IMG_UUID = "a1b2c3d4-5678-9abc-def0-111111111111"
@@ -28,10 +28,12 @@ def _run_cmd(
     tag="latest",
     *,
     delete=False,
-    status=200,
     body=None,
 ):
-    tc.respond_json(body or _DEFAULT_TAG_BODY, status=status)
+    if delete:
+        tc.mock("delete_image_tag", None)
+    else:
+        tc.mock("update_image_tag", Image.from_dict(body or _DEFAULT_TAG_BODY))
     ctx = copy_context()
     args = TagArgs(tag=tag, image_ref=image_ref, delete=delete)
     result = ctx.run(cmd_tag, args)
@@ -39,16 +41,17 @@ def _run_cmd(
 
 
 class TestCmdTag:
-    def test_sends_patch(self, contree_client):
+    def test_sends_update(self, contree_client):
         _run_cmd(contree_client, IMG_UUID, "v1.0")
-        req = contree_client.get_request(0)
-        assert req.method == "PATCH"
-        assert req.path == f"/v1/images/{IMG_UUID}/tag"
+        calls = contree_client.calls_for("update_image_tag")
+        assert len(calls) == 1
+        assert calls[0].args == (IMG_UUID, "v1.0")
 
-    def test_request_body(self, contree_client):
+    def test_request_args(self, contree_client):
         _run_cmd(contree_client, IMG_UUID, "latest")
-        req = contree_client.get_request(0)
-        assert json.loads(req.body) == {"tag": "latest"}
+        call = contree_client.calls_for("update_image_tag")[0]
+        assert call.args == (IMG_UUID, "latest")
+        assert call.kwargs == {}
 
     def test_returns_none_on_success(self, contree_client):
         result = _run_cmd(contree_client)
@@ -60,10 +63,15 @@ class TestCmdTag:
         assert f"Tagged image {IMG_UUID_2} as prod" in caplog.text
 
     def test_not_found_raises(self, contree_client):
-        contree_client.respond(status=404, body=b"image not found")
+        # "bad-uuid" is not a UUID, so it resolves as a tag; the tag
+        # lookup answers 404 for an unknown tag.
+        contree_client.mock(
+            "inspect_find_image_by_tag",
+            error=NotFoundError(404, "no such tag"),
+        )
         ctx = copy_context()
         args = TagArgs(tag="latest", image_ref="bad-uuid")
-        with pytest.raises(ApiError) as exc_info:
+        with pytest.raises(ContreeAPIError) as exc_info:
             ctx.run(cmd_tag, args)
         assert exc_info.value.status == 404
 
@@ -71,9 +79,10 @@ class TestCmdTag:
 class TestCmdTagDelete:
     def test_sends_delete(self, contree_client):
         _run_cmd(contree_client, IMG_UUID, delete=True)
-        req = contree_client.get_request(0)
-        assert req.method == "DELETE"
-        assert req.path == f"/v1/images/{IMG_UUID}/tag?tag=latest"
+        calls = contree_client.calls_for("delete_image_tag")
+        assert len(calls) == 1
+        assert calls[0].args == (IMG_UUID,)
+        assert calls[0].kwargs == {"tag": "latest"}
 
     def test_returns_none_on_success(self, contree_client):
         result = _run_cmd(contree_client, delete=True)
@@ -84,26 +93,38 @@ class TestCmdTagDelete:
             _run_cmd(contree_client, IMG_UUID_3, delete=True)
         assert f"Removed tag 'latest' from image {IMG_UUID_3}" in caplog.text
 
-    def test_delete_includes_tag_in_query(self, contree_client):
+    def test_delete_includes_tag_kwarg(self, contree_client):
         result = _run_cmd(contree_client, IMG_UUID, "mytag", delete=True)
-        req = contree_client.get_request(0)
-        assert req.method == "DELETE"
-        assert req.path == f"/v1/images/{IMG_UUID}/tag?tag=mytag"
+        call = contree_client.calls_for("delete_image_tag")[0]
+        assert call.args == (IMG_UUID,)
+        assert call.kwargs == {"tag": "mytag"}
         assert result is None
+
+    def test_delete_without_image_resolves_tag(self, contree_client):
+        contree_client.mock("inspect_find_image_by_tag", IMG_UUID_2)
+        contree_client.mock("delete_image_tag", None)
+        ctx = copy_context()
+        args = TagArgs(tag="mytag", image_ref=None, delete=True)
+        result = ctx.run(cmd_tag, args)
+        assert result is None
+        resolve = contree_client.calls_for("inspect_find_image_by_tag")
+        assert resolve[0].args == ("mytag",)
+        call = contree_client.calls_for("delete_image_tag")[0]
+        assert call.args == (IMG_UUID_2,)
+        assert call.kwargs == {"tag": "mytag"}
 
 
 class TestCmdTagCurrentImage:
     def test_tags_current_session_image(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="test")
         SESSION_STORE.set(session_store)
-        contree_client.respond_json(_DEFAULT_TAG_BODY)
+        contree_client.mock("update_image_tag", Image.from_dict(_DEFAULT_TAG_BODY))
         ctx = copy_context()
         args = TagArgs(tag="my-tag", image_ref=None)
         result = ctx.run(cmd_tag, args)
         assert result is None
-        req = contree_client.get_request(0)
-        assert req.method == "PATCH"
-        assert req.path == f"/v1/images/{IMG_UUID}/tag"
+        call = contree_client.calls_for("update_image_tag")[0]
+        assert call.args == (IMG_UUID, "my-tag")
 
     def test_no_session_returns_error(self, contree_client, tmp_path):
         store = SessionStore(tmp_path / "empty.db", "no-image")

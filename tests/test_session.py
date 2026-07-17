@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from contree_cli.config import ConfigProfile
+from contree_cli.config import session_db_path
 from contree_cli.session import (
     PendingFile,
     SessionStore,
@@ -426,15 +426,15 @@ class TestGetSessionKey:
 
 class TestGetDbPath:
     def test_default_profile(self):
-        p = ConfigProfile(name="default", url="", token=None)
-        assert p.session_db_path.name == "default.db"
-        assert p.session_db_path.parent.name == "sessions"
-        assert p.session_db_path.parent.parent.name == "cli"
+        path = session_db_path("default")
+        assert path.name == "default.db"
+        assert path.parent.name == "sessions"
+        assert path.parent.parent.name == "cli"
 
     def test_named_profile(self):
-        p = ConfigProfile(name="staging", url="", token=None)
-        assert p.session_db_path.name == "staging.db"
-        assert p.session_db_path.parent.name == "sessions"
+        path = session_db_path("staging")
+        assert path.name == "staging.db"
+        assert path.parent.name == "sessions"
 
 
 class TestPendingFiles:

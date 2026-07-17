@@ -43,7 +43,7 @@ contree show HEAD~        # one step back (shorthand for HEAD~1)
 contree show HEAD~3       # three steps back from the tip
 
 # JSON output for scripting
-contree -f json show 3f2a7b...
+contree -o json show 3f2a7b...
 
 # Show result of a detached run
 contree run -d -- make test
@@ -74,7 +74,7 @@ operation to completion, not whether the sandbox process exited with
 zero. A `SUCCESS` row with `exit_code=1` means "the API completed the
 job; your command returned 1". `error` is pinned to the last column.
 Nested objects (`metadata`, `result`) are dropped from the flat row
-— use `--raw` for the full server payload, or `-f json` to keep the
+— use `--raw` for the full server payload, or `-o json` to keep the
 flat structured row.
 
 Pass `--raw` to skip all of the above and print each operation's

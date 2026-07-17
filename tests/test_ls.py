@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from contextvars import copy_context
 
-from conftest import ContreeTestClient, FakeResponse
+from conftest import ContreeTestClient, make_file_item
+from contree_client.models import DirectoryList
 
 from contree_cli import FORMATTER, SESSION_STORE
 from contree_cli.cli.ls import (
@@ -19,26 +20,8 @@ from contree_cli.output import (
 from contree_cli.session import SessionStore
 
 
-def _make_file(
-    path: str = "/etc/hosts",
-    size: int = 128,
-    mode: int = 0o644,
-    owner: str = "root",
-    group: str = "root",
-    mtime: int = 1700000000,
-    is_dir: bool = False,
-    is_symlink: bool = False,
-) -> dict:
-    return {
-        "path": path,
-        "size": size,
-        "mode": mode,
-        "owner": owner,
-        "group": group,
-        "mtime": mtime,
-        "is_dir": is_dir,
-        "is_symlink": is_symlink,
-    }
+def _make_file(path: str = "/etc/hosts", **overrides: object) -> dict:
+    return make_file_item(path, **overrides)
 
 
 def _run_cmd(
@@ -54,13 +37,16 @@ def _run_cmd(
 ):
     """Run cmd_ls with mocked responses and a session store."""
     if images_response is not None:
-        tc.respond_json(images_response)
+        tc.mock("inspect_find_image_by_tag", images_response["images"][0]["uuid"])
 
     if text is not None:
-        # Manually add a text response (not JSON)
-        tc.fake.responses.append(FakeResponse(body=text.encode()))
+        # The text listing goes through the raw RequestSpec path.
+        tc.respond_raw(body=text.encode())
     else:
-        tc.respond_json({"path": path, "files": files or []})
+        tc.mock(
+            "inspect_image_list",
+            DirectoryList.from_dict({"path": path, "files": files or []}),
+        )
 
     FORMATTER.set(formatter or CSVFormatter())
     store.set_image(image, kind="test")
@@ -69,6 +55,10 @@ def _run_cmd(
 
     args = LsArgs(path=path)
     ctx.run(cmd_ls, args)
+
+
+def total_requests(tc: ContreeTestClient) -> int:
+    return len(tc.calls) + len(tc.raw_requests)
 
 
 class TestCmdLs:
@@ -80,10 +70,9 @@ class TestCmdLs:
             image="a1b2c3d4-5678-9abc-def0-111111111111",
             path="/etc",
         )
-        paths = contree_client.request_paths
-        assert len(paths) == 1
-        assert "/v1/inspect/a1b2c3d4-5678-9abc-def0-111111111111/list" in paths[0]
-        assert "path=%2Fetc" in paths[0]
+        calls = contree_client.calls_for("inspect_image_list")
+        assert len(calls) == 1
+        assert calls[0].args == ("a1b2c3d4-5678-9abc-def0-111111111111", "/etc")
 
     def test_outputs_file_entries(self, contree_client, session_store, capsys):
         files = [
@@ -104,10 +93,12 @@ class TestCmdLs:
             image="tag:latest",
             images_response=images_resp,
         )
-        paths = contree_client.request_paths
-        assert len(paths) == 2
-        assert "tag=latest" in paths[0]
-        assert "/v1/inspect/resolved-uuid/list" in paths[1]
+        resolve_calls = contree_client.calls_for("inspect_find_image_by_tag")
+        assert len(resolve_calls) == 1
+        assert resolve_calls[0].args == ("latest",)
+        inspect_calls = contree_client.calls_for("inspect_image_list")
+        assert len(inspect_calls) == 1
+        assert inspect_calls[0].args[0] == "resolved-uuid"
 
     def test_empty_directory(self, contree_client, session_store, capsys):
         _run_cmd(contree_client, [], store=session_store)
@@ -146,15 +137,13 @@ class TestCmdLs:
         assert parsed["path"] == "/bin/sh"
         assert parsed["size"] == 42
 
-    def test_unknown_field_passes_through(self, contree_client, session_store, capsys):
-        """New server fields reach the row even when not hardcoded."""
-        f = _make_file()
-        f["future_field"] = "anything"
-        f["inode"] = 4242
+    def test_model_fields_pass_through(self, contree_client, session_store, capsys):
+        """Fields not hardcoded in cmd_ls still reach the output row."""
+        f = _make_file(nlink=3, uid=1042)
         _run_cmd(contree_client, [f], store=session_store, formatter=JSONFormatter())
         parsed = json.loads(capsys.readouterr().out.strip())
-        assert parsed["future_field"] == "anything"
-        assert parsed["inode"] == 4242
+        assert parsed["nlink"] == 3
+        assert parsed["uid"] == 1042
 
     def test_table_output(self, contree_client, session_store, capsys):
         files = [_make_file(), _make_file(path="/etc/passwd")]
@@ -166,17 +155,13 @@ class TestCmdLs:
         assert "PATH" in lines[0]
 
     def test_owner_fallback_to_uid(self, contree_client, session_store, capsys):
-        f = _make_file()
-        del f["owner"]
-        f["uid"] = 1000
+        f = _make_file(owner="", uid=1000)
         _run_cmd(contree_client, [f], store=session_store)
         out = capsys.readouterr().out
         assert "1000" in out
 
     def test_group_fallback_to_gid(self, contree_client, session_store, capsys):
-        f = _make_file()
-        del f["group"]
-        f["gid"] = 1000
+        f = _make_file(group="", gid=1000)
         _run_cmd(contree_client, [f], store=session_store)
         out = capsys.readouterr().out
         assert "1000" in out
@@ -201,10 +186,9 @@ class TestCmdLs:
             store=session_store,
             formatter=DefaultFormatter(),
         )
-        paths = contree_client.request_paths
-        assert len(paths) == 1
-        assert "text=1" in paths[0]
-        assert "path=%2Fetc" in paths[0]
+        specs = contree_client.raw_requests
+        assert len(specs) == 1
+        assert specs[0].query == {"path": "/etc", "text": "1"}
 
     def test_explicit_format_no_text_param(self, contree_client, session_store):
         _run_cmd(
@@ -213,9 +197,9 @@ class TestCmdLs:
             store=session_store,
             formatter=JSONFormatter(),
         )
-        paths = contree_client.request_paths
-        assert len(paths) == 1
-        assert "text=1" not in paths[0]
+        assert contree_client.raw_requests == []
+        calls = contree_client.calls_for("inspect_image_list")
+        assert len(calls) == 1
 
     def test_default_formatter_empty(self, contree_client, session_store, capsys):
         _run_cmd(
@@ -235,11 +219,11 @@ class TestCmdLs:
         """Second call with same args should not hit the API."""
         files = [_make_file()]
         _run_cmd(contree_client, files, store=session_store)
-        assert contree_client.request_count == 1
+        assert total_requests(contree_client) == 1
 
         # Second call -- should be served from cache
         _run_cmd(contree_client, files, store=session_store)
-        assert contree_client.request_count == 1  # no new request (cached)
+        assert total_requests(contree_client) == 1  # no new request (cached)
 
     def test_default_formatter_not_cached(self, contree_client, session_store):
         """DefaultFormatter (text=1) path always hits API."""
@@ -250,7 +234,7 @@ class TestCmdLs:
             store=session_store,
             formatter=DefaultFormatter(),
         )
-        assert contree_client.request_count == 1
+        assert total_requests(contree_client) == 1
 
         _run_cmd(
             contree_client,
@@ -258,4 +242,4 @@ class TestCmdLs:
             store=session_store,
             formatter=DefaultFormatter(),
         )
-        assert contree_client.request_count == 2  # new request (not cached)
+        assert total_requests(contree_client) == 2  # new request (not cached)

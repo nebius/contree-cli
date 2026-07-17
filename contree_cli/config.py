@@ -1,3 +1,13 @@
+"""CLI-owned configuration on top of ``contree_client.profiles``.
+
+Profile parsing, the auth.ini/cli.ini merge and the resolution
+precedence (explicit name > ``CONTREE_PROFILE`` > active) live in the
+library; this module keeps what only the CLI needs: the writable
+profile store (atomic 0600 save, active-profile switching, deletion
+with session-DB cleanup), the ``[cli]`` settings section, the editor
+choice and the session database layout.
+"""
+
 from __future__ import annotations
 
 import configparser
@@ -6,11 +16,36 @@ import os
 import shutil
 import stat
 from collections.abc import Iterator, MutableMapping
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 
+from contree_client.profiles import (
+    AUTH_TYPE_IAM,
+    AUTH_TYPE_JWT,
+    DEFAULT_IAM_URL,
+    Profile,
+    ProfileError,
+    load_profiles,
+    resolve_profile,
+)
+
 from .migrations import run_migrations
+
+__all__ = [
+    "AUTH_TYPE_IAM",
+    "AUTH_TYPE_JWT",
+    "CLI_CONFIG_FILE",
+    "CONFIG_DIR",
+    "CONFIG_FILE",
+    "CONTREE_HOME",
+    "DEFAULT_IAM_URL",
+    "EDITOR",
+    "SETTINGS",
+    "Config",
+    "Profile",
+    "get_default_path",
+    "remove_session_db",
+    "session_db_path",
+]
 
 log = logging.getLogger(__name__)
 
@@ -42,55 +77,29 @@ EDITOR = (
 )
 
 
-class AuthType(str, Enum):
-    IAM = "iam"
-    JWT = "jwt"
-
-    def __str__(self) -> str:
-        return self.value
+def session_db_path(profile_name: str) -> Path:
+    """Per-profile session database location (CLI-owned layout)."""
+    return CONTREE_HOME / "cli" / "sessions" / f"{profile_name}.db"
 
 
-@dataclass(frozen=True, repr=False)
-class ConfigProfile:
-    name: str
-    url: str
-    token: str | None
-    auth_type: AuthType = AuthType.JWT
-    project: str | None = None
-
-    def __repr__(self) -> str:
-        masked = "***" if self.token else None
-        return (
-            f"{self.__class__.__name__}(name={self.name!r}, url={self.url!r},"
-            f" token={masked!r}, auth_type={self.auth_type!r},"
-            f" project={self.project!r})"
-        )
-
-    @property
-    def session_db_path(self) -> Path:
-        return CONTREE_HOME / "cli" / "sessions" / f"{self.name}.db"
-
-    def remove_session_db(self) -> None:
-        db = self.session_db_path
-        for suffix in ("", "-wal", "-shm"):
-            p = db.with_name(db.name + suffix)
-            p.unlink(missing_ok=True)
+def remove_session_db(profile_name: str) -> None:
+    db = session_db_path(profile_name)
+    for suffix in ("", "-wal", "-shm"):
+        p = db.with_name(db.name + suffix)
+        p.unlink(missing_ok=True)
 
 
-class Config(MutableMapping[str, ConfigProfile]):
-    """INI-backed profile store.
+class Config(MutableMapping[str, Profile]):
+    """Writable INI-backed profile store over the library reader.
 
     Dict-like: ``cfg[name]``, ``cfg[name] = profile``,
     ``del cfg[name]``, ``name in cfg``, ``len(cfg)``, iteration.
     """
 
-    DEFAULT_IAM_URL = "https://api.tokenfactory.nebius.com/sandboxes"
-    PROFILE_PREFIX = "profile:"
-
     def __init__(self, path: Path | None = None) -> None:
         run_migrations(CONTREE_HOME)
         self.__path = path or CONFIG_FILE
-        self.__profiles: dict[str, ConfigProfile] = {}
+        self.__profiles: dict[str, Profile] = {}
         self.__active: str = "default"
         self._load()
 
@@ -101,48 +110,14 @@ class Config(MutableMapping[str, ConfigProfile]):
     # -- persistence ---------------------------------------------------------
 
     def _load(self) -> None:
-        cp = configparser.ConfigParser()
-        # Read cli.ini first, then auth.ini — later files override earlier
-        # ones, so secrets in auth.ini take precedence over any non-secret
-        # profile fields a user keeps in cli.ini (url, project, type, …).
-        sources = [CLI_CONFIG_FILE, self.__path]
-        log.debug("Loading config from %s", sources)
-        cp.read(sources)
-        self.__active = cp.defaults().get("profile", "default")
-        self.__profiles.clear()
-        for section in cp.sections():
-            if section.startswith(self.PROFILE_PREFIX):
-                p = self._parse_profile(cp, section)
-                self.__profiles[p.name] = p
-
-    @classmethod
-    def _parse_profile(
-        cls,
-        cp: configparser.ConfigParser,
-        section: str,
-    ) -> ConfigProfile:
-        auth_type = AuthType(cp.get(section, "type", fallback=AuthType.JWT.value))
-        default_url = cls.DEFAULT_IAM_URL if auth_type == AuthType.IAM else ""
-        return ConfigProfile(
-            name=section[len(cls.PROFILE_PREFIX) :],
-            token=cp.get(section, "token", fallback=None),
-            url=cp.get(section, "url", fallback=default_url),
-            auth_type=auth_type,
-            project=cp.get(section, "project", fallback=None),
-        )
+        log.debug("Loading profiles for %s", self.__path)
+        self.__profiles, self.__active = load_profiles(self.__path)
 
     def _save(self) -> None:
         cp = configparser.ConfigParser()
         cp["DEFAULT"]["profile"] = self.__active
         for profile in self.__profiles.values():
-            section = self.PROFILE_PREFIX + profile.name
-            cp.add_section(section)
-            if profile.token is not None:
-                cp.set(section, "token", profile.token)
-            cp.set(section, "url", profile.url.rstrip("/"))
-            cp.set(section, "type", profile.auth_type)
-            if profile.project is not None:
-                cp.set(section, "project", profile.project)
+            profile.save(cp)
         self.__path.parent.mkdir(parents=True, exist_ok=True)
         # Create with 0o600 from the start so the token is never readable
         # by other users — even between create() and chmod().
@@ -160,10 +135,10 @@ class Config(MutableMapping[str, ConfigProfile]):
     def __contains__(self, name: object) -> bool:
         return name in self.__profiles
 
-    def __getitem__(self, name: str) -> ConfigProfile:
+    def __getitem__(self, name: str) -> Profile:
         return self.__profiles[name]
 
-    def __setitem__(self, name: str, profile: ConfigProfile) -> None:
+    def __setitem__(self, name: str, profile: Profile) -> None:
         assert name == profile.name, "profile name must match key"
         self.__profiles[name] = profile
         self._save()
@@ -171,11 +146,11 @@ class Config(MutableMapping[str, ConfigProfile]):
     def __delitem__(self, name: str) -> None:
         if name not in self.__profiles:
             raise KeyError(name)
-        profile = self.__profiles.pop(name)
+        self.__profiles.pop(name)
         if self.__active == name:
             self.__active = next(iter(self.__profiles), "default")
         self._save()
-        profile.remove_session_db()
+        remove_session_db(name)
 
     def __len__(self) -> int:
         return len(self.__profiles)
@@ -186,33 +161,33 @@ class Config(MutableMapping[str, ConfigProfile]):
     # -- profile management --------------------------------------------------
 
     @property
-    def current(self) -> ConfigProfile:
+    def current(self) -> Profile:
         return self.__profiles[self.__active]
 
     @current.setter
-    def current(self, profile: ConfigProfile) -> None:
+    def current(self, profile: Profile) -> None:
         self.__active = profile.name
         self._save()
 
-    def resolve(self, profile_override: str | None = None) -> ConfigProfile:
+    def resolve(self, profile_override: str | None = None) -> Profile:
         """Resolve the active profile by name.
 
-        Priority: *profile_override* > ``CONTREE_PROFILE`` > config default.
+        The library owns the precedence (*profile_override* >
+        ``CONTREE_PROFILE`` > config default). A missing profile
+        yields a credential-less stub instead of an error so local
+        commands still run and main() reports remote ones itself.
         Credentials come strictly from the saved profile; runtime
         commands do not read tokens, URLs, or project IDs from the
         environment. To register/refresh credentials from env vars use
         ``contree auth``.
         """
-        name = profile_override or os.environ.get("CONTREE_PROFILE") or self.__active
-        if name in self.__profiles:
-            return self.__profiles[name]
-        return ConfigProfile(
-            name=name,
-            token=None,
-            url="",
-            auth_type=AuthType.JWT,
-            project=None,
-        )
+        try:
+            return resolve_profile(profile_override, path=self.__path)
+        except ProfileError:
+            name = (
+                profile_override or os.environ.get("CONTREE_PROFILE") or self.__active
+            )
+            return Profile(name=name, url="", token=None)
 
     def switch(self, name: str) -> None:
         """Set the active profile."""
