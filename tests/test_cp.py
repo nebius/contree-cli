@@ -5,7 +5,9 @@ from contextlib import ExitStack
 from contextvars import copy_context
 from unittest.mock import patch
 
+import pytest
 from conftest import ContreeTestClient
+from contree_client.exceptions import NotFoundError
 from contree_client.runtime import CHUNK_SIZE
 
 from contree_cli import FORMATTER, SESSION_STORE
@@ -16,7 +18,7 @@ from contree_cli.session import SessionStore
 
 def _run_cmd(
     tc: ContreeTestClient,
-    chunks: list[bytes] | None = None,
+    chunks: list[bytes] | BaseException | None = None,
     *,
     store: SessionStore,
     image: str = "a1b2c3d4-5678-9abc-def0-111111111111",
@@ -29,7 +31,10 @@ def _run_cmd(
     """Run cmd_cp with mocked responses."""
     if images_response is not None:
         tc.mock("inspect_find_image_by_tag", images_response["images"][0]["uuid"])
-    tc.mock("inspect_image_download_stream", chunks or [])
+    if isinstance(chunks, BaseException):
+        tc.mock("inspect_image_download_stream", error=chunks)
+    else:
+        tc.mock("inspect_image_download_stream", chunks or [])
 
     FORMATTER.set(formatter or DefaultFormatter())
     store.set_image(image, kind="test")
@@ -137,6 +142,39 @@ class TestCmdCp:
         )
         assert result is None
         assert dest.read_bytes() == b"new content"
+
+    def test_missing_path_leaves_no_partial_file(
+        self, contree_client, session_store, tmp_path
+    ):
+        dest = tmp_path / "out.bin"
+        with pytest.raises(NotFoundError):
+            _run_cmd(
+                contree_client,
+                NotFoundError(404, "path not found"),
+                store=session_store,
+                path="/nope",
+                dest=str(dest),
+            )
+        # No partial file is left behind.
+        assert not dest.exists()
+
+    def test_missing_path_preserves_existing_output(
+        self, contree_client, session_store, tmp_path
+    ):
+        dest = tmp_path / "out.bin"
+        dest.write_bytes(b"previous copy contents")
+        with pytest.raises(NotFoundError):
+            _run_cmd(
+                contree_client,
+                NotFoundError(404, "path not found"),
+                store=session_store,
+                path="/nope",
+                dest=str(dest),
+            )
+        # A failed copy must not clobber a file that already existed.
+        assert dest.read_bytes() == b"previous copy contents"
+        # No leftover temp file in the destination directory.
+        assert not list(tmp_path.glob(f".{dest.name}.*"))
 
     def test_progress_log(self, contree_client, session_store, tmp_path, caplog):
         """After 5s elapsed, a progress line with volume and speed.

@@ -43,7 +43,7 @@ def respond_listing(tc, ops: list[dict]) -> None:
 
     The handler needs the per-op ``session_key`` field, which the typed
     OperationSummary model does not carry, so it fetches the raw payload
-    via ``client.request(RequestSpec(...))``.
+    via ``client.call(RequestSpec(...))``.
     """
     tc.respond_raw(body=json.dumps(ops).encode())
 
@@ -507,6 +507,9 @@ class TestWait:
         assert rc is None
         out = capsys.readouterr().out
         assert "op-2" in out
+        # Marked idempotent (a safe-to-replay GET) so a retry policy
+        # can retry a transient 410/425/5xx instead of failing outright.
+        assert contree_client.raw_requests[0].idempotent is True
         assert "SUCCESS" in out
 
     def test_wait_active_none_for_other_session(

@@ -159,6 +159,21 @@ def config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return cfg_dir
 
 
+@pytest.fixture(autouse=True)
+def _isolate_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect CODEX_HOME so a skill install exercising CodexSkill (which
+    writes a rules file under it) never touches the real ~/.codex.
+
+    Applies globally, unlike `config_dir`, since `default_codex_home()`
+    reads the env var directly rather than a module-level constant --
+    any test that reaches it without its own explicit
+    `default_codex_home` patch would otherwise fall through to the
+    real home. Tests that patch the function themselves are
+    unaffected: that override takes precedence over this env var.
+    """
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex-home"))
+
+
 @pytest.fixture()
 def profile() -> Generator[Profile]:
     """Set PROFILE context var to a test profile, reset after."""

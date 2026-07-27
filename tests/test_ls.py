@@ -189,6 +189,9 @@ class TestCmdLs:
         specs = contree_client.raw_requests
         assert len(specs) == 1
         assert specs[0].query == {"path": "/etc", "text": "1"}
+        # Marked idempotent (a safe-to-replay GET) so a retry policy
+        # can retry a transient 410/425/5xx instead of failing outright.
+        assert specs[0].idempotent is True
 
     def test_explicit_format_no_text_param(self, contree_client, session_store):
         _run_cmd(

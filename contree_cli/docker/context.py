@@ -166,3 +166,22 @@ class BuildContext:
 
         self.last_image = image_uuid
         self.last_op_uuid = operation_uuid
+
+
+def resolve_stage_ref(ctx: BuildContext, ref: str) -> str | None:
+    """Resolve *ref* against already-sealed build stages.
+
+    A numeric ``ref`` addresses a stage by position and must be in
+    range; a name is looked up in the alias registry. Returns
+    ``None`` when *ref* is neither, so the caller can fall through to
+    external image resolution (``FROM``, ``COPY --from``).
+    """
+    if ref.isdigit():
+        index = int(ref)
+        if index >= len(ctx.stage_images):
+            raise ValueError(
+                f"stage index out of range ({len(ctx.stage_images)} stage(s)"
+                f" sealed so far): {ref}"
+            )
+        return ctx.stage_images[index]
+    return ctx.stages.get(ref)

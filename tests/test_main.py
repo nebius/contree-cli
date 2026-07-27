@@ -9,6 +9,7 @@ with a spy client to pin that contract.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -31,8 +32,9 @@ class DummyChecker:
 class SpyClient:
     """Records context-manager transitions instead of doing HTTP."""
 
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], raises: BaseException | None = None) -> None:
         self.events = events
+        self.raises = raises
 
     def __enter__(self) -> SpyClient:
         self.events.append("enter")
@@ -40,6 +42,11 @@ class SpyClient:
 
     def __exit__(self, *exc: object) -> None:
         self.events.append("exit")
+
+    def iter_images(self, **kwargs: object) -> Iterator[object]:
+        if self.raises is not None:
+            raise self.raises
+        return iter(())
 
 
 def write_profile(tmp_path: Path) -> Path:
@@ -58,11 +65,12 @@ def run_main(
     cfg_path: Path,
     events: list[str],
     command: str,
+    raises: BaseException | None = None,
 ) -> pytest.ExceptionInfo[SystemExit]:
     monkeypatch.setattr("contree_cli.__main__.UpdateChecker", DummyChecker)
     monkeypatch.setattr(
         "contree_cli.__main__.client_from_profile",
-        lambda profile, timeout=300.0: SpyClient(events),
+        lambda profile, timeout=300.0: SpyClient(events, raises=raises),
     )
     monkeypatch.setattr(
         sys,
@@ -72,6 +80,47 @@ def run_main(
     with pytest.raises(SystemExit) as exc_info:
         main()
     return exc_info
+
+
+class TestNetworkErrorHandling:
+    """A transport-layer failure must print a friendly message and exit
+    1, not an unhandled traceback -- regardless of which HTTP backend
+    raised it. `images` (bare, list) calls `client.iter_images(...)`
+    directly, so SpyClient's `raises` fires from inside the real
+    try/except in main(), unlike patching a handler function (whose
+    reference argparse already captured at parser-build time)."""
+
+    def test_urllib3_error_caught(self, tmp_path, monkeypatch, capsys):
+        urllib3 = pytest.importorskip("urllib3")
+        cfg_path = write_profile(tmp_path)
+        events: list[str] = []
+
+        exc_info = run_main(
+            monkeypatch,
+            cfg_path,
+            events,
+            "images",
+            raises=urllib3.exceptions.HTTPError("boom"),
+        )
+
+        assert exc_info.value.code == 1
+        assert "Network error" in capsys.readouterr().err
+
+    def test_httpx_error_caught(self, tmp_path, monkeypatch, capsys):
+        httpx = pytest.importorskip("httpx")
+        cfg_path = write_profile(tmp_path)
+        events: list[str] = []
+
+        exc_info = run_main(
+            monkeypatch,
+            cfg_path,
+            events,
+            "images",
+            raises=httpx.HTTPError("boom"),
+        )
+
+        assert exc_info.value.code == 1
+        assert "Network error" in capsys.readouterr().err
 
 
 class TestClientLifecycle:

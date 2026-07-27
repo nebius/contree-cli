@@ -20,6 +20,26 @@ from contree_cli.update_check import UpdateChecker
 
 log = logging.getLogger(__name__)
 
+# Network errors raised by the auto-detected transport backend. The
+# stdlib ones are always available; urllib3/httpx raise their own
+# hierarchies (neither inherits from OSError) when auto-detected as
+# the backend instead of `requests` (whose exceptions do subclass
+# OSError). Both imports are optional, mirroring how
+# contree_client.sync.detect_backend() itself probes for them.
+_NETWORK_ERRORS: tuple[type[BaseException], ...] = (OSError, http.client.HTTPException)
+try:
+    import urllib3.exceptions  # type: ignore[import-not-found]
+
+    _NETWORK_ERRORS = (*_NETWORK_ERRORS, urllib3.exceptions.HTTPError)
+except ModuleNotFoundError:
+    pass
+try:
+    import httpx  # type: ignore[import-not-found]
+
+    _NETWORK_ERRORS = (*_NETWORK_ERRORS, httpx.HTTPError)
+except ModuleNotFoundError:
+    pass
+
 
 def main() -> None:
     if len(sys.argv) == 1:
@@ -112,7 +132,7 @@ def main() -> None:
             # (invalid UUIDs, etc.); the message is already user-facing.
             log.error("%s", exc)
             exit(1)
-        except (OSError, http.client.HTTPException) as exc:
+        except _NETWORK_ERRORS as exc:
             log.error("Network error: %s", exc)
             exit(1)
         except KeyboardInterrupt:

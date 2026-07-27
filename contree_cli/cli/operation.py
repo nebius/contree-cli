@@ -164,11 +164,12 @@ def setup_show_parser(p: argparse.ArgumentParser) -> SetupResult:
         *FLAGS["raw"],
         action="store_true",
         help=(
-            "Print each operation's full server payload as JSONL "
-            "(one JSON object per line) to stdout, verbatim. Skips "
-            "formatter routing and derived columns; streams cleanly "
-            "into `jq -c`. Useful for debugging or for fields the "
-            "table view omits."
+            "Print each operation's JSON payload as JSONL (one object "
+            "per line) to stdout. Round-trips through the typed "
+            "operation model, so fields the model doesn't know about "
+            "are dropped. Skips formatter routing and derived "
+            "columns; streams cleanly into `jq -c`. Useful for "
+            "debugging or for fields the table view omits."
         ),
     )
     return cmd_show_multi, ShowMultiArgs

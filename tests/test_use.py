@@ -4,7 +4,9 @@ import json
 from contextvars import copy_context
 from unittest.mock import patch
 
+import pytest
 from conftest import ContreeTestClient
+from contree_client.exceptions import NotFoundError
 
 from contree_cli import FORMATTER, SESSION_STORE
 from contree_cli.cli.use import UseArgs, cmd_use
@@ -142,3 +144,17 @@ class TestUseNew:
         assert rc == 1
         err = capsys.readouterr().err
         assert "--new requires an IMAGE" in err
+
+    def test_new_does_not_switch_session_on_resolve_failure(
+        self, contree_client, session_store
+    ):
+        """A failed --new resolve must not leave the store pointed at a
+        new, unvalidated session."""
+        contree_client.mock(
+            "inspect_find_image_by_tag", error=NotFoundError(404, "no such tag")
+        )
+        original_key = session_store.session_key
+        args = UseArgs(image="tag:missing", new=True)
+        with pytest.raises(NotFoundError):
+            _run_cmd(contree_client, args, store=session_store)
+        assert session_store.session_key == original_key

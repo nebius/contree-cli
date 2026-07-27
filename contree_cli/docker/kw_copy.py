@@ -19,6 +19,7 @@ import posixpath
 import shlex
 import tarfile
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from typing import IO, ClassVar, TypeVar
 
@@ -26,15 +27,15 @@ from contree_client.exceptions import NotFoundError
 
 from contree_cli.cli.run import upload_files
 
-from .context import BuildContext, PendingFile
+from .context import BuildContext, PendingFile, resolve_stage_ref
 from .keyword import DockerKeyword
+from .kw_from import resolve_or_import
 from .kw_run import RunKeyword
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=DockerKeyword)
 
-SCRATCH_DIR = "/.contree-build"
 SPOOL_MAX_MEMORY = 8 * 1024 * 1024
 
 
@@ -168,24 +169,13 @@ def resolve_stage_image(ctx: BuildContext, ref: str) -> str:
 
     Numeric references address sealed stages by position, names go
     through the alias registry, anything else is treated as an
-    external image reference (docker parity: ``--from=image:tag``).
+    external image reference (docker parity: ``--from=image:tag``),
+    auto-imported from a registry on a resolve miss just like ``FROM``.
     """
-    if ref.isdigit():
-        index = int(ref)
-        if index >= len(ctx.stage_images):
-            raise ValueError(
-                f"COPY --from={ref}: stage index out of range"
-                f" ({len(ctx.stage_images)} stage(s) sealed so far)"
-            )
-        return ctx.stage_images[index]
-    if ref in ctx.stages:
-        return ctx.stages[ref]
-    try:
-        return ctx.client.resolve_image(ref)
-    except NotFoundError:
-        raise ValueError(
-            f"COPY --from={ref}: unknown build stage and no such image"
-        ) from None
+    local = resolve_stage_ref(ctx, ref)
+    if local is not None:
+        return local
+    return resolve_or_import(ctx, ref)
 
 
 def fetch_archive(
@@ -237,13 +227,19 @@ def copy_from_image(
     """Stage a ``COPY --from`` directive as one extraction layer.
 
     Each source is exported from the referenced image as a tar
-    archive, uploaded once (deduplicated) and attached under
-    ``/.contree-build``; a single RUN then unpacks every archive into
-    place and removes the scratch directory. Ownership and modes come
-    from the tar unless ``--chown``/``--chmod`` override them.
+    archive, uploaded once (deduplicated) and attached under a scratch
+    directory unique to this instruction; a single RUN then unpacks
+    every archive into place and removes the scratch directory.
+    Ownership and modes come from the tar unless ``--chown``/
+    ``--chmod`` override them.
+
+    The scratch directory is randomised per invocation (rather than a
+    fixed ``/.contree-build``) so ``rm -rf`` at the end can never
+    delete a path that happened to pre-exist in the source image.
     """
     stage_ref = ctx.substitute(from_stage)
     image_uuid = resolve_stage_image(ctx, stage_ref)
+    scratch_dir = f"/.contree-build-{uuid.uuid4().hex[:8]}"
 
     sub_sources = tuple(ctx.substitute(s) for s in sources)
     sub_dest = ctx.substitute(dest)
@@ -260,8 +256,8 @@ def copy_from_image(
     script: list[str] = []
     for index, raw_src in enumerate(sub_sources):
         src = posixpath.normpath(posixpath.join("/", raw_src))
-        tar_path = f"{SCRATCH_DIR}/copy-{index}.tar"
-        extract_dir = f"{SCRATCH_DIR}/extract-{index}"
+        tar_path = f"{scratch_dir}/copy-{index}.tar"
+        extract_dir = f"{scratch_dir}/extract-{index}"
 
         # Small archives stay in memory; big ones spill to a temp file.
         with tempfile.SpooledTemporaryFile(max_size=SPOOL_MAX_MEMORY) as buffer:
@@ -300,7 +296,7 @@ def copy_from_image(
             script.append(f"mkdir -p {shlex.quote(posixpath.dirname(target) or '/')}")
             script.append(f"mv {shlex.quote(unpacked)} {shlex.quote(target)}")
 
-    script.append(f"rm -rf {shlex.quote(SCRATCH_DIR)}")
+    script.append(f"rm -rf {shlex.quote(scratch_dir)}")
     command = " && ".join(script)
 
     # The extraction runs as root regardless of an active USER (docker

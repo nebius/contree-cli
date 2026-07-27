@@ -82,7 +82,7 @@ Anywhere `--help` shows a positional named `UUID_OR_REF` (`op show`, `op cancel`
 
 When unsure, use `session show` to find the absolute id and pass that.
 
-`contree op show --raw UUID_OR_REF...` (also `contree show --raw ...`) prints each operation's full server payload as JSONL: one compact JSON object per line, no derived columns, no stdout/stderr decoding. Use it when the flat row hides what you need (`metadata`, `resources`, raw `result.state`, ...) or pipe it into `jq -c`.
+`contree op show --raw UUID_OR_REF...` (also `contree show --raw ...`) prints each operation's JSON payload as JSONL: one compact JSON object per line, no derived columns, no stdout/stderr decoding. It still round-trips through the typed operation model, so fields the model doesn't know about are dropped. Use it when the flat row hides what you need (`metadata`, `resources`, raw `result.state`, ...) or pipe it into `jq -c`.
 
 ## Subagents
 

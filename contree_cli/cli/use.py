@@ -80,19 +80,20 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
 def cmd_use(args: UseArgs) -> int | None:
     store = SESSION_STORE.get()
 
-    if args.new:
-        if args.image is None:
-            print(
-                "--new requires an IMAGE argument.",
-                file=sys.stderr,
-            )
-            return 1
-        new_key = str(uuid.uuid4())
-        store.select_session(new_key)
+    if args.new and args.image is None:
+        print(
+            "--new requires an IMAGE argument.",
+            file=sys.stderr,
+        )
+        return 1
 
     if args.image is not None:
         client = CLIENT.get()
+        # Validate before switching: a failed resolve must not leave
+        # the store pointed at a new, unvalidated, empty session.
         image_uuid = client.resolve_image(args.image)
+        if args.new:
+            store.select_session(str(uuid.uuid4()))
         store.set_image(image_uuid, kind="use", title=args.image)
         if not IN_SHELL.get(False):
             _print_shell_export("CONTREE_SESSION", store.session_key)

@@ -70,10 +70,11 @@ def cmd_show(args: ShowArgs) -> int | None:
             store.cache[cache_key] = op
 
     if args.raw:
-        # Pass through the server payload verbatim, one operation per
-        # line (JSONL), so multi-UUID `op show --raw` streams cleanly
-        # into `jq -c`, `awk`, etc. Skips formatter routing, derived
-        # columns, and stdout/stderr decoding -- the user asked for raw.
+        # One operation per line (JSONL), so multi-UUID `op show --raw`
+        # streams cleanly into `jq -c`, `awk`, etc. Skips formatter
+        # routing, derived columns, and stdout/stderr decoding -- the
+        # typed-model round-trip above is still in effect, though (see
+        # the note on `op` a few lines up).
         json.dump(op, sys.stdout)
         sys.stdout.write("\n")
         return None

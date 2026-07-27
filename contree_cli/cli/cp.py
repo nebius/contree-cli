@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,21 +77,29 @@ def cmd_cp(args: CpArgs) -> int | None:
     start = time.monotonic()
     last_log = start
 
-    with dest.open("wb") as f:
-        for chunk in client.inspect_image_download_stream(uuid, path):
-            f.write(chunk)
-            downloaded += len(chunk)
+    tmp_path: str | None = None
+    fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for chunk in client.inspect_image_download_stream(uuid, path):
+                f.write(chunk)
+                downloaded += len(chunk)
 
-            now = time.monotonic()
-            if now - last_log >= LOG_INTERVAL:
-                last_log = now
-                elapsed = now - start
-                speed = downloaded / elapsed if elapsed > 0 else 0
-                logger.info(
-                    "%s downloaded | %s/s",
-                    fmt_size(downloaded),
-                    fmt_size(speed),
-                )
+                now = time.monotonic()
+                if now - last_log >= LOG_INTERVAL:
+                    last_log = now
+                    elapsed = now - start
+                    speed = downloaded / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        "%s downloaded | %s/s",
+                        fmt_size(downloaded),
+                        fmt_size(speed),
+                    )
+        os.replace(tmp_path, dest)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            Path(tmp_path).unlink(missing_ok=True)
 
     elapsed = time.monotonic() - start
     speed = downloaded / elapsed if elapsed > 0 else 0

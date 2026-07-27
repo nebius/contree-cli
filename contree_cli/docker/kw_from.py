@@ -13,7 +13,7 @@ from contree_client.models import ImageImportRegistry
 
 from contree_cli.cli.images import normalize_registry_url
 
-from .context import BuildContext
+from .context import BuildContext, resolve_stage_ref
 from .keyword import DockerKeyword
 from .kw_run import RunKeyword
 
@@ -55,7 +55,9 @@ class FromKeyword(DockerKeyword):
         ctx.user = ""
 
         ref = ctx.substitute(self.image_ref)
-        image_uuid = resolve_or_import(ctx, ref)
+        image_uuid = resolve_stage_ref(ctx, ref)
+        if image_uuid is None:
+            image_uuid = resolve_or_import(ctx, ref)
 
         from_hash = hashlib.sha256(f"FROM:{image_uuid}".encode()).hexdigest()
         branch_name = f"layer:{BuildContext.short_hash(from_hash)}"
@@ -85,8 +87,15 @@ def seal_stage(ctx: BuildContext) -> None:
     becomes addressable via ``COPY --from=<alias|index>``.
     """
     if ctx.pending:
-        closer = RunKeyword(parts=(":",), shell_form=True)
-        closer.execute(ctx)
+        # Sealing just commits already-uploaded files; it must run as
+        # root regardless of the stage's active USER (matching how
+        # copy_from_image's own extraction RUN clears ctx.user).
+        saved_user = ctx.user
+        ctx.user = ""
+        try:
+            RunKeyword(parts=(":",), shell_form=True).execute(ctx)
+        finally:
+            ctx.user = saved_user
     ctx.stage_images.append(ctx.last_image)
     if ctx.current_stage_alias:
         ctx.stages[ctx.current_stage_alias] = ctx.last_image

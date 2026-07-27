@@ -326,7 +326,7 @@ class Skill(abc.ABC):
         )
 
     def install(self, *, force: bool = False) -> None:
-        if self.exists and not force:
+        if not force and any(f.is_file() for f in self.owned_files()):
             raise FileExistsError(self.path)
         self.build_tree(self.path)
 
@@ -568,12 +568,18 @@ PATH_MARKERS: dict[str, type[Skill]] = {
 def is_skill_target(path: Path) -> bool:
     """True when path points at a skill artifact rather than a project root.
 
-    Only signals of the artifact itself count (`SKILL.md` inside, the
-    skill basename, an `.md` file); the directories the path goes
-    through do not, so a project living inside `.claude`, `.codex`, or
-    `.agents` still expands as a project root.
+    Only signals of the artifact itself count (`SKILL.md` inside, an
+    `.md` file, or the skill basename sitting directly under a
+    `skills/` directory as every install layout produces); the other
+    directories the path goes through do not, so a project living
+    inside `.claude`, `.codex`, or `.agents` still expands as a
+    project root. Requiring the `skills/` parent also keeps an
+    unrelated project directory that merely happens to be named
+    `contree` from being mistaken for the artifact itself.
     """
-    if path.suffix == ".md" or path.name == SKILL_NAME:
+    if path.suffix == ".md":
+        return True
+    if path.name == SKILL_NAME and path.parent.name == "skills":
         return True
     return (path / "SKILL.md").is_file()
 

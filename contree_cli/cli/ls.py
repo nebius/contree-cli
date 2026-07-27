@@ -62,11 +62,12 @@ def cmd_ls(args: LsArgs) -> None:
     if isinstance(formatter, DefaultFormatter):
         # The pre-formatted text listing (?text=1) has no typed method
         # in contree-client; issue the request through the raw spec.
-        response = client.request(
+        response = client.call(
             RequestSpec(
                 method="GET",
                 path=f"/inspect/{uuid}/list",
                 query={"path": path, "text": "1"},
+                idempotent=True,
             )
         )
         if response.status != 200:

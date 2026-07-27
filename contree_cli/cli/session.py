@@ -660,7 +660,9 @@ def cmd_wait(args: WaitArgs) -> int | None:
             # model in contree-client, so the typed list_operations()
             # would drop it. Fetch the raw payload to keep the
             # per-session filter working.
-            response = client.request(RequestSpec(method="GET", path="/operations"))
+            response = client.call(
+                RequestSpec(method="GET", path="/operations", idempotent=True)
+            )
             if response.status != 200:
                 raise error_for_response(response)
             operations = json.loads(response.body)

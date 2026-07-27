@@ -259,6 +259,22 @@ class TestNonDestructiveInstall:
         with pytest.raises(FileExistsError):
             skill.install()
 
+    def test_install_refuses_when_only_version_file_present(
+        self, tmp_path: Path
+    ) -> None:
+        """A partially-removed prior install (SKILL.md gone, .version
+        left behind) must not have .version silently overwritten."""
+        repo = self.populated_dir(tmp_path)
+        skill = ClaudeSkill(path=repo)
+        skill.install()
+        (repo / "SKILL.md").unlink()
+        assert not skill.exists
+        with pytest.raises(FileExistsError):
+            skill.install()
+        # --force still works and rewrites cleanly.
+        skill.install(force=True)
+        assert skill.exists
+
     def test_force_reinstall_replaces_only_skill_files(self, tmp_path: Path) -> None:
         repo = self.populated_dir(tmp_path)
         skill = ClaudeSkill(path=repo)
@@ -388,9 +404,25 @@ class TestProjectRootSpecs:
         (dest / "SKILL.md").write_text("installed", encoding="utf-8")
         assert skills_from_spec(str(dest)) == (ClaudeSkill(path=dest),)
 
-    def test_contree_basename_stays_literal(self, tmp_path: Path) -> None:
-        dest = tmp_path / "anywhere" / SKILL_NAME
+    def test_contree_basename_under_skills_dir_stays_literal(
+        self, tmp_path: Path
+    ) -> None:
+        """A path shaped like a real install target (.../skills/contree)
+        stays literal even without SKILL.md, e.g. a partially-removed
+        install being pointed at directly for cleanup."""
+        dest = tmp_path / "anywhere" / "skills" / SKILL_NAME
         assert skills_from_spec(str(dest)) == (ClaudeSkill(path=dest),)
+
+    def test_contree_basename_elsewhere_expands_as_project_root(
+        self, tmp_path: Path
+    ) -> None:
+        """A project directory that merely happens to be named `contree`
+        (parent isn't `skills/`) must NOT be mistaken for a skill
+        artifact -- it expands like any other project root."""
+        root = tmp_path / "anywhere" / SKILL_NAME
+        skills = skills_from_spec(str(root))
+        assert len(skills) == len(ALL_SKILL_TYPES)
+        assert all(str(s.path).startswith(str(root)) for s in skills)
 
     def test_md_path_stays_literal(self, tmp_path: Path) -> None:
         dest = tmp_path / "somewhere" / "custom.md"
