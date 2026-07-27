@@ -46,6 +46,8 @@ ARG_SOURCES: dict[ArgKey, str] = {
     (("cat",), "path"): "sandbox-path",
     (("cp",), "path"): "sandbox-path",
     (("cp",), "dest"): "host-path",
+    (("export",), "path"): "sandbox-path",
+    (("export",), "output"): "host-path",
     (("cd",), "path"): "sandbox-dir",
     (("file", "edit"), "path"): "sandbox-path",
     (("file", "edit"), "editor"): "editor",

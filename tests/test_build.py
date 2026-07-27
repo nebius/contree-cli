@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-import json
+import re
 from contextvars import copy_context
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from conftest import ContreeTestClient, FakeResponse
+from conftest import ContreeTestClient
+from contree_client.exceptions import NotFoundError
+from contree_client.models import (
+    FileResponse,
+    Image,
+    InstanceSpawnResponse,
+    OperationResponse,
+)
+from contree_client.profiles import Profile
 
 from contree_cli import CLIENT, FORMATTER, PROFILE, SESSION_STORE
 from contree_cli.cli.build import (
@@ -14,7 +22,6 @@ from contree_cli.cli.build import (
     cmd_build,
     make_session_key,
 )
-from contree_cli.config import ConfigProfile
 from contree_cli.output import JSONFormatter
 from contree_cli.session import SessionStore
 
@@ -22,69 +29,74 @@ BASE_IMG = "11111111-1111-1111-1111-111111111111"
 NEW_IMG = "22222222-2222-2222-2222-222222222222"
 NEW_IMG_2 = "33333333-3333-3333-3333-333333333333"
 
+# A prepared mock outcome: (operation name, result model or exception).
+MockSpec = tuple[str, object]
 
-def make_op_success(image: str, op_uuid: str = "op-1") -> FakeResponse:
-    return FakeResponse.json(
-        {
-            "uuid": op_uuid,
-            "kind": "instance",
-            "status": "SUCCESS",
-            "duration": 1.0,
-            "metadata": {
-                "result": {
-                    "state": {"exit_code": 0},
-                    "stdout": None,
-                    "stderr": None,
-                }
-            },
-            "result": {"image": image, "tag": ""},
-        }
+
+def make_op_success(image: str, op_uuid: str = "op-1") -> MockSpec:
+    # OperationInstanceMetadata requires `command` and `image` on the
+    # wire; the API always echoes the spawn parameters back here.
+    return (
+        "get_operation_status",
+        OperationResponse.from_dict(
+            {
+                "uuid": op_uuid,
+                "kind": "instance",
+                "status": "SUCCESS",
+                "duration": 1.0,
+                "metadata": {
+                    "command": "echo hi",
+                    "image": BASE_IMG,
+                    "shell": True,
+                    "result": {
+                        "state": {"exit_code": 0},
+                        "stdout": None,
+                        "stderr": None,
+                    },
+                },
+                "result": {"image": image, "tag": ""},
+            }
+        ),
     )
 
 
-def make_spawn(op_uuid: str = "op-1") -> FakeResponse:
-    return FakeResponse.json({"uuid": op_uuid, "status": "PENDING"}, status=201)
+def make_spawn(op_uuid: str = "op-1") -> MockSpec:
+    return ("spawn_instance", InstanceSpawnResponse.from_dict({"uuid": op_uuid}))
 
 
-def make_tag_lookup(image_uuid: str) -> FakeResponse:
-    return FakeResponse.json({"images": [{"uuid": image_uuid, "tag": "ubuntu:latest"}]})
+def make_tag_lookup(image_uuid: str) -> MockSpec:
+    return ("inspect_find_image_by_tag", image_uuid)
 
 
 def run_build(
     tc: ContreeTestClient,
     args: BuildArgs,
-    responses: list[FakeResponse],
+    mocks: list[MockSpec],
     db_path: Path,
 ):
-    tc.fake.responses.extend(responses)
-    profile = ConfigProfile(name="test", url="http://x", token="t")
+    for name, value in mocks:
+        if isinstance(value, BaseException):
+            tc.mock(name, error=value)
+        else:
+            tc.mock(name, value)
+    # The RUN streamer always opens the SSE event stream before falling
+    # back to the terminal GET; serve it empty unless the test cares.
+    if all(name != "iter_operation_events" for name, _ in mocks):
+        tc.mock("iter_operation_events", [])
+    profile = Profile(name="test", url="http://x", token="t")
     PROFILE.set(profile)
-    monkey_profile_path(profile, db_path)
     FORMATTER.set(JSONFormatter())
     CLIENT.set(tc)
-    SESSION_STORE.set(SessionStore(db_path, "placeholder"))
     ctx = copy_context()
+    previous_store = ctx.get(SESSION_STORE)
     with (
+        patch("contree_cli.cli.build.session_db_path", lambda name: db_path),
         patch("contree_cli.cli.run.time.sleep"),
-        patch("contree_cli.docker.kw_from.time.sleep"),
+        patch("contree_client.base.time.sleep"),
     ):
-        return ctx.run(cmd_build, args)
-
-
-def monkey_profile_path(profile: ConfigProfile, db_path: Path):
-    object.__setattr__(profile, "_session_db_override", db_path)
-    from contree_cli.config import ConfigProfile as RealProfile
-
-    if not hasattr(RealProfile, "_original_session_db_path"):
-        RealProfile._original_session_db_path = RealProfile.session_db_path  # type: ignore[attr-defined]
-
-        def patched(self):
-            override = getattr(self, "_session_db_override", None)
-            if override is not None:
-                return override
-            return RealProfile._original_session_db_path.fget(self)  # type: ignore[attr-defined]
-
-        RealProfile.session_db_path = property(patched)  # type: ignore[assignment,misc]
+        result = ctx.run(cmd_build, args)
+    assert ctx.get(SESSION_STORE) is previous_store
+    return result
 
 
 @pytest.fixture
@@ -121,6 +133,32 @@ class TestArgparseWiring:
 
 
 class TestSimpleBuild:
+    def test_store_is_closed_when_build_fails(self, context_dir, db_path):
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest\nRUN false\n",
+        )
+        closed: list[SessionStore] = []
+        original_close = SessionStore.close
+
+        def track_close(store: SessionStore) -> None:
+            original_close(store)
+            closed.append(store)
+
+        with patch.object(SessionStore, "close", track_close):
+            rc = run_build(
+                ContreeTestClient(),
+                BuildArgs(context=str(context_dir)),
+                [
+                    make_tag_lookup(BASE_IMG),
+                    ("spawn_instance", RuntimeError("spawn failed")),
+                ],
+                db_path,
+            )
+
+        assert rc == 1
+        assert len(closed) == 1
+
     def test_from_run_creates_expected_api_calls(self, context_dir, db_path):
         write_dockerfile(
             context_dir,
@@ -128,27 +166,27 @@ class TestSimpleBuild:
         )
         tc = ContreeTestClient()
         args = BuildArgs(context=str(context_dir))
-        responses = [
+        mocks = [
             make_tag_lookup(BASE_IMG),
             make_spawn(),
             make_op_success(NEW_IMG),
         ]
-        rc = run_build(tc, args, responses, db_path)
+        rc = run_build(tc, args, mocks, db_path)
         assert rc is None
-        # 4 wire calls: FROM's tag lookup, POST instances, SSE events
-        # follow, then the streamer's terminal GET.
-        assert tc.request_count == 4
-        assert tc.get_request(0).method == "GET"
-        assert "/v1/images" in tc.get_request(0).path
-        assert tc.get_request(1).method == "POST"
-        assert "/v1/instances" in tc.get_request(1).path
-        assert tc.get_request(2).method == "GET"
-        assert "/v1/operations/op-1/events?follow=1" in tc.get_request(2).path
-        assert tc.get_request(3).method == "GET"
-        assert (
-            tc.get_request(3).path[-len("/v1/operations/op-1") :]
-            == "/v1/operations/op-1"
-        )
+        # FROM's tag lookup, spawn, SSE events follow, the library's
+        # terminal probe and the streamer's fallback payload fetch.
+        assert [c.operation for c in tc.calls] == [
+            "inspect_find_image_by_tag",
+            "spawn_instance",
+            "iter_operation_events",
+            "get_operation_status",
+            "get_operation_status",
+        ]
+        assert tc.calls_for("inspect_find_image_by_tag")[0].args == ("ubuntu:latest",)
+        events_call = tc.calls_for("iter_operation_events")[0]
+        assert events_call.args == ("op-1",)
+        assert events_call.kwargs["follow"] is True
+        assert tc.calls_for("get_operation_status")[0].args == ("op-1",)
 
     def test_run_payload_carries_command(self, context_dir, db_path):
         write_dockerfile(
@@ -167,11 +205,9 @@ class TestSimpleBuild:
             ],
             db_path,
         )
-        spawn = tc.get_request(1)
-        body = json.loads(spawn.body.decode())
-        assert body["image"] == BASE_IMG
-        assert body["command"] == "apt-get update"
-        assert body["shell"] is True
+        spawn = tc.calls_for("spawn_instance")[0]
+        assert spawn.args == ("apt-get update", BASE_IMG)
+        assert spawn.kwargs["shell"] is True
 
     def test_run_streams_stdout_live(self, context_dir, db_path, capsys):
         """Docker-compat mode: RUN output must reach the user's terminal
@@ -179,9 +215,11 @@ class TestSimpleBuild:
 
         Uses a stubbed streamer that writes a chunk to `sys.stdout.buffer`
         and returns a completion-populated summary so the build finishes
-        with the streamed image — mirrors what a live SSE `stdout` frame
+        with the streamed image; mirrors what a live SSE `stdout` frame
         followed by a `completion` frame would produce."""
         import sys
+
+        from contree_client.models import OperationEvent
 
         from contree_cli.cli.run import TerminalSummary
 
@@ -195,16 +233,34 @@ class TestSimpleBuild:
             sys.stdout.buffer.write(b"hi from RUN\n")
             sys.stdout.buffer.flush()
             summary = TerminalSummary()
-            summary.completion = {
-                "type": "completion",
-                "data": {"status": "SUCCESS", "result_image_uuid": NEW_IMG},
-            }
-            summary.exit_event = {"type": "exit", "spid": 1, "data": {"code": 0}}
+            summary.completion = OperationEvent.from_dict(
+                {
+                    "id": 2,
+                    "ts": "2026-01-01T00:00:00+00:00",
+                    "type": "completion",
+                    "data": {
+                        "status": "SUCCESS",
+                        "duration_ms": 1000,
+                        "result_image_uuid": NEW_IMG,
+                        "error": None,
+                        "image_size_bytes": 4096,
+                    },
+                }
+            )
+            summary.exit_event = OperationEvent.from_dict(
+                {
+                    "id": 1,
+                    "ts": "2026-01-01T00:00:00+00:00",
+                    "type": "exit",
+                    "spid": 1,
+                    "data": {"code": 0, "timed_out": False},
+                }
+            )
             summary.stdout.extend(b"hi from RUN\n")
             return summary
 
         with patch(
-            "contree_cli.docker.kw_run._stream_events_until_close",
+            "contree_cli.docker.kw_run.stream_events_until_close",
             side_effect=fake_stream,
         ):
             rc = run_build(
@@ -215,7 +271,7 @@ class TestSimpleBuild:
             )
         assert rc is None
         # The live-streamed chunk lands on stdout before the final
-        # formatter record — verify both are present.
+        # formatter record; verify both are present.
         out = capsys.readouterr().out
         assert "hi from RUN" in out
 
@@ -247,8 +303,7 @@ class TestCache:
             [make_tag_lookup(BASE_IMG)],
             db_path,
         )
-        assert second.request_count == 1
-        assert "/v1/images" in second.get_request(0).path
+        assert [c.operation for c in second.calls] == ["inspect_find_image_by_tag"]
 
     def test_no_cache_reruns(self, context_dir, db_path):
         write_dockerfile(
@@ -280,9 +335,15 @@ class TestCache:
             db_path,
         )
         assert rc is None
-        # 4 wire calls per build: FROM tag lookup, POST instances, SSE
-        # follow, and the streamer's terminal GET.
-        assert second.request_count == 4
+        # FROM tag lookup, spawn, SSE follow, the library's terminal
+        # probe and the streamer's fallback payload fetch.
+        assert [c.operation for c in second.calls] == [
+            "inspect_find_image_by_tag",
+            "spawn_instance",
+            "iter_operation_events",
+            "get_operation_status",
+            "get_operation_status",
+        ]
 
     def test_no_cache_when_from_layer_is_active_branch(self, context_dir, db_path):
         """Regression: --no-cache must not blow up when the target layer
@@ -347,25 +408,24 @@ class TestCopy:
             "FROM tag:ubuntu:latest\nCOPY app.py /app.py\nRUN python /app.py\n",
         )
         tc = ContreeTestClient()
-        responses = [
+        mocks = [
             make_tag_lookup(BASE_IMG),
-            FakeResponse.json({}, status=404),
-            FakeResponse.json({"uuid": "file-1", "sha256": "abc"}),
+            ("get_file", NotFoundError(404, "not found")),
+            ("upload_file", FileResponse(uuid="file-1", sha256="abc", size=11)),
             make_spawn(),
             make_op_success(NEW_IMG),
         ]
         rc = run_build(
             tc,
             BuildArgs(context=str(context_dir)),
-            responses,
+            mocks,
             db_path,
         )
         assert rc is None
-        spawn = tc.get_request(3)
-        body = json.loads(spawn.body.decode())
-        assert "files" in body
-        assert "/app.py" in body["files"]
-        assert body["files"]["/app.py"]["uuid"] == "file-1"
+        spawn = tc.calls_for("spawn_instance")[0]
+        files = spawn.kwargs["files"]
+        assert "/app.py" in files
+        assert files["/app.py"].uuid == "file-1"
 
 
 class TestUnsupportedDirective:
@@ -406,8 +466,8 @@ class TestBuildArgs:
             ],
             db_path,
         )
-        spawn_body = json.loads(tc.get_request(1).body.decode())
-        assert spawn_body["command"] == "echo 2.5"
+        spawn = tc.calls_for("spawn_instance")[0]
+        assert spawn.args[0] == "echo 2.5"
 
     def test_arg_default_flows_into_env(self, context_dir, db_path):
         write_dockerfile(
@@ -428,9 +488,9 @@ class TestBuildArgs:
             ],
             db_path,
         )
-        spawn_body = json.loads(tc.get_request(1).body.decode())
-        assert spawn_body["command"] == "echo /opt/streamforge"
-        assert spawn_body["env"] == {"APP_HOME": "/opt/streamforge"}
+        spawn = tc.calls_for("spawn_instance")[0]
+        assert spawn.args[0] == "echo /opt/streamforge"
+        assert spawn.kwargs["env"] == {"APP_HOME": "/opt/streamforge"}
 
     def test_arg_default_referencing_earlier_arg(self, context_dir, db_path):
         write_dockerfile(
@@ -452,9 +512,9 @@ class TestBuildArgs:
             ],
             db_path,
         )
-        spawn_body = json.loads(tc.get_request(1).body.decode())
-        assert spawn_body["command"] == "echo /opt/streamforge"
-        assert spawn_body["env"] == {"APP_HOME": "/opt/streamforge"}
+        spawn = tc.calls_for("spawn_instance")[0]
+        assert spawn.args[0] == "echo /opt/streamforge"
+        assert spawn.kwargs["env"] == {"APP_HOME": "/opt/streamforge"}
 
 
 class TestSessionKey:
@@ -481,15 +541,460 @@ class TestTag:
                 make_tag_lookup(BASE_IMG),
                 make_spawn(),
                 make_op_success(NEW_IMG),
-                FakeResponse.json({}),
+                (
+                    "update_image_tag",
+                    Image.from_dict({"uuid": NEW_IMG, "tag": "mybuild:test"}),
+                ),
             ],
             db_path,
         )
         assert rc is None
-        # PATCH lands after: tag lookup (0), spawn (1), SSE events (2),
-        # streamer's terminal GET (3).
-        tag_req = tc.get_request(4)
-        assert tag_req.method == "PATCH"
-        assert NEW_IMG in tag_req.path
-        body = json.loads(tag_req.body.decode())
-        assert body == {"tag": "mybuild:test"}
+        # The tag update lands after: tag lookup, spawn, SSE events,
+        # and the streamer's terminal GET.
+        assert tc.calls[-1].operation == "update_image_tag"
+        tag_call = tc.calls_for("update_image_tag")[0]
+        assert tag_call.args == (NEW_IMG, "mybuild:test")
+
+
+# ── Multistage builds ────────────────────────────────────────────────
+
+
+STAGE_IMG = "44444444-4444-4444-4444-444444444444"
+FINAL_IMG = "55555555-5555-5555-5555-555555555555"
+
+
+def tar_bytes(entries: dict[str, bytes], dirs: tuple[str, ...] = ()) -> bytes:
+    """Build an in-memory tar the way the archive endpoint serves it:
+    members rooted at the archived basename, no leading "./"."""
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        for name in dirs:
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            tar.addfile(info)
+        for name, content in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def make_archive(entries: dict[str, bytes], dirs: tuple[str, ...] = ()) -> MockSpec:
+    return ("inspect_image_archive", [tar_bytes(entries, dirs)])
+
+
+def make_ensure_file(uuid: str = "tar-1", sha: str = "sha-1") -> MockSpec:
+    return ("ensure_file", FileResponse(uuid=uuid, sha256=sha, size=1024))
+
+
+def two_stage_dockerfile(copy_line: str) -> str:
+    return (
+        "FROM tag:ubuntu:latest AS build\n"
+        "RUN make\n"
+        "FROM tag:ubuntu:latest\n"
+        f"{copy_line}\n"
+        "RUN app\n"
+    )
+
+
+def extraction_spawn(tc: ContreeTestClient, index: int = 1):
+    """The extraction RUN sits between the stage RUN and the final RUN."""
+    return tc.calls_for("spawn_instance")[index]
+
+
+SCRATCH_DIR_RE = re.compile(r"/\.contree-build-[0-9a-f]{8}")
+
+
+def scratch_dir_of(command: str) -> str:
+    """Extract the randomised per-invocation scratch dir from a COPY --from
+    extraction command, so assertions don't hardcode the random suffix."""
+    match = SCRATCH_DIR_RE.search(command)
+    assert match, f"no scratch dir found in: {command}"
+    return match.group(0)
+
+
+class TestMultistage:
+    def build_two_stage(self, tc, context_dir, db_path, copy_line, extra_mocks=()):
+        write_dockerfile(context_dir, two_stage_dockerfile(copy_line))
+        mocks = [
+            make_tag_lookup(BASE_IMG),  # FROM ... AS build
+            make_spawn("op-1"),  # RUN make
+            make_op_success(STAGE_IMG, "op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_tag_lookup(BASE_IMG),  # FROM (final stage)
+            *extra_mocks,
+            make_spawn("op-2"),  # extraction RUN
+            make_op_success(NEW_IMG, "op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+            make_spawn("op-3"),  # RUN app
+            make_op_success(FINAL_IMG, "op-3"),
+            make_op_success(FINAL_IMG, "op-3"),
+        ]
+        return run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+
+    def test_from_reuses_sealed_stage(self, context_dir, db_path):
+        """FROM <alias> reuses the sealed stage image locally, without
+        resolving or importing it as an external reference."""
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest AS build\nRUN make\nFROM build AS next\nRUN app\n",
+        )
+        tc = ContreeTestClient()
+        mocks = [
+            make_tag_lookup(BASE_IMG),  # FROM tag:ubuntu:latest AS build
+            make_spawn("op-1"),  # RUN make
+            make_op_success(STAGE_IMG, "op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            # FROM build AS next resolves locally: no further API call.
+            make_spawn("op-2"),  # RUN app
+            make_op_success(NEW_IMG, "op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+        ]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc is None
+        assert len(tc.calls_for("inspect_find_image_by_tag")) == 1
+        assert tc.calls_for("resolve_image") == []
+        assert tc.calls_for("import_image") == []
+        second_run = tc.calls_for("spawn_instance")[1]
+        assert second_run.args[1] == STAGE_IMG
+
+    def test_copy_from_alias_single_file(self, context_dir, db_path):
+        tc = ContreeTestClient()
+        rc = self.build_two_stage(
+            tc,
+            context_dir,
+            db_path,
+            "COPY --from=build /out/app /usr/local/bin/app",
+            extra_mocks=[
+                make_archive({"app": b"binary"}),
+                make_ensure_file(),
+            ],
+        )
+        assert rc is None
+
+        # The stage alias resolves locally: no image lookup beyond the
+        # two FROM directives.
+        assert len(tc.calls_for("inspect_find_image_by_tag")) == 2
+        archive_call = tc.calls_for("inspect_image_archive")[0]
+        assert archive_call.args == (STAGE_IMG, "/out/app")
+        assert archive_call.kwargs["compressed"] is False
+
+        spawn = extraction_spawn(tc)
+        command = spawn.args[0]
+        scratch = scratch_dir_of(command)
+        files = spawn.kwargs["files"]
+        assert files[f"{scratch}/copy-0.tar"].uuid == "tar-1"
+        assert f"tar -xf {scratch}/copy-0.tar" in command
+        assert f"mv {scratch}/extract-0/app /usr/local/bin/app" in command
+        assert f"rm -rf {scratch}" in command
+
+    def test_copy_from_numeric_index(self, context_dir, db_path):
+        tc = ContreeTestClient()
+        rc = self.build_two_stage(
+            tc,
+            context_dir,
+            db_path,
+            "COPY --from=0 /out/app /app",
+            extra_mocks=[
+                make_archive({"app": b"binary"}),
+                make_ensure_file(),
+            ],
+        )
+        assert rc is None
+        assert tc.calls_for("inspect_image_archive")[0].args == (STAGE_IMG, "/out/app")
+
+    def test_copy_from_external_image(self, context_dir, db_path):
+        tc = ContreeTestClient()
+        tc.mock("resolve_image", STAGE_IMG)
+        rc = self.build_two_stage(
+            tc,
+            context_dir,
+            db_path,
+            "COPY --from=someimage:latest /bin/tool /bin/tool",
+            extra_mocks=[
+                make_archive({"tool": b"binary"}),
+                make_ensure_file(),
+            ],
+        )
+        assert rc is None
+        # resolve_image also serves the FROM lookups once mocked; the
+        # external --from reference must be among the resolved refs.
+        refs = [call.args[0] for call in tc.calls_for("resolve_image")]
+        assert "someimage:latest" in refs
+
+    def test_copy_from_unresolved_image_imports(self, context_dir, db_path):
+        """COPY --from=<external image> auto-imports on a resolve miss,
+        matching FROM's own resolve_or_import fallback.
+
+        Both FROM directives resolve "ubuntu:latest" via the first two
+        queued `inspect_find_image_by_tag` outcomes; the COPY --from
+        reference is a bare non-UUID tag too (resolve_image() falls
+        through to the same typed call for those), so the third queued
+        outcome -- a 404 -- drives it into the import fallback.
+        """
+        tc = ContreeTestClient()
+        tc.mock("import_image", "import-op-1")
+        tc.mock(
+            "wait_operation",
+            OperationResponse.from_dict(
+                {
+                    "uuid": "import-op-1",
+                    "kind": "image_import",
+                    "status": "SUCCESS",
+                    "duration": 1.0,
+                    "result": {"image": NEW_IMG_2, "tag": "someimage:latest"},
+                }
+            ),
+        )
+        rc = self.build_two_stage(
+            tc,
+            context_dir,
+            db_path,
+            "COPY --from=someimage:latest /bin/tool /bin/tool",
+            extra_mocks=[
+                ("inspect_find_image_by_tag", NotFoundError(404, "no such image")),
+                make_archive({"tool": b"binary"}),
+                make_ensure_file(),
+            ],
+        )
+        assert rc is None
+        assert tc.calls_for("import_image")[0].kwargs["tag"] == "someimage:latest"
+        archive_call = tc.calls_for("inspect_image_archive")[0]
+        assert archive_call.args[0] == NEW_IMG_2
+
+    def test_copy_from_directory_source(self, context_dir, db_path):
+        tc = ContreeTestClient()
+        rc = self.build_two_stage(
+            tc,
+            context_dir,
+            db_path,
+            "COPY --from=build /out /srv/out",
+            extra_mocks=[
+                make_archive(
+                    {"out/a.txt": b"a", "out/sub/b.txt": b"b"},
+                    dirs=("out", "out/sub"),
+                ),
+                make_ensure_file(),
+            ],
+        )
+        assert rc is None
+        command = extraction_spawn(tc).args[0]
+        scratch = scratch_dir_of(command)
+        # Directory sources copy their CONTENTS into dest.
+        assert "mkdir -p /srv/out" in command
+        assert f"cp -a {scratch}/extract-0/out/. /srv/out/" in command
+
+    def test_copy_from_file_into_dir_dest(self, context_dir, db_path):
+        tc = ContreeTestClient()
+        rc = self.build_two_stage(
+            tc,
+            context_dir,
+            db_path,
+            "COPY --from=build /out/app /usr/local/bin/",
+            extra_mocks=[
+                make_archive({"app": b"binary"}),
+                make_ensure_file(),
+            ],
+        )
+        assert rc is None
+        command = extraction_spawn(tc).args[0]
+        scratch = scratch_dir_of(command)
+        assert f"mv {scratch}/extract-0/app /usr/local/bin/app" in command
+
+    def test_copy_from_chown_chmod(self, context_dir, db_path):
+        tc = ContreeTestClient()
+        rc = self.build_two_stage(
+            tc,
+            context_dir,
+            db_path,
+            "COPY --from=build --chown=10:20 --chmod=0755 /out/app /app",
+            extra_mocks=[
+                make_archive({"app": b"binary"}),
+                make_ensure_file(),
+            ],
+        )
+        assert rc is None
+        command = extraction_spawn(tc).args[0]
+        scratch = scratch_dir_of(command)
+        assert f"chown -R 10:20 {scratch}/extract-0/app" in command
+        assert f"chmod 755 {scratch}/extract-0/app" in command
+
+    def test_extraction_not_wrapped_with_user(self, context_dir, db_path):
+        """COPY --from extracts as root even under an active USER."""
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest AS build\n"
+            "RUN make\n"
+            "FROM tag:ubuntu:latest\n"
+            "USER app\n"
+            "COPY --from=build /out/app /app\n"
+            "RUN app\n",
+        )
+        tc = ContreeTestClient()
+        mocks = [
+            make_tag_lookup(BASE_IMG),
+            make_spawn("op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_tag_lookup(BASE_IMG),
+            make_archive({"app": b"binary"}),
+            make_ensure_file(),
+            make_spawn("op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+            make_spawn("op-3"),
+            make_op_success(FINAL_IMG, "op-3"),
+            make_op_success(FINAL_IMG, "op-3"),
+        ]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc is None
+        extraction = extraction_spawn(tc).args[0]
+        assert "su -s" not in extraction
+        # The user RUN after it is still wrapped.
+        final = tc.calls_for("spawn_instance")[2].args[0]
+        assert "su -s" in final
+
+    def test_stage_state_reset_on_from(self, context_dir, db_path):
+        """USER, ENV, and WORKDIR do not leak into the next stage."""
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest AS build\n"
+            "USER app\n"
+            "ENV FOO=bar\n"
+            "WORKDIR /src\n"
+            "RUN make\n"
+            "FROM tag:ubuntu:latest\n"
+            "RUN id\n",
+        )
+        tc = ContreeTestClient()
+        mocks = [
+            make_tag_lookup(BASE_IMG),
+            make_spawn("op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_tag_lookup(BASE_IMG),
+            make_spawn("op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+        ]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc is None
+        first, second = tc.calls_for("spawn_instance")
+        assert "su -s" in first.args[0]
+        assert first.kwargs["cwd"] == "/src"
+        assert first.kwargs["env"] == {"FOO": "bar"}
+        assert "su -s" not in second.args[0]
+        assert second.kwargs["cwd"] is ...
+        assert second.kwargs["env"] is ...
+
+    def test_stage_with_pending_files_sealed_via_closer(self, context_dir, db_path):
+        """A stage ending with a local COPY is committed by the closer
+        RUN before the next FROM starts."""
+        (context_dir / "a.txt").write_text("a")
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest AS build\n"
+            "COPY a.txt /a.txt\n"
+            "FROM tag:ubuntu:latest\n"
+            "COPY --from=build /a.txt /b.txt\n",
+        )
+        tc = ContreeTestClient()
+        mocks = [
+            make_tag_lookup(BASE_IMG),
+            ("get_file", NotFoundError(404, "missing")),
+            ("upload_file", FileResponse(uuid="file-1", sha256="s", size=1)),
+            make_spawn("op-1"),  # closer RUN sealing stage `build`
+            make_op_success(STAGE_IMG, "op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_tag_lookup(BASE_IMG),
+            make_archive({"a.txt": b"a"}),
+            make_ensure_file(),
+            make_spawn("op-2"),  # extraction RUN
+            make_op_success(NEW_IMG, "op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+        ]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc is None
+        closer = tc.calls_for("spawn_instance")[0]
+        assert closer.args[0] == ":"
+        assert "/a.txt" in closer.kwargs["files"]
+        # The archive is exported from the sealed stage image.
+        assert tc.calls_for("inspect_image_archive")[0].args == (STAGE_IMG, "/a.txt")
+
+    def test_stage_sealed_under_user_not_su_wrapped(self, context_dir, db_path):
+        """Sealing a stage that ends after USER still commits as root."""
+        (context_dir / "a.txt").write_text("a")
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest AS build\n"
+            "USER 1000:1000\n"
+            "COPY a.txt /a.txt\n"
+            "FROM tag:ubuntu:latest\n"
+            "COPY --from=build /a.txt /b.txt\n",
+        )
+        tc = ContreeTestClient()
+        mocks = [
+            make_tag_lookup(BASE_IMG),
+            ("get_file", NotFoundError(404, "missing")),
+            ("upload_file", FileResponse(uuid="file-1", sha256="s", size=1)),
+            make_spawn("op-1"),  # closer RUN sealing stage `build`
+            make_op_success(STAGE_IMG, "op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_tag_lookup(BASE_IMG),
+            make_archive({"a.txt": b"a"}),
+            make_ensure_file(),
+            make_spawn("op-2"),  # extraction RUN
+            make_op_success(NEW_IMG, "op-2"),
+            make_op_success(NEW_IMG, "op-2"),
+        ]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc is None
+        closer = tc.calls_for("spawn_instance")[0]
+        assert closer.args[0] == ":"
+        assert "su -s" not in closer.args[0]
+
+    def test_unknown_stage_fails(self, context_dir, db_path):
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest\nCOPY --from=nosuch /x /x\n",
+        )
+        tc = ContreeTestClient()
+        tc.mock("resolve_image", error=NotFoundError(404, "no such image"))
+        mocks = [make_tag_lookup(BASE_IMG)]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc == 1
+
+    def test_missing_path_in_stage_fails(self, context_dir, db_path):
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest AS build\n"
+            "RUN make\n"
+            "FROM tag:ubuntu:latest\n"
+            "COPY --from=build /nope /x\n",
+        )
+        tc = ContreeTestClient()
+        mocks = [
+            make_tag_lookup(BASE_IMG),
+            make_spawn("op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_op_success(STAGE_IMG, "op-1"),
+            make_tag_lookup(BASE_IMG),
+            ("inspect_image_archive", NotFoundError(404, "path not found")),
+        ]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc == 1
+
+    def test_add_from_fails(self, context_dir, db_path):
+        write_dockerfile(
+            context_dir,
+            "FROM tag:ubuntu:latest\nADD --from=build /x /x\n",
+        )
+        tc = ContreeTestClient()
+        mocks = [make_tag_lookup(BASE_IMG)]
+        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
+        assert rc == 1

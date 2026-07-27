@@ -82,7 +82,7 @@ contree auth ls -O
 For automation, use structured output:
 
 ```bash
-contree -f json auth ls
+contree -o json auth ls
 ```
 
 ## Switching profiles

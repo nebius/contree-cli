@@ -6,11 +6,11 @@ from unittest.mock import patch
 
 import pytest
 from conftest import ContreeTestClient
+from contree_client.models import Image, OperationResponse
 
 from contree_cli import CLIENT, FORMATTER
 from contree_cli.cli.images import (
     LIMIT_DEFAULT,
-    PAGE_SIZE,
     ImagesArgs,
     ImportArgs,
     _derive_tag,
@@ -25,14 +25,8 @@ from contree_cli.types import parse_interval
 
 
 def _run_cmd(tc: ContreeTestClient, images, *, formatter=None, **kwargs):
-    """Run cmd_images with a single-page response."""
-    return _run_cmd_pages(tc, [images], formatter=formatter, **kwargs)
-
-
-def _run_cmd_pages(tc: ContreeTestClient, pages, *, formatter=None, **kwargs):
-    """Run cmd_images with multiple pages of responses."""
-    for page in pages:
-        tc.respond_json({"images": page})
+    """Run cmd_images against a mocked image stream."""
+    _mock_images(tc, images)
 
     FORMATTER.set(formatter or CSVFormatter())
     ctx = copy_context()
@@ -60,7 +54,8 @@ class TestCmdImages:
 
     def test_prefix_passed_as_tag_param(self, contree_client):
         _run_cmd(contree_client, [], prefix="ubuntu")
-        assert "tag=ubuntu" in contree_client.request_paths[0]
+        calls = contree_client.calls_for("iter_images")
+        assert calls[0].kwargs["tag"] == "ubuntu"
 
     def test_null_tag_shown_as_empty(self, contree_client, capsys):
         images = [
@@ -101,8 +96,10 @@ class TestCmdImages:
         assert len(lines) == 3  # header + 2 rows
         assert "UUID" in lines[0]
 
-    def test_unknown_field_passes_through(self, contree_client, capsys):
-        """New server fields (e.g. ``size``, ``digest``) reach the row as-is."""
+    def test_unknown_field_dropped(self, contree_client, capsys):
+        """Fields absent from the typed Image model (e.g. ``size``,
+        ``digest``) are dropped by the contree-client parser; only the
+        model's known fields reach the row."""
         images = [
             {
                 "uuid": "ggg",
@@ -114,8 +111,10 @@ class TestCmdImages:
         ]
         _run_cmd(contree_client, images, formatter=JSONFormatter())
         parsed = json.loads(capsys.readouterr().out.strip())
-        assert parsed["size"] == 12345
-        assert parsed["digest"] == "sha256:abcd"
+        assert parsed["uuid"] == "ggg"
+        assert parsed["tag"] == "v4"
+        assert "size" not in parsed
+        assert "digest" not in parsed
 
     def test_nested_fields_skipped(self, contree_client, capsys):
         images = [
@@ -137,156 +136,133 @@ class TestCmdImages:
 class TestImagesParams:
     def test_uuid_param(self, contree_client):
         _run_cmd(contree_client, [], uuid="abc-123")
-        assert "uuid=abc-123" in contree_client.request_paths[0]
+        calls = contree_client.calls_for("iter_images")
+        assert calls[0].kwargs["uuid"] == "abc-123"
 
     def test_default_tagged_only_param(self, contree_client):
         _run_cmd(contree_client, [])
-        assert "tagged=1" in contree_client.request_paths[0]
+        calls = contree_client.calls_for("iter_images")
+        assert calls[0].kwargs["tagged"] is True
 
     def test_all_param_disables_tagged_filter(self, contree_client):
         _run_cmd(contree_client, [], all_images=True)
-        assert "tagged=1" not in contree_client.request_paths[0]
+        calls = contree_client.calls_for("iter_images")
+        assert calls[0].kwargs["tagged"] is False
 
     def test_since_param(self, contree_client):
+        """The parsed datetime goes to the client as-is; the library
+        owns the wire formatting (format_time_param)."""
+        from datetime import datetime
+
         _run_cmd(contree_client, [], since="1h")
-        path = contree_client.request_paths[0]
-        assert "since=" in path
+        calls = contree_client.calls_for("iter_images")
+        assert isinstance(calls[0].kwargs["since"], datetime)
 
     def test_until_param(self, contree_client):
+        from datetime import datetime
+
         _run_cmd(contree_client, [], until="2025-01-01")
-        path = contree_client.request_paths[0]
-        assert "until=" in path
+        calls = contree_client.calls_for("iter_images")
+        assert isinstance(calls[0].kwargs["until"], datetime)
 
 
 def _make_image(i: int) -> dict:
     return {"uuid": f"uuid-{i}", "tag": None, "created_at": "2025-01-01T00:00:00Z"}
 
 
+def _mock_images(tc: ContreeTestClient, images: list[dict]) -> None:
+    tc.mock("iter_images", [Image.from_dict(image) for image in images])
+
+
 class TestImagesPagination:
-    def test_single_page_partial(self, contree_client, capsys):
-        """A page smaller than PAGE_SIZE means no further requests."""
+    """Offset pagination is the library's job (iter_images); the CLI
+    contract is a single iterator pass with the record budget
+    forwarded as limit and truncation detected via one extra item."""
+
+    def test_single_iterator_pass(self, contree_client, capsys):
         images = [_make_image(i) for i in range(5)]
         _run_cmd(contree_client, images)
-        assert contree_client.request_count == 1
+        assert len(contree_client.calls_for("iter_images")) == 1
 
-    def test_two_full_pages(self, contree_client, capsys):
-        """Two full pages + an empty third page."""
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        page2 = [_make_image(i) for i in range(PAGE_SIZE, PAGE_SIZE + 3)]
-        _run_cmd_pages(contree_client, [page1, page2])
-        assert contree_client.request_count == 2
-        out = capsys.readouterr().out
-        assert f"uuid-{PAGE_SIZE + 2}" in out
+    def test_limit_forwarded_with_probe(self, contree_client):
+        _run_cmd(contree_client, [], limit=7)
+        calls = contree_client.calls_for("iter_images")
+        assert calls[0].kwargs["limit"] == 8
 
-    def test_offset_increments(self, contree_client):
-        """Each page request increments offset by PAGE_SIZE."""
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        page2 = []
-        _run_cmd_pages(contree_client, [page1, page2])
-        paths = contree_client.request_paths
-        assert "offset=0" in paths[0]
-        assert f"offset={PAGE_SIZE}" in paths[1]
-
-    def test_empty_first_page(self, contree_client, capsys):
-        """No output and only one request when first page is empty."""
+    def test_empty_stream(self, contree_client, capsys):
+        """No output when the stream is empty."""
         _run_cmd(contree_client, [])
-        assert contree_client.request_count == 1
         assert capsys.readouterr().out == ""
 
     def test_all_images_emitted(self, contree_client, capsys):
-        """All images across pages appear in output."""
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        page2 = [_make_image(i) for i in range(PAGE_SIZE, PAGE_SIZE + 5)]
-        _run_cmd_pages(contree_client, [page1, page2])
+        images = [_make_image(i) for i in range(25)]
+        _run_cmd(contree_client, images)
         out = capsys.readouterr().out
-        assert out.count("uuid-") == PAGE_SIZE + 5
+        assert out.count("uuid-") == 25
 
-    def test_pages_flushed_progressively(self, contree_client, capsys):
-        """Each full page is flushed as it completes (streaming output)."""
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        page2 = [_make_image(i) for i in range(PAGE_SIZE, PAGE_SIZE * 2)]
-        page3 = [_make_image(i) for i in range(PAGE_SIZE * 2, PAGE_SIZE * 2 + 3)]
-        _run_cmd_pages(contree_client, [page1, page2, page3])
-        out = capsys.readouterr().out
-        assert f"uuid-{PAGE_SIZE - 1}" in out
-        assert f"uuid-{PAGE_SIZE * 2 - 1}" in out
-        assert f"uuid-{PAGE_SIZE * 2 + 2}" in out
+    def test_progress_logged_per_page(self, contree_client, caplog):
+        """Every consumed page reports progress, so a long listing does
+        not look hung while the next page loads."""
+        import logging
+
+        images = [_make_image(i) for i in range(1500)]
+        with caplog.at_level(logging.INFO, logger="contree_cli.cli.images"):
+            _run_cmd(contree_client, images, limit=3000)
+        progress = [
+            r.getMessage() for r in caplog.records if "loading more" in r.getMessage()
+        ]
+        assert progress == ["Fetched 1000 images, loading more..."]
 
     def test_default_limit_matches_constant(self):
         assert LIMIT_DEFAULT > 0
         assert ImagesArgs().limit == LIMIT_DEFAULT
 
     def test_limit_truncates_with_warning(self, contree_client, caplog):
-        """Hitting --limit triggers a probe; non-empty probe -> warning."""
+        """An extra record past --limit means truncation -> warning."""
         import logging
 
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        contree_client.respond_json({"images": page1})
-        contree_client.respond_json({"images": [_make_image(PAGE_SIZE)]})
+        _mock_images(contree_client, [_make_image(i) for i in range(6)])
 
         FORMATTER.set(CSVFormatter())
         ctx = copy_context()
         with caplog.at_level(logging.WARNING, logger="contree_cli.cli.images"):
-            ctx.run(cmd_images, ImagesArgs(limit=PAGE_SIZE))
+            ctx.run(cmd_images, ImagesArgs(limit=5))
         msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any("truncated" in m and f"--limit={PAGE_SIZE}" in m for m in msgs)
-        assert contree_client.request_count == 2
-
-    def test_limit_probe_uses_skip_of_one(self, contree_client):
-        """Probe is a single-record request, not a full page."""
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        contree_client.respond_json({"images": page1})
-        contree_client.respond_json({"images": []})
-
-        FORMATTER.set(CSVFormatter())
-        ctx = copy_context()
-        ctx.run(cmd_images, ImagesArgs(limit=PAGE_SIZE))
-
-        probe_path = contree_client.request_paths[1]
-        assert "limit=1" in probe_path
-        assert f"offset={PAGE_SIZE}" in probe_path
+        assert any("truncated" in m and "--limit=5" in m for m in msgs)
 
     def test_limit_warning_after_table_flush(self, contree_client, caplog, capsys):
         """TableFormatter buffer is flushed before the truncation warning."""
         import logging
 
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        contree_client.respond_json({"images": page1})
-        contree_client.respond_json({"images": [_make_image(PAGE_SIZE)]})
+        _mock_images(contree_client, [_make_image(i) for i in range(6)])
 
         FORMATTER.set(TableFormatter())
         ctx = copy_context()
         with caplog.at_level(logging.WARNING, logger="contree_cli.cli.images"):
-            ctx.run(cmd_images, ImagesArgs(limit=PAGE_SIZE))
+            ctx.run(cmd_images, ImagesArgs(limit=5))
 
         out = capsys.readouterr().out
         # Table content must be printed (i.e. flushed) before the handler
         # logs the warning. Verify the table is on stdout already.
         assert "uuid-0" in out
-        assert f"uuid-{PAGE_SIZE - 1}" in out
+        assert "uuid-4" in out
 
-    def test_limit_no_warning_when_no_more(self, contree_client, caplog):
-        """Empty probe response -> no warning."""
+    def test_limit_no_warning_when_stream_fits(self, contree_client, caplog):
+        """Exactly --limit records -> no warning."""
         import logging
 
-        page1 = [_make_image(i) for i in range(PAGE_SIZE)]
-        contree_client.respond_json({"images": page1})
-        contree_client.respond_json({"images": []})
+        _mock_images(contree_client, [_make_image(i) for i in range(5)])
 
         FORMATTER.set(CSVFormatter())
         ctx = copy_context()
         with caplog.at_level(logging.WARNING, logger="contree_cli.cli.images"):
-            ctx.run(cmd_images, ImagesArgs(limit=PAGE_SIZE))
+            ctx.run(cmd_images, ImagesArgs(limit=5))
         warns = [r for r in caplog.records if r.levelname == "WARNING"]
         assert not any("truncated" in r.getMessage() for r in warns)
 
-    def test_limit_smaller_than_page_size_emits_only_limit_records(
-        self, contree_client, capsys
-    ):
-        """--limit < PAGE_SIZE: caller emits exactly limit records from the page."""
-        contree_client.respond_json(
-            {"images": [_make_image(i) for i in range(PAGE_SIZE)]}
-        )
+    def test_limit_emits_only_limit_records(self, contree_client, capsys):
+        """The stream past --limit is not emitted."""
+        _mock_images(contree_client, [_make_image(i) for i in range(10)])
 
         FORMATTER.set(CSVFormatter())
         ctx = copy_context()
@@ -295,15 +271,6 @@ class TestImagesPagination:
         out = capsys.readouterr().out
         # 1 header row + 3 data rows.
         assert len(out.strip().splitlines()) == 4
-
-    def test_progress_not_logged_for_single_short_page(self, contree_client, caplog):
-        """Final/only partial page does not emit progress (output covers it)."""
-        import logging
-
-        images = [_make_image(i) for i in range(5)]
-        with caplog.at_level(logging.INFO, logger="contree_cli.cli.images"):
-            _run_cmd(contree_client, images)
-        assert not any("images so far" in r.getMessage() for r in caplog.records)
 
 
 class TestImagesCreatedAtFormats:
@@ -489,13 +456,17 @@ class TestDeriveTag:
 # ---------------------------------------------------------------------------
 
 
-def _op_response(uuid: str, status: str = "PENDING", image: str = ""):
+def _op_response(
+    uuid: str, status: str = "PENDING", image: str = ""
+) -> OperationResponse:
     result = {"image": image} if image else {}
-    return {"uuid": uuid, "status": status, "result": result}
+    return OperationResponse.from_dict(
+        {"uuid": uuid, "status": status, "result": result}
+    )
 
 
 def _run_import(tc: ContreeTestClient, refs: list[str], *, formatter=None, **kwargs):
-    """Run cmd_import with mocked HTTP and time.sleep."""
+    """Run cmd_import with mocked client and time.sleep."""
     FORMATTER.set(formatter or CSVFormatter())
     ctx = copy_context()
     args = ImportArgs(refs=refs, **kwargs)
@@ -505,94 +476,95 @@ def _run_import(tc: ContreeTestClient, refs: list[str], *, formatter=None, **kwa
 
 class TestCmdImport:
     def test_single_import_success(self, contree_client, capsys):
-        # POST response (operation created)
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
-        # GET poll response (terminal)
-        contree_client.respond_json(
-            _op_response("op-1", "SUCCESS", image="img-1"),
+        contree_client.mock("import_image", "op-1")
+        contree_client.mock(
+            "get_operation_status", _op_response("op-1", "SUCCESS", "img-1")
         )
 
         rc = _run_import(contree_client, ["ubuntu:latest"])
 
         assert rc is None
-        paths = contree_client.request_paths
-        assert "/v1/images/import" in paths[0]
-        assert "/v1/operations/op-1" in paths[1]
+        assert len(contree_client.calls_for("import_image")) == 1
+        polls = contree_client.calls_for("get_operation_status")
+        assert polls[0].args == ("op-1",)
         out = capsys.readouterr().out
         assert "op-1" in out
 
-    def test_normalized_url_in_post_body(self, contree_client):
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
-        contree_client.respond_json(_op_response("op-1", "SUCCESS"))
+    def test_normalized_url_in_request(self, contree_client):
+        contree_client.mock("import_image", "op-1")
+        contree_client.mock("get_operation_status", _op_response("op-1", "SUCCESS"))
 
         _run_import(contree_client, ["ubuntu:latest"])
 
-        req = contree_client.get_request(0)
-        payload = json.loads(req.body)
-        assert payload["registry"]["url"] == "docker://docker.io/library/ubuntu:latest"
-        assert payload["tag"] == "ubuntu:latest"
-        assert "timeout" not in payload
+        call = contree_client.calls_for("import_image")[0]
+        registry = call.args[0]
+        assert registry.url == "docker://docker.io/library/ubuntu:latest"
+        assert registry.credentials is ...
+        assert call.kwargs["tag"] == "ubuntu:latest"
+        assert call.kwargs["timeout"] is ...
 
-    def test_timeout_included_in_post_body(self, contree_client):
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
-        contree_client.respond_json(_op_response("op-1", "SUCCESS"))
+    def test_timeout_included_in_request(self, contree_client):
+        contree_client.mock("import_image", "op-1")
+        contree_client.mock("get_operation_status", _op_response("op-1", "SUCCESS"))
 
         _run_import(contree_client, ["ubuntu:latest"], timeout=60)
 
-        req = contree_client.get_request(0)
-        payload = json.loads(req.body)
-        assert payload["timeout"] == 60
+        call = contree_client.calls_for("import_image")[0]
+        assert call.kwargs["timeout"] == 60
 
     def test_brace_expansion_multiple(self, contree_client, capsys):
-        # 3 POST responses
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
-        contree_client.respond_json({"uuid": "op-2"}, status=201)
-        contree_client.respond_json({"uuid": "op-3"}, status=201)
+        # 3 import operations
+        contree_client.mock("import_image", "op-1")
+        contree_client.mock("import_image", "op-2")
+        contree_client.mock("import_image", "op-3")
         # 3 poll responses (all terminal on first poll)
-        contree_client.respond_json(_op_response("op-1", "SUCCESS", "img-1"))
-        contree_client.respond_json(_op_response("op-2", "SUCCESS", "img-2"))
-        contree_client.respond_json(_op_response("op-3", "SUCCESS", "img-3"))
+        contree_client.mock(
+            "get_operation_status", _op_response("op-1", "SUCCESS", "img-1")
+        )
+        contree_client.mock(
+            "get_operation_status", _op_response("op-2", "SUCCESS", "img-2")
+        )
+        contree_client.mock(
+            "get_operation_status", _op_response("op-3", "SUCCESS", "img-3")
+        )
 
         rc = _run_import(contree_client, ["ubuntu:{latest,noble,jammy}"])
 
         assert rc is None
-        # 3 POSTs + 3 GETs = 6 requests
-        assert contree_client.request_count == 6
+        assert len(contree_client.calls_for("import_image")) == 3
+        assert len(contree_client.calls_for("get_operation_status")) == 3
         out = capsys.readouterr().out
         assert "op-1" in out
         assert "op-2" in out
         assert "op-3" in out
 
     def test_polls_until_terminal(self, contree_client, capsys):
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
+        contree_client.mock("import_image", "op-1")
         # First poll: still pending
-        contree_client.respond_json(_op_response("op-1", "EXECUTING"))
+        contree_client.mock("get_operation_status", _op_response("op-1", "EXECUTING"))
         # Second poll: done
-        contree_client.respond_json(_op_response("op-1", "SUCCESS", "img-1"))
+        contree_client.mock(
+            "get_operation_status", _op_response("op-1", "SUCCESS", "img-1")
+        )
 
         rc = _run_import(contree_client, ["ubuntu:latest"])
 
         assert rc is None
-        # 1 POST + 2 GETs
-        assert contree_client.request_count == 3
+        assert len(contree_client.calls_for("import_image")) == 1
+        assert len(contree_client.calls_for("get_operation_status")) == 2
 
     def test_failed_import_returns_1(self, contree_client):
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
-        contree_client.respond_json(
-            _op_response("op-1", "FAILED"),
-        )
+        contree_client.mock("import_image", "op-1")
+        contree_client.mock("get_operation_status", _op_response("op-1", "FAILED"))
 
         rc = _run_import(contree_client, ["ubuntu:latest"])
 
         assert rc == 1
 
     def test_keyboard_interrupt_cancels_all(self, contree_client):
-        # POST responses
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
-        contree_client.respond_json({"uuid": "op-2"}, status=201)
-        # DELETE responses for cancellation
-        contree_client.respond(status=200)
-        contree_client.respond(status=200)
+        contree_client.mock("import_image", "op-1")
+        contree_client.mock("import_image", "op-2")
+        contree_client.mock("cancel_operation", None)
 
         FORMATTER.set(CSVFormatter())
         CLIENT.set(contree_client)
@@ -608,30 +580,25 @@ class TestCmdImport:
         ):
             ctx.run(cmd_import, args)
 
-        # 2 POSTs + 2 DELETEs (cancellations)
-        assert contree_client.request_count == 4
-        paths = contree_client.request_paths
-        assert "/v1/operations/op-1" in paths[2]
-        assert "/v1/operations/op-2" in paths[3]
+        cancels = contree_client.calls_for("cancel_operation")
+        assert [c.args for c in cancels] == [("op-1",), ("op-2",)]
 
     def test_explicit_tag(self, contree_client):
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
-        contree_client.respond_json(_op_response("op-1", "SUCCESS"))
+        contree_client.mock("import_image", "op-1")
+        contree_client.mock("get_operation_status", _op_response("op-1", "SUCCESS"))
 
         _run_import(contree_client, ["ubuntu:latest?tag=myubuntu:test"])
 
-        req = contree_client.get_request(0)
-        payload = json.loads(req.body)
-        assert payload["registry"]["url"] == "docker://docker.io/library/ubuntu:latest"
-        assert payload["tag"] == "myubuntu:test"
+        call = contree_client.calls_for("import_image")[0]
+        assert call.args[0].url == "docker://docker.io/library/ubuntu:latest"
+        assert call.kwargs["tag"] == "myubuntu:test"
 
     def test_ghcr_implicit_tag(self, contree_client):
-        contree_client.respond_json({"uuid": "op-1"}, status=201)
-        contree_client.respond_json(_op_response("op-1", "SUCCESS"))
+        contree_client.mock("import_image", "op-1")
+        contree_client.mock("get_operation_status", _op_response("op-1", "SUCCESS"))
 
         _run_import(contree_client, ["ghcr.io/ubuntu/ubuntu:latest"])
 
-        req = contree_client.get_request(0)
-        payload = json.loads(req.body)
-        assert payload["registry"]["url"] == "docker://ghcr.io/ubuntu/ubuntu:latest"
-        assert payload["tag"] == "ubuntu/ubuntu:latest"
+        call = contree_client.calls_for("import_image")[0]
+        assert call.args[0].url == "docker://ghcr.io/ubuntu/ubuntu:latest"
+        assert call.kwargs["tag"] == "ubuntu/ubuntu:latest"

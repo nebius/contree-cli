@@ -26,15 +26,23 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
-import json
 import logging
 import os
 from dataclasses import dataclass
 from multiprocessing.pool import ThreadPool
 
+from contree_client.exceptions import ContreeAPIError
+from contree_client.models import WhoAmIResponse
+
 from contree_cli import FORMATTER, ArgumentsProtocol, SetupResult
-from contree_cli.client import ApiError, client_from_profile
-from contree_cli.config import AuthType, Config, ConfigProfile
+from contree_cli.client import client_from_profile
+from contree_cli.config import (
+    AUTH_TYPE_IAM,
+    AUTH_TYPE_JWT,
+    DEFAULT_IAM_URL,
+    Config,
+    Profile,
+)
 from contree_cli.types import FLAGS
 
 logger = logging.getLogger(__name__)
@@ -54,7 +62,7 @@ for coding agents:
 class AuthArgs(ArgumentsProtocol):
     token: str | None = None
     url: str | None = None
-    auth_type: AuthType = AuthType.IAM
+    auth_type: str = AUTH_TYPE_IAM
     project: str | None = None
     profile: str = "default"
     force: bool = False
@@ -64,7 +72,7 @@ class AuthArgs(ArgumentsProtocol):
         return cls(
             token=ns.auth_token or None,
             url=ns.auth_url or None,
-            auth_type=AuthType(ns.auth_type) if ns.auth_type else AuthType.IAM,
+            auth_type=ns.auth_type or AUTH_TYPE_IAM,
             project=ns.auth_project or None,
             profile=ns.profile or "default",
             force=ns.force,
@@ -113,8 +121,8 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     p.add_argument(
         "--type",
         dest="auth_type",
-        choices=list(AuthType),
-        default=AuthType.IAM,
+        choices=(AUTH_TYPE_IAM, AUTH_TYPE_JWT),
+        default=AUTH_TYPE_IAM,
         help="Auth type",
     )
     p.add_argument(
@@ -184,13 +192,8 @@ def env_fallback(names: tuple[str, ...], *, what: str) -> str | None:
     return None
 
 
-def check_permission(payload: object, permission: str) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    perms = payload.get("permissions")
-    if not isinstance(perms, dict):
-        return False
-    return bool(perms.get(permission))
+def check_permission(payload: WhoAmIResponse, permission: str) -> bool:
+    return bool(payload.permissions.get(permission))
 
 
 def cmd_auth(args: AuthArgs) -> int | None:
@@ -223,8 +226,8 @@ def cmd_auth(args: AuthArgs) -> int | None:
     # URL: --url > CONTREE_URL > type-specific default > interactive prompt
     url = args.url or env_fallback(("CONTREE_URL",), what="URL")
     if url is None:
-        if args.auth_type == AuthType.IAM:
-            url = Config.DEFAULT_IAM_URL
+        if args.auth_type == AUTH_TYPE_IAM:
+            url = DEFAULT_IAM_URL
         else:
             url = input("URL: ").strip().rstrip("/")
             if not url:
@@ -233,14 +236,14 @@ def cmd_auth(args: AuthArgs) -> int | None:
 
     # Project (IAM only): --project > CONTREE_PROJECT > NEBIUS_AI_PROJECT > prompt
     project: str | None = None
-    if args.auth_type == AuthType.IAM:
+    if args.auth_type == AUTH_TYPE_IAM:
         project = args.project or env_fallback(
             ("CONTREE_PROJECT", "NEBIUS_AI_PROJECT"),
             what="project",
         )
         if project is None:
             project = input("Project ID: ").strip()
-    profile = ConfigProfile(
+    profile = Profile(
         name=args.profile,
         token=token,
         url=url,
@@ -255,14 +258,16 @@ def cmd_auth(args: AuthArgs) -> int | None:
         return 1
 
     try:
-        resp = client.get("/v1/whoami")
-        whoami = json.loads(resp.read() or b"{}")
-    except ApiError as exc:
+        with client:
+            whoami = client.whoami()
+    except ContreeAPIError as exc:
         # Logs the API error message, not the token itself.
         # nosemgrep: python-logger-credential-disclosure
         logger.error("Token verification failed: %s. Profile not changed.", exc)
         return 1
-    except ValueError as exc:
+    except (KeyError, TypeError, ValueError) as exc:
+        # Strict contree-client models raise TypeError (missing required
+        # field) or KeyError (parse_fields lookup) on incomplete payloads.
         logger.error("Could not parse /v1/whoami response: %s", exc)
         return 1
 
@@ -306,8 +311,8 @@ def cmd_list(args: ProfilesArgs) -> None:
         )
 
     def check_status(
-        profile: ConfigProfile,
-    ) -> tuple[ConfigProfile, str]:
+        profile: Profile,
+    ) -> tuple[Profile, str]:
         if not profile.token:
             return profile, "error"
         if args.offline:
@@ -321,15 +326,11 @@ def cmd_list(args: ProfilesArgs) -> None:
             return profile, "no url"
 
         try:
-            resp = client.get("/v1/whoami")
-            payload = resp.read()
+            with client:
+                whoami = client.whoami()
         except TimeoutError:
             return profile, "timeout"
         except Exception:
-            return profile, "error"
-        try:
-            whoami = json.loads(payload or b"{}")
-        except ValueError:
             return profile, "error"
         if not check_permission(whoami, REQUIRED_PERMISSION):
             return profile, "inactive"

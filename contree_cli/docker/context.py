@@ -6,8 +6,9 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
-from contree_cli.client import ContreeClient
+from contree_cli.client import CliClient
 from contree_cli.session import SessionStore
 
 from .local_context import LocalContext
@@ -29,7 +30,7 @@ class PendingFile:
 
 @dataclass
 class BuildContext:
-    client: ContreeClient
+    client: CliClient
     store: SessionStore
     local: LocalContext
     build_args: dict[str, str] = field(default_factory=dict)
@@ -39,6 +40,12 @@ class BuildContext:
     workdir: str = "/"
     user: str = ""
     parent_hash: str = ""
+    # Sealed build stages: every FROM past the first closes the stage
+    # before it. `stages` maps `FROM ... AS name` aliases, `stage_images`
+    # indexes the same images for numeric `COPY --from=N` references.
+    stages: dict[str, str] = field(default_factory=dict)
+    stage_images: list[str] = field(default_factory=list)
+    current_stage_alias: str = ""
     pending: list[PendingFile] = field(default_factory=list)
     no_cache: bool = False
     timeout: int = BUILD_TIMEOUT_DEFAULT
@@ -99,7 +106,7 @@ class BuildContext:
     def short_hash(full: str) -> str:
         return full[:16]
 
-    def pending_files_payload(self) -> dict[str, object]:
+    def pending_files_payload(self) -> dict[str, dict[str, Any]]:
         return {
             p.instance_path: {
                 "uuid": p.file_uuid,
@@ -159,3 +166,22 @@ class BuildContext:
 
         self.last_image = image_uuid
         self.last_op_uuid = operation_uuid
+
+
+def resolve_stage_ref(ctx: BuildContext, ref: str) -> str | None:
+    """Resolve *ref* against already-sealed build stages.
+
+    A numeric ``ref`` addresses a stage by position and must be in
+    range; a name is looked up in the alias registry. Returns
+    ``None`` when *ref* is neither, so the caller can fall through to
+    external image resolution (``FROM``, ``COPY --from``).
+    """
+    if ref.isdigit():
+        index = int(ref)
+        if index >= len(ctx.stage_images):
+            raise ValueError(
+                f"stage index out of range ({len(ctx.stage_images)} stage(s)"
+                f" sealed so far): {ref}"
+            )
+        return ctx.stage_images[index]
+    return ctx.stages.get(ref)

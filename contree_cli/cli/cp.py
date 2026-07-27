@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
-from contree_cli.client import resolve_image, stream_response
 from contree_cli.output import DefaultFormatter
 
 logger = logging.getLogger(__name__)
@@ -36,16 +37,6 @@ def fmt_size(n: int | float) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TiB"
-
-
-def fmt_duration(seconds: float) -> str:
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    minutes, secs = divmod(int(seconds), 60)
-    if minutes < 60:
-        return f"{minutes}m{secs:02d}s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h{minutes:02d}m{secs:02d}s"
 
 
 @dataclass(frozen=True)
@@ -73,43 +64,49 @@ def cmd_cp(args: CpArgs) -> int | None:
     store = SESSION_STORE.get()
     image = store.current_image
     path = store.resolve_path(args.path)
-    uuid = resolve_image(client, image)
-    resp = client.get(f"/v1/inspect/{uuid}/download", params={"path": path})
+    uuid = client.resolve_image(image)
 
-    total: int | None = None
-    cl = resp.getheader("Content-Length")
-    if cl is not None:
-        total = int(cl)
+    dest = Path(args.dest)
+    if dest.is_dir():
+        dest = dest / Path(path).name
 
+    # The streaming download API exposes no response headers, so the
+    # total size (Content-Length) is unknown and progress is reported
+    # as running volume/speed only.
     downloaded = 0
     start = time.monotonic()
     last_log = start
 
-    with Path(args.dest).open("wb") as f:
-        for chunk in stream_response(resp):
-            f.write(chunk)
-            downloaded += len(chunk)
+    tmp_path: str | None = None
+    fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for chunk in client.inspect_image_download_stream(uuid, path):
+                f.write(chunk)
+                downloaded += len(chunk)
 
-            now = time.monotonic()
-            if now - last_log >= LOG_INTERVAL:
-                last_log = now
-                elapsed = now - start
-                speed = downloaded / elapsed if elapsed > 0 else 0
-                parts = [f"{fmt_size(downloaded)} downloaded"]
-                if total:
-                    pct = downloaded / total * 100
-                    remaining = (total - downloaded) / speed if speed > 0 else 0
-                    parts.append(f"{pct:.0f}%")
-                    parts.append(f"ETA {fmt_duration(remaining)}")
-                parts.append(f"{fmt_size(speed)}/s")
-                logger.info("%s", " | ".join(parts))
+                now = time.monotonic()
+                if now - last_log >= LOG_INTERVAL:
+                    last_log = now
+                    elapsed = now - start
+                    speed = downloaded / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        "%s downloaded | %s/s",
+                        fmt_size(downloaded),
+                        fmt_size(speed),
+                    )
+        os.replace(tmp_path, dest)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            Path(tmp_path).unlink(missing_ok=True)
 
     elapsed = time.monotonic() - start
     speed = downloaded / elapsed if elapsed > 0 else 0
     logger.info(
         "Written %s to %s (%s/s)",
         fmt_size(downloaded),
-        args.dest,
+        dest,
         fmt_size(speed),
     )
     return None

@@ -9,9 +9,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import ContreeTestClient
+from contree_client.exceptions import ContreeAPIError
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
-from contree_cli.client import ApiError
 from contree_cli.output import (
     DefaultFormatter,
     JSONFormatter,
@@ -128,7 +128,7 @@ class TestExecute:
 
         with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
-            ns.handler = MagicMock(side_effect=ApiError(404, "Not Found", "gone"))
+            ns.handler = MagicMock(side_effect=ContreeAPIError(404, "gone"))
             ns.load_args = MagicMock()
             ns.load_args.from_args.return_value = "args"
             ns.output_format = None
@@ -476,7 +476,9 @@ class TestImplicitRun:
 
         with (
             _mock_session(),
-            patch("contree_cli.cli.run.cmd_run", side_effect=ApiError(500, "err", "")),
+            patch(
+                "contree_cli.cli.run.cmd_run", side_effect=ContreeAPIError(500, "err")
+            ),
         ):
             shell.dispatch_run("echo hello")
 
@@ -675,7 +677,7 @@ class TestFormatOverride:
     """Per-command ``-f``/``--format`` override and persistent switching."""
 
     def test_per_command_override_uses_json(self):
-        """'contree -f json ls' should use JSONFormatter for that command."""
+        """'contree -o json ls' should use JSONFormatter for that command."""
         shell = _make_shell()
         original = DefaultFormatter()
         FORMATTER.set(original)
@@ -692,12 +694,12 @@ class TestFormatOverride:
             ns.load_args.from_args.return_value = "args"
             ns.output_format = "json"
             mock_parse.return_value = ns
-            shell.dispatch_contree(["-f", "json", "ls"])
+            shell.dispatch_contree(["-o", "json", "ls"])
 
         assert captured_formatter["type"] is JSONFormatter
 
     def test_per_command_override_restores_original(self):
-        """After -f json, the original formatter is restored."""
+        """After -o json, the original formatter is restored."""
         shell = _make_shell()
         original = DefaultFormatter()
         FORMATTER.set(original)
@@ -709,7 +711,7 @@ class TestFormatOverride:
             ns.load_args.from_args.return_value = "args"
             ns.output_format = "json"
             mock_parse.return_value = ns
-            shell.dispatch_contree(["-f", "json", "ls"])
+            shell.dispatch_contree(["-o", "json", "ls"])
 
         assert FORMATTER.get() is original
 
@@ -721,12 +723,12 @@ class TestFormatOverride:
 
         with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
-            ns.handler = MagicMock(side_effect=ApiError(500, "err", ""))
+            ns.handler = MagicMock(side_effect=ContreeAPIError(500, "err"))
             ns.load_args = MagicMock()
             ns.load_args.from_args.return_value = "args"
             ns.output_format = "json"
             mock_parse.return_value = ns
-            shell.dispatch_contree(["-f", "json", "ls"])
+            shell.dispatch_contree(["-o", "json", "ls"])
 
         assert FORMATTER.get() is original
 
@@ -840,9 +842,9 @@ class TestHelpBuiltin:
         mock.assert_called_once_with(["nonexistent", "--help"])
 
     def test_help_f_shows_format_help(self, capsys):
-        """'help -f' resolves to 'help --format' via alias."""
+        """'help -o' resolves to 'help --format' via alias."""
         shell = _make_shell()
-        shell.execute("help -f")
+        shell.execute("help -o")
         out = capsys.readouterr().out
         assert "--format" in out
         assert "format" in out.lower()
@@ -888,17 +890,17 @@ class TestFormatCommand:
         assert type(FORMATTER.get()) is TableFormatter
 
     def test_format_short_flag(self):
-        """'-f json' works the same as '--format json'."""
+        """'-o json' works the same as '--format json'."""
         shell = _make_shell()
         FORMATTER.set(DefaultFormatter())
-        shell.execute("-f json")
+        shell.execute("-o json")
         assert type(FORMATTER.get()) is JSONFormatter
 
     def test_format_short_flag_prints_current(self, capsys):
         """'-f' with no args prints current format name."""
         shell = _make_shell()
         FORMATTER.set(DefaultFormatter())
-        shell.execute("-f")
+        shell.execute("-o")
         out = capsys.readouterr().out.strip()
         assert out == "default"
 
@@ -1033,9 +1035,9 @@ class TestArgparseBuiltins:
         assert "TOPIC" in out
 
     def test_help_with_flag_like_topic_resolves(self, capsys):
-        """``help -f`` reaches BUILTIN_HELP via the HELP_ALIASES table."""
+        """``help -o`` reaches BUILTIN_HELP via the HELP_ALIASES table."""
         shell = _make_shell()
-        shell.execute("help -f")
+        shell.execute("help -o")
         out = capsys.readouterr().out
         assert "--format" in out
 

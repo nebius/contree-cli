@@ -11,28 +11,30 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from contree_client.exceptions import ContreeAPIError
+from contree_client.models import (
+    TERMINAL_STATUSES,
+    ImageImportRegistry,
+    ImageImportRegistryCredentials,
+)
+
 from contree_cli import CLIENT, FORMATTER, ArgumentsProtocol, SetupResult
-from contree_cli.client import ApiError, PaginatedFetcher
-from contree_cli.session import CONTREE_CONCURRENCY
 from contree_cli.types import (
     FLAGS,
     ArgumentsFormatter,
-    isoformat_datetime,
     parse_interval,
     positive_int,
 )
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = PaginatedFetcher.DEFAULT_PAGE_SIZE
+PAGE_SIZE = 1000
 LIMIT_DEFAULT = 3000
-TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 DOCKER_HUB = "docker.io"
 
 EPILOG = """\
@@ -260,38 +262,28 @@ def cmd_images(args: ImagesArgs) -> None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
 
-    base_params: dict[str, str] = {}
-    if args.prefix is not None:
-        base_params["tag"] = args.prefix
-    if args.uuid is not None:
-        base_params["uuid"] = args.uuid
-    if not args.all_images:
-        base_params["tagged"] = "1"
-    if args.since is not None:
-        base_params["since"] = isoformat_datetime(args.since)
-    if args.until is not None:
-        base_params["until"] = isoformat_datetime(args.until)
-
-    emitted = 0
     hit_limit = False
-    with PaginatedFetcher(
-        client,
-        "/v1/images",
-        base_params,
-        lambda body: json.loads(body)["images"],
-        limit=args.limit,
-        concurrency=CONTREE_CONCURRENCY,
-    ) as fetcher:
-        for page in fetcher:
-            for image in page:
-                if emitted >= args.limit:
-                    hit_limit = True
-                    break
-                formatter(**image)
-                emitted += 1
-            formatter.flush()
-            if hit_limit:
-                break
+    # Fetch one extra record past the budget so truncation is
+    # detectable and the warning below can fire.
+    images = client.iter_images(
+        tag=args.prefix,
+        uuid=args.uuid,
+        tagged=not args.all_images,
+        since=args.since,
+        until=args.until,
+        page_size=PAGE_SIZE,
+        limit=args.limit + 1,
+    )
+    for emitted, image in enumerate(images):
+        if emitted >= args.limit:
+            hit_limit = True
+            break
+        formatter(**image.to_dict())
+        # Buffering formatters (table) print nothing until the end, so
+        # each consumed page reports progress while the next one loads.
+        if (emitted + 1) % PAGE_SIZE == 0:
+            logger.info("Fetched %d images, loading more...", emitted + 1)
+    formatter.flush()
 
     if hit_limit:
         logger.warning(
@@ -334,14 +326,14 @@ def cmd_import(args: ImportArgs) -> int | None:
     formatter.configure(tail=("error",))
 
     # 1. Build credentials (prompt for password when --username given)
-    credentials: dict[str, str] | None = None
+    credentials: ImageImportRegistryCredentials | None = None
     if args.username is not None:
         password = args.password or getpass.getpass("Registry password: ")
-        credentials = {"username": args.username, "password": password}
-
-    if credentials is not None:
-        masked = credentials["password"][:3] + "***"
-        cred_info = f"credentials {credentials['username']}:{masked}"
+        credentials = ImageImportRegistryCredentials(
+            username=args.username,
+            password=password,
+        )
+        cred_info = f"credentials {args.username}:{password[:3]}***"
     else:
         cred_info = "anonymous credentials"
 
@@ -363,18 +355,17 @@ def cmd_import(args: ImportArgs) -> int | None:
     # 3. Issue all POST /v1/images/import requests up-front
     op_uuids: list[str] = []
     for url, tag in imports:
-        registry: dict[str, object] = {"url": url}
-        if credentials is not None:
-            registry["credentials"] = credentials
-        payload: dict[str, object] = {
-            "registry": registry,
-            "tag": tag,
-        }
-        if args.timeout is not None:
-            payload["timeout"] = args.timeout
-        resp = client.post_json("/v1/images/import", payload)
-        data = json.loads(resp.read())
-        op_uuids.append(data["uuid"])
+        registry = ImageImportRegistry(
+            url=url,
+            credentials=credentials if credentials is not None else ...,
+        )
+        op_uuids.append(
+            client.import_image(
+                registry,
+                tag=tag,
+                timeout=args.timeout if args.timeout is not None else ...,
+            )
+        )
 
     # 3. Poll every 5 seconds until all operations reach a terminal state
     pending = set(range(len(op_uuids)))
@@ -383,8 +374,7 @@ def cmd_import(args: ImportArgs) -> int | None:
         while pending:
             time.sleep(5)
             for idx in list(pending):
-                resp = client.get(f"/v1/operations/{op_uuids[idx]}")
-                op = json.loads(resp.read())
+                op = client.get_operation_status(op_uuids[idx]).to_dict()
                 if op["status"] in TERMINAL_STATUSES:
                     pending.discard(idx)
                     if op["status"] != "SUCCESS":
@@ -401,9 +391,9 @@ def cmd_import(args: ImportArgs) -> int | None:
         # Cancel ALL operations on Ctrl+C
         for op_uuid in op_uuids:
             try:
-                client.delete(f"/v1/operations/{op_uuid}")
+                client.cancel_operation(op_uuid)
                 logger.info("Cancelled operation %s", op_uuid)
-            except (ApiError, KeyboardInterrupt, OSError):
+            except (ContreeAPIError, KeyboardInterrupt, OSError):
                 pass
         raise
 

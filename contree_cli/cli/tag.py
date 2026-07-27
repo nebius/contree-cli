@@ -16,7 +16,6 @@ import logging
 from dataclasses import dataclass
 
 from contree_cli import CLIENT, SESSION_STORE, ArgumentsProtocol, SetupResult
-from contree_cli.client import resolve_image
 from contree_cli.types import FLAGS
 
 logger = logging.getLogger(__name__)
@@ -67,7 +66,11 @@ def cmd_tag(args: TagArgs) -> int | None:
     client = CLIENT.get()
 
     if args.image_ref is not None:
-        image_uuid = resolve_image(client, args.image_ref)
+        image_uuid = client.resolve_image(args.image_ref)
+    elif args.delete:
+        # The tag itself names its image uniquely; resolving the session
+        # image instead would silently no-op when the tag lives elsewhere.
+        image_uuid = client.resolve_image(f"tag:{args.tag}")
     else:
         store = SESSION_STORE.get()
         session = store.session
@@ -77,10 +80,10 @@ def cmd_tag(args: TagArgs) -> int | None:
         image_uuid = session.current_image
 
     if args.delete:
-        client.delete(f"/v1/images/{image_uuid}/tag?tag={args.tag}")
+        client.delete_image_tag(image_uuid, tag=args.tag)
         logger.info("Removed tag %r from image %s", args.tag, image_uuid)
         return None
 
-    client.patch_json(f"/v1/images/{image_uuid}/tag", {"tag": args.tag})
+    client.update_image_tag(image_uuid, args.tag)
     logger.info("Tagged image %s as %s", image_uuid, args.tag)
     return None

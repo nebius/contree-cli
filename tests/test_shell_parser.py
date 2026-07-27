@@ -119,9 +119,9 @@ class TestFormatFlag:
     """``-f``/``--format`` on the root shell parser."""
 
     def test_format_flag_with_command(self):
-        """-f json ls parses correctly."""
+        """-o json ls parses correctly."""
         parser, _ = build_shell_parser()
-        ns = parser.parse_args(["-f", "json", "ls", "/etc"])
+        ns = parser.parse_args(["-o", "json", "ls", "/etc"])
         assert ns.output_format == "json"
         assert ns.command == "ls"
         assert ns.path == "/etc"
@@ -143,7 +143,7 @@ class TestFormatFlag:
         """Invalid format name raises ShellParseError."""
         parser, _ = build_shell_parser()
         with pytest.raises(ShellParseError):
-            parser.parse_args(["-f", "nonexistent", "ls"])
+            parser.parse_args(["-o", "nonexistent", "ls"])
 
 
 class TestGetCommandNames:

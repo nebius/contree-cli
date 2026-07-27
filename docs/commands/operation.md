@@ -105,7 +105,7 @@ failure and continues with the remaining UUIDs, exiting with status
 ```
 
 :::{note}
-With table output (`-f table`) and several UUIDs, each operation
+With table output (`-o table`) and several UUIDs, each operation
 currently renders as its own mini-table. Use `default` or `json` for a
 unified stream view across multiple UUIDs.
 :::
@@ -157,13 +157,13 @@ might expect. For multi-agent setups, prefer the explicit
 ```
 
 Preferred — `--disposable` fan-out, no image to track. Note the
-global `-f json` before `run` so `jq` sees JSON; the default
+global `-o json` before `run` so `jq` sees JSON; the default
 formatter is plain.
 
 ```bash
-A=$(contree -f json run -d --disposable -- pytest tests/a | jq -r .uuid)
-B=$(contree -f json run -d --disposable -- pytest tests/b | jq -r .uuid)
-C=$(contree -f json run -d --disposable -- pytest tests/c | jq -r .uuid)
+A=$(contree -o json run -d --disposable -- pytest tests/a | jq -r .uuid)
+B=$(contree -o json run -d --disposable -- pytest tests/b | jq -r .uuid)
+C=$(contree -o json run -d --disposable -- pytest tests/c | jq -r .uuid)
 contree op wait "$A" "$B" "$C"
 contree op show "$A" "$B" "$C"          # stdout/stderr per leg
 ```
@@ -171,13 +171,13 @@ contree op show "$A" "$B" "$C"          # stdout/stderr per leg
 Non-disposable fan-out — must recover the chosen leg's image yourself:
 
 ```bash
-A=$(contree -f json run -d -- apt-get install -y curl | jq -r .uuid)
-B=$(contree -f json run -d -- apt-get install -y wget | jq -r .uuid)
+A=$(contree -o json run -d -- apt-get install -y curl | jq -r .uuid)
+B=$(contree -o json run -d -- apt-get install -y wget | jq -r .uuid)
 contree op wait "$A" "$B"
 
 # Pull the result image out and bind it back into the session,
 # or tag it for later reuse.
-IMG_A=$(contree -f json op show "$A" | jq -r .image)
+IMG_A=$(contree -o json op show "$A" | jq -r .image)
 contree use "$IMG_A"
 contree tag "$IMG_A" feature/curl-tools
 ```

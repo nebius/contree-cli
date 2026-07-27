@@ -27,13 +27,10 @@ from contree_cli import (
     CLIENT,
     FORMATTER,
     IN_SHELL,
-    PROFILE,
     SESSION_STORE,
     ArgumentsProtocol,
     SetupResult,
 )
-from contree_cli.client import resolve_image
-from contree_cli.session import SessionStore
 from contree_cli.types import FLAGS
 
 log = logging.getLogger(__name__)
@@ -83,20 +80,20 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
 def cmd_use(args: UseArgs) -> int | None:
     store = SESSION_STORE.get()
 
-    if args.new:
-        if args.image is None:
-            print(
-                "--new requires an IMAGE argument.",
-                file=sys.stderr,
-            )
-            return 1
-        new_key = str(uuid.uuid4())
-        store = SessionStore(PROFILE.get().session_db_path, new_key)
-        SESSION_STORE.set(store)
+    if args.new and args.image is None:
+        print(
+            "--new requires an IMAGE argument.",
+            file=sys.stderr,
+        )
+        return 1
 
     if args.image is not None:
         client = CLIENT.get()
-        image_uuid = resolve_image(client, args.image)
+        # Validate before switching: a failed resolve must not leave
+        # the store pointed at a new, unvalidated, empty session.
+        image_uuid = client.resolve_image(args.image)
+        if args.new:
+            store.select_session(str(uuid.uuid4()))
         store.set_image(image_uuid, kind="use", title=args.image)
         if not IN_SHELL.get(False):
             _print_shell_export("CONTREE_SESSION", store.session_key)

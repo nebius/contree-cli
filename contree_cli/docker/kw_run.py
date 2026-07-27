@@ -8,12 +8,12 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from contree_client.models import TERMINAL_STATUSES, FileSpec, decode_stream
+
 from contree_cli.cli.run import (
-    TERMINAL_OP_STATUSES,
-    _build_op_from_summary,
-    _stream_events_until_close,
+    build_op_from_summary,
+    stream_events_until_close,
 )
-from contree_cli.client import decode_stream
 from contree_cli.output import DefaultFormatter
 
 from .context import BuildContext
@@ -74,28 +74,28 @@ class RunKeyword(DockerKeyword):
 
     def spawn(self, ctx: BuildContext, parts: tuple[str, ...]) -> tuple[str, str]:
         command, args, shell = build_command(parts, self.shell_form, ctx.user)
-        payload: dict[str, object] = {
-            "image": ctx.last_image,
-            "command": command,
-            "shell": shell,
-            "disposable": False,
-            "hostname": "linuxkit",
-            "truncate_output_at": 65536,
-        }
-        if args:
-            payload["args"] = args
-        if ctx.timeout:
-            payload["timeout"] = ctx.timeout
-        if ctx.workdir and ctx.workdir != "/":
-            payload["cwd"] = ctx.workdir
-        if ctx.env:
-            payload["env"] = dict(ctx.env)
-        if ctx.pending:
-            payload["files"] = ctx.pending_files_payload()
-
-        resp = ctx.client.post_json("/v1/instances", payload)
-        spawn_op = json.loads(resp.read())
-        op_uuid: str = spawn_op["uuid"]
+        files = (
+            {
+                path: FileSpec.from_dict(spec)
+                for path, spec in ctx.pending_files_payload().items()
+            }
+            if ctx.pending
+            else ...
+        )
+        spawn_op = ctx.client.spawn_instance(
+            command,
+            ctx.last_image,
+            shell=shell,
+            disposable=False,
+            hostname="linuxkit",
+            truncate_output_at=65536,
+            args=args if args else ...,
+            timeout=ctx.timeout if ctx.timeout else ...,
+            cwd=ctx.workdir if ctx.workdir and ctx.workdir != "/" else ...,
+            env=dict(ctx.env) if ctx.env else ...,
+            files=files,
+        )
+        op_uuid = str(spawn_op.uuid)
         logger.info(
             "RUN spawned op=%s: %s", op_uuid, display_title(parts, self.shell_form)
         )
@@ -119,15 +119,14 @@ def stream_and_resolve(ctx: BuildContext, op_uuid: str) -> dict[str, Any]:
     safety-net GET.  When we fell back to the plain endpoint (no
     live stream), replay the captured stdout/stderr from the op's
     metadata so build users still see what the RUN produced."""
-    summary = _stream_events_until_close(ctx.client, op_uuid, DefaultFormatter())
+    summary = stream_events_until_close(ctx.client, op_uuid, DefaultFormatter())
     if summary.completion is not None:
-        return _build_op_from_summary(op_uuid, summary)
+        return build_op_from_summary(op_uuid, summary)
     if summary.fallback_op is not None:
         log_streams(summary.fallback_op)
         return summary.fallback_op
-    resp = ctx.client.get(f"/v1/operations/{op_uuid}")
-    op: dict[str, Any] = json.loads(resp.read())
-    if op.get("status") in TERMINAL_OP_STATUSES:
+    op: dict[str, Any] = ctx.client.get_operation_status(op_uuid).to_dict()
+    if op.get("status") in TERMINAL_STATUSES:
         log_streams(op)
     return op
 

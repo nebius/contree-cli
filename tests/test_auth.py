@@ -6,6 +6,9 @@ from unittest.mock import patch
 
 import pytest
 from conftest import ContreeTestClient
+from contree_client import operations
+from contree_client.models import WhoAmIResponse
+from contree_client.runtime import ResponseData
 
 from contree_cli import FORMATTER
 from contree_cli.cli.auth import (
@@ -18,7 +21,7 @@ from contree_cli.cli.auth import (
     cmd_remove,
     cmd_switch,
 )
-from contree_cli.config import AuthType, Config
+from contree_cli.config import AUTH_TYPE_IAM, AUTH_TYPE_JWT, Config
 
 
 def _make_auth_args(**kwargs) -> AuthArgs:
@@ -26,7 +29,7 @@ def _make_auth_args(**kwargs) -> AuthArgs:
     defaults: dict[str, object] = dict(
         token="",
         url="https://test.dev",
-        auth_type=AuthType.JWT,
+        auth_type=AUTH_TYPE_JWT,
         project=None,
         profile="default",
     )
@@ -39,7 +42,7 @@ def _make_iam_args(**kwargs) -> AuthArgs:
     defaults: dict[str, object] = dict(
         token="",
         url="https://iam.test",
-        auth_type=AuthType.IAM,
+        auth_type=AUTH_TYPE_IAM,
         project="aiproject-test",
         profile="default",
     )
@@ -57,6 +60,30 @@ def whoami_body(*, permissions: dict[str, bool] | None = None) -> bytes:
     return json.dumps(body).encode()
 
 
+def whoami_result(*, permissions: dict[str, bool] | None = None) -> WhoAmIResponse:
+    return WhoAmIResponse(
+        token_uuid="00000000-0000-0000-0000-000000000000",
+        token_expiration=None,
+        permissions={"list": True} if permissions is None else permissions,
+        operations_stat={},
+    )
+
+
+def mock_whoami_response(tc: ContreeTestClient, status: int, body: bytes) -> None:
+    """Mock ``whoami`` exactly as the real client would parse the wire.
+
+    Runs ``operations.parse_whoami`` over a synthetic response so the
+    tests keep exercising the client's own status/JSON/model error
+    behavior (401 -> UnauthorizedError, non-dict -> ContreeAPIError,
+    missing model field -> TypeError, invalid JSON -> ValueError).
+    """
+    response = ResponseData(status=status, headers={}, body=body)
+    try:
+        tc.mock("whoami", operations.parse_whoami(response))
+    except Exception as exc:
+        tc.mock("whoami", error=exc)
+
+
 @contextmanager
 def mock_whoami(status=200, *, body: bytes | None = None):
     """Patch client_from_profile to return a fresh ContreeTestClient per call."""
@@ -64,7 +91,7 @@ def mock_whoami(status=200, *, body: bytes | None = None):
 
     def factory(profile, timeout=None):  # type: ignore[no-untyped-def]
         tc = ContreeTestClient()
-        tc.respond(status=status, body=body if body is not None else whoami_body())
+        mock_whoami_response(tc, status, body if body is not None else whoami_body())
         last_client.clear()
         last_client.append(tc)
         return tc
@@ -141,13 +168,13 @@ class TestAuthSave:
         with mock_whoami():
             cmd_auth(_make_auth_args(token="tok"))
         p = Config().resolve()
-        assert p.auth_type == AuthType.JWT
+        assert p.auth_type == AUTH_TYPE_JWT
 
     def test_save_iam_stores_type_and_project(self, config_dir):
         with mock_whoami():
             cmd_auth(_make_iam_args(token="tok"))
         p = Config().resolve()
-        assert p.auth_type == AuthType.IAM
+        assert p.auth_type == AUTH_TYPE_IAM
         assert p.project == "aiproject-test"
         assert p.url == "https://iam.test"
 
@@ -165,7 +192,7 @@ class TestAuthPrompt:
         assert args.token is None
 
     def test_prompts_when_no_token_jwt(self, config_dir):
-        ns = _make_ns(auth_type=AuthType.JWT, auth_url="https://test.dev")
+        ns = _make_ns(auth_type=AUTH_TYPE_JWT, auth_url="https://test.dev")
         args = AuthArgs.from_args(ns)
         with (
             patch(
@@ -181,7 +208,7 @@ class TestAuthPrompt:
     def test_from_args_defaults_to_iam(self):
         ns = _make_ns()
         args = AuthArgs.from_args(ns)
-        assert args.auth_type == AuthType.IAM
+        assert args.auth_type == AUTH_TYPE_IAM
 
 
 # ---------------------------------------------------------------------------
@@ -225,14 +252,16 @@ class TestAuthVerify:
             cmd_auth(args)
         assert "aiproject-restricted" in caplog.text
 
-    def test_missing_permissions_field_warns(self, config_dir, caplog):
+    def test_missing_permissions_field_rejected(self, config_dir, caplog):
+        """`permissions` is required by WhoAmIResponse; a payload without
+        it fails parsing and the profile is not saved."""
         args = _make_auth_args(token="tok")
         body = b'{"token_uuid":"x","token_expiration":null,"operations_stat":{}}'
-        with caplog.at_level("WARNING"), mock_whoami(body=body):
+        with caplog.at_level("ERROR"), mock_whoami(body=body):
             rc = cmd_auth(args)
-        assert rc is None
-        assert "sandboxes are disabled" in caplog.text
-        assert Config().resolve().token == "tok"
+        assert rc == 1
+        assert "Could not parse /v1/whoami response" in caplog.text
+        assert Config().resolve().token is None
 
     def test_unparseable_whoami_rejected(self, config_dir, caplog):
         args = _make_auth_args(token="tok")
@@ -241,14 +270,15 @@ class TestAuthVerify:
         assert rc == 1
         assert Config().resolve().token is None
 
-    def test_non_dict_whoami_payload_warns_but_saves(self, config_dir, caplog):
-        """JSON list (or other non-dict) is treated as missing permissions."""
+    def test_non_dict_whoami_payload_rejected(self, config_dir, caplog):
+        """JSON list (or other non-dict) fails whoami parsing; the
+        profile is not saved."""
         args = _make_auth_args(token="tok")
-        with caplog.at_level("WARNING"), mock_whoami(body=b"[]"):
+        with caplog.at_level("ERROR"), mock_whoami(body=b"[]"):
             rc = cmd_auth(args)
-        assert rc is None
-        assert "sandboxes are disabled" in caplog.text
-        assert Config().resolve().token == "tok"
+        assert rc == 1
+        assert "Token verification failed" in caplog.text
+        assert Config().resolve().token is None
 
     def test_success_logs_saved(self, config_dir, caplog):
         args = _make_auth_args(token="good")
@@ -261,8 +291,8 @@ class TestAuthVerify:
         with mock_whoami() as clients:
             cmd_auth(args)
         tc = clients[0]
-        assert tc.request_count == 1
-        assert "/v1/whoami" in tc.request_paths[0]
+        assert len(tc.calls_for("whoami")) == 1
+        assert len(tc.calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +307,7 @@ class TestNebius:
             cmd_auth(
                 AuthArgs(
                     url="https://test.dev",
-                    auth_type=AuthType.JWT,
+                    auth_type=AUTH_TYPE_JWT,
                 )
             )
         p = Config().resolve()
@@ -290,7 +320,7 @@ class TestNebius:
             cmd_auth(
                 AuthArgs(
                     token="tok",
-                    auth_type=AuthType.IAM,
+                    auth_type=AUTH_TYPE_IAM,
                     url="https://iam.test",
                 )
             )
@@ -302,7 +332,7 @@ class TestNebius:
         monkeypatch.setenv("NEBIUS_API_KEY", "neb-tok")
         monkeypatch.setenv("NEBIUS_AI_PROJECT", "aiproject-auto")
         with caplog.at_level("INFO"), mock_whoami():
-            cmd_auth(AuthArgs(auth_type=AuthType.IAM, url="https://iam.test"))
+            cmd_auth(AuthArgs(auth_type=AUTH_TYPE_IAM, url="https://iam.test"))
         p = Config().resolve()
         assert p.token == "neb-tok"
         assert p.project == "aiproject-auto"
@@ -314,7 +344,7 @@ class TestContreeEnvFallbacks:
     ):
         monkeypatch.setenv("CONTREE_TOKEN", "ctok")
         with caplog.at_level("INFO"), mock_whoami():
-            cmd_auth(AuthArgs(url="https://test.dev", auth_type=AuthType.JWT))
+            cmd_auth(AuthArgs(url="https://test.dev", auth_type=AUTH_TYPE_JWT))
         p = Config().resolve()
         assert p.token == "ctok"
         assert "Using token from CONTREE_TOKEN" in caplog.text
@@ -325,7 +355,7 @@ class TestContreeEnvFallbacks:
         monkeypatch.setenv("CONTREE_TOKEN", "ctok")
         monkeypatch.setenv("NEBIUS_API_KEY", "ntok")
         with caplog.at_level("INFO"), mock_whoami():
-            cmd_auth(AuthArgs(url="https://test.dev", auth_type=AuthType.JWT))
+            cmd_auth(AuthArgs(url="https://test.dev", auth_type=AUTH_TYPE_JWT))
         p = Config().resolve()
         assert p.token == "ctok"
 
@@ -333,7 +363,7 @@ class TestContreeEnvFallbacks:
         monkeypatch.setenv("CONTREE_URL", "https://env-url.dev")
         monkeypatch.setenv("NEBIUS_API_KEY", "tok")
         with caplog.at_level("INFO"), mock_whoami():
-            cmd_auth(AuthArgs(auth_type=AuthType.JWT))
+            cmd_auth(AuthArgs(auth_type=AUTH_TYPE_JWT))
         p = Config().resolve()
         assert p.url == "https://env-url.dev"
 
@@ -346,7 +376,7 @@ class TestContreeEnvFallbacks:
                 AuthArgs(
                     token="tok",
                     url="https://iam.test",
-                    auth_type=AuthType.IAM,
+                    auth_type=AUTH_TYPE_IAM,
                 )
             )
         p = Config().resolve()
@@ -360,7 +390,7 @@ class TestContreeEnvFallbacks:
                 AuthArgs(
                     token="from-flag",
                     url="https://test.dev",
-                    auth_type=AuthType.JWT,
+                    auth_type=AUTH_TYPE_JWT,
                 )
             )
         p = Config().resolve()
@@ -412,19 +442,11 @@ class TestAuthProfiles:
         def fake_factory(profile, timeout=None):  # type: ignore[no-untyped-def]
             tc = ContreeTestClient(token=profile.token)
             if profile.token == "tok-ok":
-                tc.respond(status=200, body=whoami_body())
+                tc.mock("whoami", whoami_result())
             elif profile.token == "tok-timeout":
-
-                def timeout_get(path, params=None):  # type: ignore[no-untyped-def]
-                    raise TimeoutError("timeout")
-
-                tc.get = timeout_get  # type: ignore[assignment]
+                tc.mock("whoami", error=TimeoutError("timeout"))
             else:
-
-                def error_get(path, params=None):  # type: ignore[no-untyped-def]
-                    raise OSError("boom")
-
-                tc.get = error_get  # type: ignore[assignment]
+                tc.mock("whoami", error=OSError("boom"))
             return tc
 
         FORMATTER.set(CaptureFormatter())
@@ -456,9 +478,9 @@ class TestAuthProfiles:
 
         def fake_factory(profile, timeout=None):  # type: ignore[no-untyped-def]
             tc = ContreeTestClient(token=profile.token)
-            tc.respond(
-                status=200,
-                body=whoami_body(permissions={"list": False, "spawn": True}),
+            tc.mock(
+                "whoami",
+                whoami_result(permissions={"list": False, "spawn": True}),
             )
             return tc
 
@@ -636,7 +658,7 @@ class TestAuthFromArgs:
         ns = _make_ns(
             auth_token="tok",
             auth_url="https://url.dev",
-            auth_type=AuthType.JWT,
+            auth_type=AUTH_TYPE_JWT,
             auth_project="aiproject-x",
             profile="prod",
             force=True,
@@ -644,7 +666,7 @@ class TestAuthFromArgs:
         args = AuthArgs.from_args(ns)
         assert args.token == "tok"
         assert args.url == "https://url.dev"
-        assert args.auth_type == AuthType.JWT
+        assert args.auth_type == AUTH_TYPE_JWT
         assert args.project == "aiproject-x"
         assert args.profile == "prod"
         assert args.force is True
@@ -654,7 +676,7 @@ class TestAuthFromArgs:
         args = AuthArgs.from_args(ns)
         assert args.token is None
         assert args.url is None
-        assert args.auth_type == AuthType.IAM
+        assert args.auth_type == AUTH_TYPE_IAM
         assert args.project is None
         assert args.profile == "default"
         assert args.force is False

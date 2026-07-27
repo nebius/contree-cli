@@ -332,6 +332,14 @@ class SessionStore:
     def session_key(self) -> str:
         return self._session_key
 
+    def select_session(self, session_key: str) -> None:
+        """Select another session in the same profile database.
+
+        A session key is only a scope for queries made through this store;
+        changing it does not require opening a second SQLite connection.
+        """
+        self._session_key = session_key
+
     @property
     def current_image(self) -> str:
         s = self.session

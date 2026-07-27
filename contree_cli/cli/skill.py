@@ -2,8 +2,8 @@
 
 contree skill install              # autodetect agent homes
 contree skill install claude:~     # global ~/.claude
-contree skill install codex:       # project-level .codex
-contree skill install ./path       # raw path, class guessed
+contree skill install codex:       # project-level .agents/skills
+contree skill install .            # project root: every kind under it
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 
 from contree_cli import FORMATTER, ArgumentsProtocol, SetupResult
@@ -21,8 +22,8 @@ from contree_cli.skill import (
     forget_installed,
     list_installed,
     remember_installed,
-    skill_from_spec,
     skill_version,
+    skills_from_spec,
 )
 from contree_cli.types import FLAGS
 
@@ -55,7 +56,7 @@ class SkillInstallArgs(ArgumentsProtocol):
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> SkillInstallArgs:
-        return cls(specs=frozenset(ns.specs or []), force=ns.force)
+        return cls(specs=frozenset(chain.from_iterable(ns.specs or [])), force=ns.force)
 
 
 @dataclass(frozen=True)
@@ -65,7 +66,7 @@ class SkillRemoveArgs(ArgumentsProtocol):
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> SkillRemoveArgs:
-        return cls(specs=frozenset(ns.specs or []), force=ns.force)
+        return cls(specs=frozenset(chain.from_iterable(ns.specs or [])), force=ns.force)
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,7 @@ class SkillUpgradeArgs(ArgumentsProtocol):
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> SkillUpgradeArgs:
-        return cls(specs=frozenset(ns.specs or []))
+        return cls(specs=frozenset(chain.from_iterable(ns.specs or [])))
 
 
 @dataclass(frozen=True)
@@ -95,8 +96,8 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
             "specs",
             nargs="*",
             metavar="SPEC",
-            type=skill_from_spec,
-            help="claude:~ codex:~ or raw path",
+            type=skills_from_spec,
+            help="claude:~ codex:~ skill path or project root",
         )
 
     list_p = sub.add_parser(
@@ -179,6 +180,7 @@ def cmd_skill_remove(args: SkillRemoveArgs) -> int | None:
     failed = False
     for skill in targets:
         if not skill.exists:
+            forget_installed(skill)
             logger.error("Not installed at %s", display_path(skill.path))
             failed = True
             continue

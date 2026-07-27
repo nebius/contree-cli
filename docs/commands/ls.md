@@ -16,7 +16,7 @@ contree ls /
 contree ls /etc/nginx
 
 # JSON output with file metadata
-contree -f json ls /usr/bin
+contree -o json ls /usr/bin
 ```
 
 ## Help output

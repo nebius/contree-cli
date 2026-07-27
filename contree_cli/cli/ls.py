@@ -11,20 +11,20 @@ structured formats (json, csv, etc.) the response is cached per
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from dataclasses import dataclass
 from typing import Any, cast
 
+from contree_client.runtime import RequestSpec, error_for_response
+
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
-from contree_cli.client import resolve_image
 from contree_cli.output import DefaultFormatter
 
 EPILOG = """\
 for coding agents:
   read-only command (inspect API, no instance spawn)
   defaults to session cwd when PATH is omitted
-  use -f json for cacheable structured listings
+  use -o json for cacheable structured listings
 """
 
 
@@ -53,27 +53,34 @@ def cmd_ls(args: LsArgs) -> None:
     formatter.configure(tail=("type",))
     store = SESSION_STORE.get()
     image = store.current_image
-    uuid = resolve_image(client, image)
+    uuid = client.resolve_image(image)
     if args.path is not None:
         path = store.resolve_path(args.path)
     else:
         path = store.get_cwd() or "/"
 
     if isinstance(formatter, DefaultFormatter):
-        resp = client.get(
-            f"/v1/inspect/{uuid}/list",
-            params={"path": path, "text": "1"},
+        # The pre-formatted text listing (?text=1) has no typed method
+        # in contree-client; issue the request through the raw spec.
+        response = client.call(
+            RequestSpec(
+                method="GET",
+                path=f"/inspect/{uuid}/list",
+                query={"path": path, "text": "1"},
+                idempotent=True,
+            )
         )
-        sys.stdout.write(resp.read().decode())
+        if response.status != 200:
+            raise error_for_response(response)
+        sys.stdout.write(response.body.decode())
         return
 
     cache_key = (uuid, f"list:{path}")
     cached = store.cache.get(cache_key)
     if cached is not None:
-        data = cast(dict[str, Any], cached)
+        data = cast("dict[str, Any]", cached)
     else:
-        resp = client.get(f"/v1/inspect/{uuid}/list", params={"path": path})
-        data = json.loads(resp.read())
+        data = client.inspect_image_list(uuid, path).to_dict()
         store.cache[cache_key] = data
     for f in data["files"]:
         if f.get("is_dir"):

@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from contree_client.models import OperationResponse
 
 from contree_cli import FORMATTER, SESSION_STORE
 from contree_cli.cli.session import (
@@ -30,6 +31,21 @@ from contree_cli.output import DefaultFormatter, JSONFormatter
 from contree_cli.session import SessionStore
 
 Capsys = pytest.CaptureFixture[str]
+
+
+def respond_status(tc, payload: dict) -> None:
+    """Queue one typed get_operation_status poll result."""
+    tc.mock("get_operation_status", OperationResponse.from_dict(payload))
+
+
+def respond_listing(tc, ops: list[dict]) -> None:
+    """Queue the raw GET /operations listing used by no-arg `session wait`.
+
+    The handler needs the per-op ``session_key`` field, which the typed
+    OperationSummary model does not carry, so it fetches the raw payload
+    via ``client.call(RequestSpec(...))``.
+    """
+    tc.respond_raw(body=json.dumps(ops).encode())
 
 
 @pytest.fixture()
@@ -444,14 +460,15 @@ class TestWait:
         SESSION_STORE.set(session_store)
         session_store.set_image("img-1", kind="use")
         FORMATTER.set(JSONFormatter())
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-1",
                 "status": "SUCCESS",
                 "kind": "instance",
                 "duration": 2,
                 "error": "",
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=["op-1"]))
         assert rc is None
@@ -465,7 +482,8 @@ class TestWait:
         SESSION_STORE.set(session_store)
         FORMATTER.set(JSONFormatter())
         session_store.set_image("img-1", kind="use")
-        contree_client.respond_json(
+        respond_listing(
+            contree_client,
             [
                 {
                     "uuid": "op-2",
@@ -473,21 +491,25 @@ class TestWait:
                     "kind": "instance",
                     "session_key": "test",
                 }
-            ]
+            ],
         )
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-2",
                 "status": "SUCCESS",
                 "kind": "instance",
                 "duration": 1,
                 "error": "",
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=[]))
         assert rc is None
         out = capsys.readouterr().out
         assert "op-2" in out
+        # Marked idempotent (a safe-to-replay GET) so a retry policy
+        # can retry a transient 410/425/5xx instead of failing outright.
+        assert contree_client.raw_requests[0].idempotent is True
         assert "SUCCESS" in out
 
     def test_wait_active_none_for_other_session(
@@ -496,7 +518,8 @@ class TestWait:
         SESSION_STORE.set(session_store)
         FORMATTER.set(JSONFormatter())
         session_store.set_image("img-1", kind="use")
-        contree_client.respond_json(
+        respond_listing(
+            contree_client,
             [
                 {
                     "uuid": "op-3",
@@ -504,7 +527,7 @@ class TestWait:
                     "kind": "instance",
                     "session_key": "other",
                 }
-            ]
+            ],
         )
         rc = cmd_wait(WaitArgs(op_ids=[]))
         assert rc is None
@@ -523,7 +546,8 @@ class TestWait:
             {"op": "op-4", "title": "sleep 1", "disposable": False}
         ]
 
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-4",
                 "status": "SUCCESS",
@@ -531,7 +555,7 @@ class TestWait:
                 "duration": 1,
                 "error": "",
                 "result": {"image": "img-new"},
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=[]))
         assert rc is None
@@ -551,7 +575,8 @@ class TestWait:
             {"op": "op-5", "title": "sleep 1", "disposable": True}
         ]
 
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-5",
                 "status": "SUCCESS",
@@ -559,7 +584,7 @@ class TestWait:
                 "duration": 1,
                 "error": "",
                 "result": {"image": "img-disposable"},
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=[]))
         assert rc is None
@@ -577,14 +602,15 @@ class TestWait:
         SESSION_STORE.set(session_store)
         FORMATTER.set(JSONFormatter())
         session_store.set_image("img-1", kind="use")
-        contree_client.respond_json(
+        respond_listing(
+            contree_client,
             [
                 {
                     "uuid": "op-4",
                     "status": "PENDING",
                     "kind": "instance",
                 }
-            ]
+            ],
         )
         rc = cmd_wait(WaitArgs(op_ids=[]))
         assert rc is None
@@ -597,16 +623,21 @@ class TestWait:
         SESSION_STORE.set(session_store)
         FORMATTER.set(JSONFormatter())
         session_store.set_image("img-1", kind="use")
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-err",
                 "status": "SUCCESS",
                 "kind": "instance",
                 "duration": 1,
                 "error": "",
-                "metadata": {"result": {"state": {"exit_code": 1}}},
+                "metadata": {
+                    "command": "false",
+                    "image": "img-1",
+                    "result": {"state": {"exit_code": 1}},
+                },
                 "result": {"image": "img-new"},
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=["op-err"]))
         assert rc == 1
@@ -630,16 +661,21 @@ class TestWait:
             {"op": "op-7", "title": "sleep 1", "disposable": False}
         ]
 
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-7",
                 "status": "SUCCESS",
                 "kind": "instance",
                 "duration": 1,
                 "error": "",
-                "metadata": {"result": {"state": {"exit_code": 2}}},
+                "metadata": {
+                    "command": "sleep 1",
+                    "image": "img-1",
+                    "result": {"state": {"exit_code": 2}},
+                },
                 "result": {"image": "img-new"},
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=[]))
         assert rc == 2
@@ -653,27 +689,37 @@ class TestWait:
     def test_wait_unknown_field_passes_through(
         self, contree_client, session_store, capsys
     ) -> None:
-        """New server fields reach the row even when not hardcoded."""
+        """Schema fields the handler does not hardcode reach the row.
+
+        The poll round-trips through the typed OperationResponse model,
+        so only fields the API schema declares survive; the handler
+        itself must not need a code change for them.
+        """
         SESSION_STORE.set(session_store)
         FORMATTER.set(JSONFormatter())
         session_store.set_image("img-1", kind="use")
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-x",
                 "status": "SUCCESS",
                 "kind": "instance",
                 "duration": 1,
-                "session_key": "sess-1",
-                "future_field": "anything",
-                "metadata": {"result": {"state": {"exit_code": 0}}},
+                "consumed_cpu": 0.5,
+                "result_image_uuid": "img-new",
+                "metadata": {
+                    "command": "true",
+                    "image": "img-1",
+                    "result": {"state": {"exit_code": 0}},
+                },
                 "result": {"image": "img-new"},
-            }
+            },
         )
         cmd_wait(WaitArgs(op_ids=["op-x"]))
         out = capsys.readouterr().out.strip().splitlines()
         data = json.loads(out[0])
-        assert data["session_key"] == "sess-1"
-        assert data["future_field"] == "anything"
+        assert data["consumed_cpu"] == 0.5
+        assert data["result_image_uuid"] == "img-new"
 
     def test_show_defaults_to_last_20_and_logs_info(
         self,
@@ -956,7 +1002,8 @@ class TestWaitExtended:
         pending_key = ("", f"ops:{session_store.session_key}")
         session_store.cache[pending_key] = ["op-str"]
 
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-str",
                 "status": "SUCCESS",
@@ -964,7 +1011,7 @@ class TestWaitExtended:
                 "duration": 1,
                 "error": "",
                 "result": {"image": "img-str"},
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=[]))
         assert rc is None
@@ -978,14 +1025,15 @@ class TestWaitExtended:
         SESSION_STORE.set(session_store)
         FORMATTER.set(JSONFormatter())
         session_store.set_image("img-1", kind="use")
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-fail",
                 "status": "FAILED",
                 "kind": "instance",
                 "duration": 1,
                 "error": "timeout",
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=["op-fail"]))
         assert rc == 1
@@ -997,14 +1045,15 @@ class TestWaitExtended:
         SESSION_STORE.set(session_store)
         FORMATTER.set(JSONFormatter())
         session_store.set_image("img-1", kind="use")
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-cancel",
                 "status": "CANCELLED",
                 "kind": "instance",
                 "duration": 0,
                 "error": "",
-            }
+            },
         )
         rc = cmd_wait(WaitArgs(op_ids=["op-cancel"]))
         assert rc == 1
@@ -1016,21 +1065,23 @@ class TestWaitExtended:
         SESSION_STORE.set(session_store)
         FORMATTER.set(JSONFormatter())
         session_store.set_image("img-1", kind="use")
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-poll",
                 "status": "EXECUTING",
                 "kind": "instance",
-            }
+            },
         )
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-poll",
                 "status": "SUCCESS",
                 "kind": "instance",
                 "duration": 2,
                 "error": "",
-            }
+            },
         )
         from unittest.mock import patch
 
@@ -1051,7 +1102,8 @@ class TestWaitExtended:
         session_store.cache[pending_key] = [
             {"op": "op-c1", "title": "t1", "disposable": False}
         ]
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-c1",
                 "status": "SUCCESS",
@@ -1059,7 +1111,7 @@ class TestWaitExtended:
                 "duration": 1,
                 "error": "",
                 "result": {"image": "img-c1"},
-            }
+            },
         )
         cmd_wait(WaitArgs(op_ids=[]))
         # Cache should be cleaned
@@ -1077,7 +1129,8 @@ class TestWaitExtended:
             {"op": "op-m1", "title": "t1", "disposable": False},
             {"op": "op-m2", "title": "t2", "disposable": False},
         ]
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-m1",
                 "status": "SUCCESS",
@@ -1085,9 +1138,10 @@ class TestWaitExtended:
                 "duration": 1,
                 "error": "",
                 "result": {"image": "img-m1"},
-            }
+            },
         )
-        contree_client.respond_json(
+        respond_status(
+            contree_client,
             {
                 "uuid": "op-m2",
                 "status": "SUCCESS",
@@ -1095,7 +1149,7 @@ class TestWaitExtended:
                 "duration": 2,
                 "error": "",
                 "result": {"image": "img-m2"},
-            }
+            },
         )
         cmd_wait(WaitArgs(op_ids=[]))
         # All done -> cache cleaned

@@ -47,12 +47,10 @@ File attachments:
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
 import fnmatch
 import functools
 import io
-import json
 import logging
 import os
 import re
@@ -65,16 +63,19 @@ from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
 from typing import Any
 
-from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
-from contree_cli.client import (
-    RETRYABLE_NETWORK_ERRORS,
-    ApiError,
-    ContreeClient,
-    decode_event_chunk,
+from contree_client.exceptions import ContreeAPIError
+from contree_client.models import (
+    TERMINAL_STATUSES,
+    File,
+    FileSpec,
+    OperationEvent,
+    StreamRepr,
+    decode_chunk,
     decode_stream,
-    iter_sse_events,
-    resolve_image,
 )
+
+from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
+from contree_cli.client import CliClient
 from contree_cli.mapped_file import MAPPING_RULES, MappedFile
 from contree_cli.output import (
     DefaultFormatter,
@@ -103,10 +104,9 @@ for coding agents:
   local file cache avoids re-upload when path+inode+mtime+size unchanged
   returns command exit code when available
   default formatter prints raw stdout/stderr only
-  use -f json for structured operation metadata
+  use -o json for structured operation metadata
 """
 
-TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 DEFAULT_FILE_EXCLUDES = (
     ".*",
     ".git",
@@ -392,32 +392,22 @@ def record_local_uuid(mf: MappedFile, file_uuid: str, store: SessionStore) -> No
     }
 
 
-def upload_one_remote(client: ContreeClient, mf: MappedFile) -> tuple[MappedFile, str]:
-    """HTTP-only upload (sha256 dedup + POST /v1/files). Thread-safe."""
-    sha = mf.sha256()
-    try:
-        resp = client.get(f"/v1/files/{sha}")
-        file_uuid = str(json.loads(resp.read())["uuid"])
-        logger.info("File reused: %s -> %s", mf.host_path, file_uuid)
-        return mf, file_uuid
-    except ApiError as exc:
-        if exc.status != 404:
-            raise
-
+def upload_one_remote(client: CliClient, mf: MappedFile) -> tuple[MappedFile, str]:
+    """Deduplicated upload via the client. Thread-safe."""
     with open(mf.host_path, "rb") as fh:
-        resp = client.request(
-            "POST",
-            "/v1/files",
-            body=fh,
-            headers={"Content-Type": "application/octet-stream"},
-        )
-        file_uuid = str(json.loads(resp.read())["uuid"])
-    logger.debug("Uploaded %s (%s)", mf.host_path, file_uuid)
+        stored = client.ensure_file(fh)
+    file_uuid = str(stored.uuid)
+    if isinstance(stored, File):
+        # ensure_file returns the existing record on a digest hit and
+        # the fresh upload response otherwise.
+        logger.info("File reused: %s -> %s", mf.host_path, file_uuid)
+    else:
+        logger.debug("Uploaded %s (%s)", mf.host_path, file_uuid)
     return mf, file_uuid
 
 
 def upload_files(
-    client: ContreeClient,
+    client: CliClient,
     files: list[MappedFile],
     store: SessionStore,
 ) -> dict[str, str]:
@@ -508,14 +498,11 @@ def _build_payload(
                 "uuid": file_uuid,
                 "uid": mf.uid,
                 "gid": mf.gid,
-                "mode": f"{mf.mode:04o}",
+                "mode": mf.mode,
             }
         payload["files"] = payload_files
 
     return payload
-
-
-TERMINAL_OP_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 
 
 @dataclass
@@ -528,46 +515,24 @@ class TerminalSummary:
     detects the op is already terminal, the full op dict lands in
     ``fallback_op`` so `cmd_run` can use it directly."""
 
-    completion: dict[str, Any] | None = None
-    exit_event: dict[str, Any] | None = None
+    completion: OperationEvent | None = None
+    exit_event: OperationEvent | None = None
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
     fallback_op: dict[str, Any] | None = None
 
 
-def _check_terminal_via_get(
-    client: ContreeClient, op_uuid: str, summary: TerminalSummary
-) -> bool:
-    """Poll `GET /v1/operations/{uuid}`; if the op is in a terminal
-    status, park the full response on ``summary.fallback_op`` and
-    return True.  Any GET failure or non-terminal status returns False
-    so the caller keeps retrying SSE."""
-    try:
-        resp = client.request("GET", f"/v1/operations/{op_uuid}")
-        op = json.loads(resp.read())
-    except (ApiError, ValueError) as exc:
-        logger.debug("terminal check GET failed: %s", exc)
-        return False
-    except RETRYABLE_NETWORK_ERRORS as exc:
-        logger.debug("terminal check GET failed: %s", exc)
-        return False
-    if isinstance(op, dict) and op.get("status") in TERMINAL_OP_STATUSES:
-        summary.fallback_op = op
-        return True
-    return False
-
-
-TIGHT_LOOP_FLOOR = 0.5
-
-
-def _stream_events_until_close(
-    client: ContreeClient,
+def stream_events_until_close(
+    client: CliClient,
     op_uuid: str,
     formatter: OutputFormatter,
 ) -> TerminalSummary:
-    """Open `follow=1` SSE for *op_uuid* and write events to stdio,
-    transparently resuming on network drops / mid-stream errors using
-    ``Last-Event-Id`` for replay-free continuation.
+    """Stream *op_uuid* events to stdio and collect a terminal summary.
+
+    Reconnection is the library's job: ``follow_operation_events``
+    resumes dropped streams with ``Last-Event-Id`` and stops after the
+    ``completion`` event or once a status poll reports the operation
+    terminal. This wrapper only routes the events.
 
     For ``DefaultFormatter``: ``stdout`` / ``stderr`` events go to
     ``sys.std*.buffer`` directly so the user sees output as it arrives.
@@ -576,107 +541,60 @@ def _stream_events_until_close(
     ``TerminalSummary`` so the caller can render full stdout/stderr
     without a follow-up GET.
 
-    Loops until one of: `completion` event received, GET-detected
-    terminal status, ``BrokenPipeError`` from a local stdio write, or
-    ``KeyboardInterrupt``.  Backoff between attempts is delegated to
-    ``client.request`` — every SSE reconnect goes through its
-    ``RETRY_DELAYS`` ladder before raising, so an extra streamer-level
-    ramp would double up.  The one floor kept here (``TIGHT_LOOP_FLOOR``)
-    only kicks in when a cycle made no forward progress, guarding
-    against a server that returns immediate empty streams for an
-    executing op.
+    When the stream ends without a ``completion`` frame (the library
+    detected the terminal status via a poll), the full operation
+    payload is fetched once and parked on ``fallback_op``.
 
     ``BrokenPipeError`` from a local stdio write propagates unchanged —
     it means the shell pipe closed and retrying cannot help; the
     caller cancels the op and exits.
     """
     is_default = isinstance(formatter, DefaultFormatter)
-    last_id: int = -1
     summary = TerminalSummary()
 
-    while True:
-        headers: dict[str, str] | None = None
-        if last_id >= 0:
-            headers = {"Last-Event-Id": str(last_id)}
-        try:
-            resp = client.request(
-                "GET",
-                f"/v1/operations/{op_uuid}/events?follow=1",
-                headers=headers,
-            )
-        except ApiError as exc:
-            logger.debug("SSE connect failed after client retries: %s", exc)
-            if _check_terminal_via_get(client, op_uuid, summary):
-                return summary
-            continue
-        except RETRYABLE_NETWORK_ERRORS as exc:
-            logger.debug("SSE connect network error after client retries: %s", exc)
-            if _check_terminal_via_get(client, op_uuid, summary):
-                return summary
-            continue
+    for ev in client.follow_operation_events(op_uuid):
+        match ev.type:
+            case "stdout":
+                chunk = decode_chunk(ev.data)
+                summary.stdout.extend(chunk)
+                if is_default:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+            case "stderr":
+                chunk = decode_chunk(ev.data)
+                summary.stderr.extend(chunk)
+                if is_default:
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.buffer.flush()
+            case "exit":
+                # spid=1 is the main process — its exit code/timed_out
+                # drive the CLI's own exit code.
+                if ev.spid == 1:
+                    summary.exit_event = ev
+                logger.debug("event: %s", ev)
+            case "completion":
+                # Authoritative terminal frame; the library ends the
+                # stream right after yielding it.
+                summary.completion = ev
+                logger.debug("event: %s", ev)
+            case _:
+                logger.debug("event: %s", ev)
 
-        events_before = last_id
+    if summary.completion is None:
+        # The stream ended via the terminal-status probe; fetch the op
+        # payload the caller would otherwise build from `completion`.
         try:
-            for ev in iter_sse_events(resp):
-                ev_id = ev.get("id")
-                if isinstance(ev_id, int):
-                    last_id = ev_id
-                ev_type = ev.get("type")
-                data = ev.get("data")
-                match ev_type:
-                    case "stdout":
-                        chunk = decode_event_chunk(data)
-                        summary.stdout.extend(chunk)
-                        if is_default:
-                            sys.stdout.buffer.write(chunk)
-                            sys.stdout.buffer.flush()
-                    case "stderr":
-                        chunk = decode_event_chunk(data)
-                        summary.stderr.extend(chunk)
-                        if is_default:
-                            sys.stderr.buffer.write(chunk)
-                            sys.stderr.buffer.flush()
-                    case "exit":
-                        # spid=1 is the main process — its exit code/timed_out
-                        # drive the CLI's own exit code.
-                        if ev.get("spid") == 1:
-                            summary.exit_event = ev
-                        logger.debug("event: %s", ev)
-                    case "sse_error":
-                        logger.warning(
-                            "server-side stream error (last_id=%s): %s",
-                            last_id,
-                            ev.get("message"),
-                        )
-                    case "completion":
-                        # Authoritative terminal frame — don't wait for the server
-                        # to close, return the summary for the caller.
-                        summary.completion = ev
-                        logger.debug("event: %s", ev)
-                        return summary
-                    case _:
-                        logger.debug("event: %s", ev)
-        except BrokenPipeError:
-            # Local stdout/stderr was closed by the shell (e.g. piping
-            # into `head`).  Retrying cannot help — the caller cancels
-            # the op and exits.
-            raise
-        except RETRYABLE_NETWORK_ERRORS as exc:
-            logger.debug("SSE stream broken (last_id=%s): %s", last_id, exc)
-        finally:
-            with contextlib.suppress(Exception):
-                resp.close()
-
-        if _check_terminal_via_get(client, op_uuid, summary):
+            op = client.get_operation_status(op_uuid).to_dict()
+        except ContreeAPIError as exc:
+            logger.debug("terminal op fetch failed: %s", exc)
             return summary
+        if op.get("status") in TERMINAL_STATUSES:
+            summary.fallback_op = op
 
-        # No forward progress this cycle → briefly floor the loop so a
-        # server that keeps returning immediate EOFs doesn't spin us.
-        if last_id == events_before:
-            time.sleep(TIGHT_LOOP_FLOOR)
+    return summary
 
 
-def _build_op_from_summary(op_uuid: str, summary: TerminalSummary) -> dict[str, Any]:
+def build_op_from_summary(op_uuid: str, summary: TerminalSummary) -> dict[str, Any]:
     """Synthesize a `GET /operations/{uuid}` shape from the SSE terminal
     summary — completion event drives status / error / duration / image
     metadata; exit event drives exit_code + timed_out; stdout/stderr
@@ -686,11 +604,19 @@ def _build_op_from_summary(op_uuid: str, summary: TerminalSummary) -> dict[str, 
     while keeping the downstream `_display_operation` consumers
     (default and JSON formatters) untouched."""
     assert summary.completion is not None
-    completion_data = summary.completion.get("data") or {}
+    completion_data = (
+        summary.completion.data.to_dict()
+        if not isinstance(summary.completion.data, dict)
+        else summary.completion.data
+    )
     status = completion_data.get("status")
     state: dict[str, Any] = {}
     if summary.exit_event:
-        exit_data = summary.exit_event.get("data") or {}
+        exit_data = (
+            summary.exit_event.data.to_dict()
+            if not isinstance(summary.exit_event.data, dict)
+            else summary.exit_event.data
+        )
         if "code" in exit_data:
             state["exit_code"] = int(exit_data["code"])
         if "timed_out" in exit_data:
@@ -795,10 +721,10 @@ def cmd_run(args: RunArgs) -> int | None:
 
     # 1. Resolve image: --use switches session first, otherwise use active
     if args.use:
-        image_uuid = resolve_image(client, args.use)
+        image_uuid = client.resolve_image(args.use)
         store.set_image(image_uuid, kind="use", title=args.use)
     else:
-        image_uuid = resolve_image(client, store.current_image)
+        image_uuid = client.resolve_image(store.current_image)
 
     # 2. Expand and upload attached files (supports directories)
     try:
@@ -847,10 +773,7 @@ def cmd_run(args: RunArgs) -> int | None:
         shebang_line, _, script_body = script_data.partition(b"\n")
         logger.debug("Shebang line: %s", shebang_line.decode(errors="replace"))
         if script_body:
-            payload["stdin"] = {
-                "value": base64.b64encode(script_body).decode(),
-                "encoding": "base64",
-            }
+            payload["stdin"] = StreamRepr.from_bytes(script_body)
             logger.debug("Script body: %d bytes", len(script_body))
         payload["command"] = "/bin/sh"
         payload["shell"] = True
@@ -865,17 +788,22 @@ def cmd_run(args: RunArgs) -> int | None:
     if "stdin" not in payload:
         stdin_data = _read_piped_stdin()
         if stdin_data:
-            payload["stdin"] = {
-                "value": base64.b64encode(stdin_data).decode(),
-                "encoding": "base64",
-            }
+            payload["stdin"] = StreamRepr.from_bytes(stdin_data)
             logger.debug("Piped stdin: %d bytes", len(stdin_data))
         elif not sys.stdin.isatty():
             logger.debug("No piped stdin available; skipping read")
 
-    resp = client.post_json("/v1/instances", payload)
-    op = json.loads(resp.read())
-    op_uuid: str = op["uuid"]
+    command = str(payload.pop("command"))
+    image = str(payload.pop("image"))
+    raw_files = payload.pop("files", None)
+    if isinstance(raw_files, dict) and raw_files:
+        payload["files"] = {
+            path: FileSpec.from_dict(spec) for path, spec in raw_files.items()
+        }
+
+    spawn_response = client.spawn_instance(command, image, **payload)  # type: ignore[arg-type]
+    op = spawn_response.to_dict()
+    op_uuid = str(op["uuid"])
 
     logger.debug("Spawned operation %s", op_uuid)
 
@@ -922,11 +850,11 @@ def cmd_run(args: RunArgs) -> int | None:
     # come, log other events at debug, accumulate the terminal frame.
     store = SESSION_STORE.get()
     try:
-        summary = _stream_events_until_close(client, op_uuid, formatter)
+        summary = stream_events_until_close(client, op_uuid, formatter)
         if summary.completion is not None:
             # Authoritative terminal frame from the server — build the
             # full op dict from the SSE events themselves, no GET.
-            op = _build_op_from_summary(op_uuid, summary)
+            op = build_op_from_summary(op_uuid, summary)
         elif summary.fallback_op is not None:
             # SSE couldn't deliver `completion`, but a GET between
             # retries confirmed the op is terminal — use that dict.
@@ -935,23 +863,22 @@ def cmd_run(args: RunArgs) -> int | None:
             # Safety net: streamer normally loops until either
             # completion or a terminal GET, so this path is only hit
             # in tests where the stub queue drains early.
-            resp = client.get(f"/v1/operations/{op_uuid}")
-            op = json.loads(resp.read())
+            op = client.get_operation_status(op_uuid).to_dict()
         cache_key = (op_uuid, "operation")
         store.cache[cache_key] = op
     except KeyboardInterrupt:
         try:
-            client.delete(f"/v1/operations/{op_uuid}")
+            client.cancel_operation(op_uuid)
             logger.info("Cancelled operation %s", op_uuid)
-        except (ApiError, KeyboardInterrupt, OSError):
+        except (ContreeAPIError, KeyboardInterrupt, OSError):
             pass
         raise
     except BrokenPipeError:
         # Local stdout/stderr was closed (e.g. `contree run | head`).
         # Cancel the op, silence further stdio writes, then exit 141
         # so callers see the SIGPIPE convention (128 + 13).
-        with contextlib.suppress(ApiError, OSError):
-            client.delete(f"/v1/operations/{op_uuid}")
+        with contextlib.suppress(ContreeAPIError, OSError):
+            client.cancel_operation(op_uuid)
         with contextlib.suppress(OSError):
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, sys.stdout.fileno())

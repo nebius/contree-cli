@@ -7,7 +7,7 @@ icon: download
 ## Requirements
 
 - Python 3.10 or later
-- No external dependencies (stdlib only)
+- The `contree-client` library (installed automatically)
 
 ## Install
 

@@ -15,26 +15,26 @@ from __future__ import annotations
 import argparse
 import contextlib
 import itertools
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from contree_client.exceptions import ContreeAPIError
+from contree_client.models import ACTIVE_STATUSES, TERMINAL_STATUSES
+
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.cli.show import ShowArgs, cmd_show
-from contree_cli.client import ApiError, ContreeClient, PaginatedFetcher
+from contree_cli.client import CliClient
 from contree_cli.output import OutputFormatter
 from contree_cli.refs import (
     history_spec_from_ref,
     looks_like_history_ref,
     resolve_operation_uuids,
 )
-from contree_cli.session import CONTREE_CONCURRENCY
 from contree_cli.types import (
     FLAGS,
-    isoformat_datetime,
     parse_interval,
     positive_int,
 )
@@ -49,10 +49,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = PaginatedFetcher.DEFAULT_PAGE_SIZE
-
-ACTIVE_STATUSES = frozenset({"PENDING", "ASSIGNED", "EXECUTING"})
-TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 WAIT_TIMEOUT_DEFAULT = 60
 STATUS_CHOICES = {
     "P": "PENDING",
@@ -168,11 +164,12 @@ def setup_show_parser(p: argparse.ArgumentParser) -> SetupResult:
         *FLAGS["raw"],
         action="store_true",
         help=(
-            "Print each operation's full server payload as JSONL "
-            "(one JSON object per line) to stdout, verbatim. Skips "
-            "formatter routing and derived columns; streams cleanly "
-            "into `jq -c`. Useful for debugging or for fields the "
-            "table view omits."
+            "Print each operation's JSON payload as JSONL (one object "
+            "per line) to stdout. Round-trips through the typed "
+            "operation model, so fields the model doesn't know about "
+            "are dropped. Skips formatter routing and derived "
+            "columns; streams cleanly into `jq -c`. Useful for "
+            "debugging or for fields the table view omits."
         ),
     )
     return cmd_show_multi, ShowMultiArgs
@@ -322,6 +319,7 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     return cmd_show_multi, ShowMultiArgs
 
 
+PAGE_SIZE = 1000
 CANCEL_ACTIVE_PAGE_SIZE = 100
 
 
@@ -347,26 +345,16 @@ def extract_exit_code(op: dict[str, Any]) -> int | None:
         return None
 
 
-def list_active(client: ContreeClient) -> list[str]:
+def list_active(client: CliClient) -> list[str]:
     """Collect UUIDs of all active (PENDING/ASSIGNED/EXECUTING) operations."""
-    uuids: list[str] = []
-    for status in ACTIVE_STATUSES:
-        offset = 0
-        while True:
-            params = {
-                "status": status,
-                "limit": str(CANCEL_ACTIVE_PAGE_SIZE),
-                "offset": str(offset),
-            }
-            resp = client.get("/v1/operations", params=params)
-            operations = json.loads(resp.read())
-            if not operations:
-                break
-            uuids.extend(op["uuid"] for op in operations)
-            if len(operations) < CANCEL_ACTIVE_PAGE_SIZE:
-                break
-            offset += len(operations)
-    return uuids
+    return [
+        str(op.uuid)
+        for status in ACTIVE_STATUSES
+        for op in client.iter_operations(
+            status=status,
+            page_size=CANCEL_ACTIVE_PAGE_SIZE,
+        )
+    ]
 
 
 def cmd_list(args: ListArgs) -> None:
@@ -383,40 +371,34 @@ def cmd_list(args: ListArgs) -> None:
     elif not args.all:
         status = "EXECUTING"
 
-    base_params: dict[str, str] = {}
-    if status:
-        base_params["status"] = status
-    if args.kind:
-        base_params["kind"] = args.kind
-    if args.since is not None:
-        base_params["since"] = isoformat_datetime(args.since)
-    if args.until is not None:
-        base_params["until"] = isoformat_datetime(args.until)
+    kind = args.kind
 
     limit = args.show_max
-    emitted = 0
     hit_limit = False
-    with PaginatedFetcher(
-        client,
-        "/v1/operations",
-        base_params,
-        json.loads,
-        limit=limit,
-        concurrency=CONTREE_CONCURRENCY,
-    ) as fetcher:
-        for page in fetcher:
-            for op in page:
-                if limit is not None and emitted >= limit:
-                    hit_limit = True
-                    break
-                if args.quiet:
-                    print(op["uuid"])
-                else:
-                    formatter(**op)
-                emitted += 1
-            formatter.flush()
-            if hit_limit:
-                break
+    # Fetch one extra record past the budget so truncation is
+    # detectable and the warning below can fire.
+    summaries = client.iter_operations(
+        status=status,
+        kind=kind,  # type: ignore[arg-type]
+        since=args.since,
+        until=args.until,
+        page_size=PAGE_SIZE,
+        limit=limit + 1 if limit is not None else None,
+    )
+    for emitted, summary in enumerate(summaries):
+        if limit is not None and emitted >= limit:
+            hit_limit = True
+            break
+        op = summary.to_dict()
+        if args.quiet:
+            print(op["uuid"])
+        else:
+            formatter(**op)
+        # Buffering formatters (table) print nothing until the end, so
+        # each consumed page reports progress while the next one loads.
+        if (emitted + 1) % PAGE_SIZE == 0:
+            logger.info("Fetched %d operations, loading more...", emitted + 1)
+    formatter.flush()
 
     if hit_limit:
         logger.warning(
@@ -432,7 +414,7 @@ def cmd_show_multi(args: ShowMultiArgs) -> int | None:
     for uuid in args.uuids:
         try:
             result = cmd_show(ShowArgs(uuid=uuid, raw=args.raw))
-        except ApiError as exc:
+        except ContreeAPIError as exc:
             logger.error("Failed to fetch %s: %s", uuid, exc)
             exit_code = max(exit_code, 1)
             continue
@@ -460,9 +442,9 @@ def cmd_cancel(args: CancelArgs) -> int | None:
     failed = 0
     for uuid in uuids:
         try:
-            client.delete(f"/v1/operations/{uuid}")
+            client.cancel_operation(uuid)
             logger.info("Cancelled operation %s", uuid)
-        except ApiError as exc:
+        except ContreeAPIError as exc:
             logger.error("Failed to cancel %s: %s", uuid, exc)
             failed += 1
     return 1 if failed else None
@@ -507,8 +489,7 @@ def cmd_wait(args: WaitArgs) -> int | None:
 
     while pending and time.monotonic() < deadline:
         for uuid in list(pending):
-            resp = client.get(f"/v1/operations/{uuid}")
-            op = json.loads(resp.read())
+            op = client.get_operation_status(uuid).to_dict()
 
             if op.get("status") in TERMINAL_STATUSES:
                 if store is not None:
@@ -547,9 +528,8 @@ def cmd_wait(args: WaitArgs) -> int | None:
     # what state each operation was stuck in.
     for uuid in sorted(pending):
         try:
-            resp = client.get(f"/v1/operations/{uuid}")
-            op = json.loads(resp.read())
-        except ApiError as exc:
+            op = client.get_operation_status(uuid).to_dict()
+        except ContreeAPIError as exc:
             logger.error("Failed to fetch %s: %s", uuid, exc)
             continue
         formatter(**{**op, "timed_out": True})

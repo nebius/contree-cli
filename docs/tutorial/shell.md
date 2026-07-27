@@ -318,7 +318,7 @@ Change the output format mid-session, or show the current format:
 
 ```text
 contree:/> --format json   # switch to JSON output
-contree:/> -f table        # switch to table output
+contree:/> -o table        # switch to table output
 contree:/> --format        # show current format name
 ```
 
@@ -344,7 +344,7 @@ contree:/app> contree tag UUID my-app:v1
 ## Limitations
 
 - **Output format is fixed** -- the `--format` flag is set at `contree shell`
-  launch. To use JSON output: `contree -f json shell`.
+  launch. To use JSON output: `contree -o json shell`.
 - **No local pipes or redirects** -- `|`, `>`, `<` are sent to the sandbox,
   not interpreted locally.
 - **No job control** -- no `&`, `bg`, `fg`, or Ctrl-Z. Use `contree run -d`

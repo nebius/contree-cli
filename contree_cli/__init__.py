@@ -6,13 +6,14 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from contree_cli.client import ContreeClient
-    from contree_cli.config import ConfigProfile
+    from contree_client.profiles import Profile
+
+    from contree_cli.client import CliClient
     from contree_cli.output import OutputFormatter
     from contree_cli.session import SessionStore
 
-PROFILE: ContextVar[ConfigProfile] = ContextVar("PROFILE")
-CLIENT: ContextVar[ContreeClient] = ContextVar("CLIENT")
+PROFILE: ContextVar[Profile] = ContextVar("PROFILE")
+CLIENT: ContextVar[CliClient] = ContextVar("CLIENT")
 FORMATTER: ContextVar[OutputFormatter] = ContextVar("FORMATTER")
 SESSION_STORE: ContextVar[SessionStore] = ContextVar("SESSION_STORE")
 IN_SHELL: ContextVar[bool] = ContextVar("IN_SHELL", default=False)

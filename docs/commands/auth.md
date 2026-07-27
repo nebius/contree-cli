@@ -23,7 +23,7 @@ contree auth -y
 contree auth ls
 
 # Structured output for scripts and agents
-contree -f json auth ls
+contree -o json auth ls
 
 # List profiles without network probes
 contree auth ls --offline
@@ -111,8 +111,8 @@ Possible `status` values:
 For automation and agents, prefer:
 
 ```bash
-contree -f json auth ls
-contree -f json auth ls --offline
+contree -o json auth ls
+contree -o json auth ls --offline
 ```
 
 ## `auth switch`

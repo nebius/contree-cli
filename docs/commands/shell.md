@@ -18,7 +18,7 @@ Start an interactive REPL for managing sessions and running sandbox commands.
 contree shell
 
 # Start with a specific output format
-contree -f json shell
+contree -o json shell
 
 # Start with a named profile
 contree --profile=personal shell

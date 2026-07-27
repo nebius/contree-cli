@@ -2,6 +2,8 @@ import logging
 import sys
 from types import MappingProxyType
 
+from contree_client.types import set_log_level
+
 from contree_cli.types import STDERR_IS_A_TTY, Colors
 
 
@@ -42,3 +44,6 @@ def setup_logging(level: int = logging.INFO) -> None:
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(ColorFormatter(tty=STDERR_IS_A_TTY))
     logging.basicConfig(level=level, handlers=[handler], force=True)
+    # The contree_client package logger is pinned to ERROR by default;
+    # mirror the CLI level so --log-level debug covers the transport too.
+    set_log_level(level)

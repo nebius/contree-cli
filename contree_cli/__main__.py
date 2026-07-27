@@ -3,13 +3,15 @@ import http.client
 import logging
 import sys
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import replace
+
+from contree_client.exceptions import ContreeError
 
 import contree_cli.config as config_mod
 from contree_cli import CLIENT, FORMATTER, PROFILE, SESSION_STORE, ArgumentsProtocol
 from contree_cli.arguments import parser
-from contree_cli.client import ApiError, client_from_profile
+from contree_cli.client import client_from_profile
 from contree_cli.config import SETTINGS, Config
 from contree_cli.log import setup_logging
 from contree_cli.output import FORMATTERS
@@ -17,6 +19,26 @@ from contree_cli.session import SessionStore, get_session_key
 from contree_cli.update_check import UpdateChecker
 
 log = logging.getLogger(__name__)
+
+# Network errors raised by the auto-detected transport backend. The
+# stdlib ones are always available; urllib3/httpx raise their own
+# hierarchies (neither inherits from OSError) when auto-detected as
+# the backend instead of `requests` (whose exceptions do subclass
+# OSError). Both imports are optional, mirroring how
+# contree_client.sync.detect_backend() itself probes for them.
+_NETWORK_ERRORS: tuple[type[BaseException], ...] = (OSError, http.client.HTTPException)
+try:
+    import urllib3.exceptions  # type: ignore[import-not-found]
+
+    _NETWORK_ERRORS = (*_NETWORK_ERRORS, urllib3.exceptions.HTTPError)
+except ModuleNotFoundError:
+    pass
+try:
+    import httpx  # type: ignore[import-not-found]
+
+    _NETWORK_ERRORS = (*_NETWORK_ERRORS, httpx.HTTPError)
+except ModuleNotFoundError:
+    pass
 
 
 def main() -> None:
@@ -71,24 +93,30 @@ def main() -> None:
         )
         exit(1)
 
-    if needs_client:
-        try:
-            client = client_from_profile(profile)
-        except ValueError as exc:
-            log.error("%s", exc)
-            exit(1)
-        CLIENT.set(client)
+    # One stack owns every resource the command needs; entries are
+    # added as they come to life and unwound together on the way out.
+    with ExitStack() as stack:
+        if needs_client:
+            # Session-based transports (requests/httpx/urllib3) hold
+            # pooled connections; enter the client so open()/close()
+            # run around the whole command.
+            try:
+                client = client_from_profile(profile)
+            except ValueError as exc:
+                log.error("%s", exc)
+                exit(1)
+            CLIENT.set(stack.enter_context(client))
 
-    formatter = FORMATTERS[args.output_format]()
+        formatter = FORMATTERS[args.output_format]()
+        stack.callback(formatter.close)
 
-    session_key = get_session_key(profile.name, override=args.session_key)
-    db_path = profile.session_db_path
-    log.debug("Running in session: %s", session_key)
+        session_key = get_session_key(profile.name, override=args.session_key)
+        db_path = config_mod.session_db_path(profile.name)
+        log.debug("Running in session: %s", session_key)
 
-    with SessionStore(db_path, session_key) as store:
         PROFILE.set(profile)
         FORMATTER.set(formatter)
-        SESSION_STORE.set(store)
+        SESSION_STORE.set(stack.enter_context(SessionStore(db_path, session_key)))
         ctx = contextvars.copy_context()
 
         loader: type[ArgumentsProtocol] = args.load_args
@@ -96,7 +124,7 @@ def main() -> None:
 
         try:
             exit_code = ctx.run(handler, loader.from_args(args))
-        except ApiError as exc:
+        except ContreeError as exc:
             log.error("%s", exc)
             exit(1)
         except ValueError as exc:
@@ -104,14 +132,12 @@ def main() -> None:
             # (invalid UUIDs, etc.); the message is already user-facing.
             log.error("%s", exc)
             exit(1)
-        except (OSError, http.client.HTTPException) as exc:
+        except _NETWORK_ERRORS as exc:
             log.error("Network error: %s", exc)
             exit(1)
         except KeyboardInterrupt:
             log.error("User interrupted")
             exit(1)
-        finally:
-            formatter.close()
 
     exit(exit_code or 0)
 

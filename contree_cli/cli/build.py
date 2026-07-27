@@ -6,11 +6,22 @@ the absolute path of the context directory. Successful layers are
 materialised as branches named ``layer:<chain-hash>`` so that
 re-running the same Dockerfile reuses prior work.
 
-Supported directives (MVP): FROM, RUN, COPY, ADD (local files/dirs
-and http(s) URLs; no tar auto-extraction), WORKDIR, ENV, ARG, USER.
-Other Dockerfile directives parse cleanly but are skipped with a
-warning (CMD, ENTRYPOINT, LABEL, EXPOSE, VOLUME, STOPSIGNAL,
-MAINTAINER, HEALTHCHECK, ONBUILD, SHELL).
+Supported directives (MVP): FROM (multistage via ``FROM ... AS name``),
+RUN, COPY (including ``--from=<alias|index|image>``), ADD (local
+files/dirs and http(s) URLs; no tar auto-extraction, no ``--from``),
+WORKDIR, ENV, ARG, USER. Other Dockerfile directives parse cleanly but
+are skipped with a warning (CMD, ENTRYPOINT, LABEL, EXPOSE, VOLUME,
+STOPSIGNAL, MAINTAINER, HEALTHCHECK, ONBUILD, SHELL).
+
+Multistage notes: ``COPY --from`` exports the source path from the
+referenced stage image as a tar archive, uploads it once (content
+deduplicated) and unpacks it with an extraction RUN inside the target
+sandbox. For now this means the target image must provide ``/bin/sh``,
+``tar``, ``cp`` and ``mv`` (busybox suffices; ``FROM scratch`` targets
+cannot receive ``COPY --from``). This is a temporary limitation of the
+client-side extraction and will be lifted in a future release once the
+backend unpacks archives itself. Unlike docker, ARG/ENV live in one
+global namespace across stages.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ from contree_cli import (
     ArgumentsProtocol,
     SetupResult,
 )
+from contree_cli.config import session_db_path
 from contree_cli.docker import (
     ArgKeyword,
     BuildContext,
@@ -56,6 +68,9 @@ for coding agents:
   mutating command, may create operations against the API
   layer cache is per-context (session keyed by abspath(context))
   use --no-cache to bypass cached layers and rebuild from scratch
+  multistage supported: FROM ... AS name + COPY --from=<name|index|image>
+  COPY --from unpacks a tar inside the target: needs sh/tar/cp/mv there
+  (temporary limitation, to be lifted in a future release)
 """
 
 
@@ -151,45 +166,44 @@ def cmd_build(args: BuildArgs) -> int | None:
     profile = PROFILE.get()
     client = CLIENT.get()
     session_key = make_session_key(context_dir)
-    store = SessionStore(profile.session_db_path, session_key)
-    SESSION_STORE.set(store)
+    with SessionStore(session_db_path(profile.name), session_key) as store:
+        store_token = SESSION_STORE.set(store)
+        try:
+            ctx = BuildContext(
+                client=client,
+                store=store,
+                local=LocalContext.from_dir(context_dir),
+                build_args=build_args,
+                no_cache=args.no_cache,
+                timeout=args.timeout,
+            )
 
-    ctx = BuildContext(
-        client=client,
-        store=store,
-        local=LocalContext.from_dir(context_dir),
-        build_args=build_args,
-        no_cache=args.no_cache,
-        timeout=args.timeout,
-    )
+            try:
+                for kw in directives:
+                    kw.execute(ctx)
+                finalize_pending(ctx)
+            except Exception as exc:
+                logger.error("build failed: %s", exc)
+                return 1
 
-    try:
-        for kw in directives:
-            kw.execute(ctx)
-        finalize_pending(ctx)
-    except Exception as exc:
-        logger.error("build failed: %s", exc)
-        return 1
+            if not ctx.last_image:
+                logger.error("build produced no image")
+                return 1
 
-    if not ctx.last_image:
-        logger.error("build produced no image")
-        return 1
+            if args.tag:
+                client.update_image_tag(ctx.last_image, args.tag)
+                logger.info("tagged %s as %s", ctx.last_image, args.tag)
 
-    if args.tag:
-        client.patch_json(
-            f"/v1/images/{ctx.last_image}/tag",
-            {"tag": args.tag},
-        )
-        logger.info("tagged %s as %s", ctx.last_image, args.tag)
-
-    formatter = FORMATTER.get()
-    formatter(
-        image=ctx.last_image,
-        tag=args.tag,
-        session=session_key,
-    )
-    formatter.flush()
-    return None
+            formatter = FORMATTER.get()
+            formatter(
+                image=ctx.last_image,
+                tag=args.tag,
+                session=session_key,
+            )
+            formatter.flush()
+            return None
+        finally:
+            SESSION_STORE.reset(store_token)
 
 
 def validate_first_directive(directives: list[DockerKeyword]) -> bool:

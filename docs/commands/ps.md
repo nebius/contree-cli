@@ -33,7 +33,7 @@ contree ps -q
 contree ps --status FAILED
 
 # Filter by kind
-contree ps -K instance
+contree ps -k instance
 
 # Operations from the last hour
 contree ps -a --since=1h

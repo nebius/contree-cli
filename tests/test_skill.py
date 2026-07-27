@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
+import pytest
+
+import contree_cli.config as config_mod
 from contree_cli.cli.skill import (
     SkillInstallArgs,
     SkillListArgs,
@@ -14,6 +18,7 @@ from contree_cli.cli.skill import (
     cmd_skill_upgrade,
 )
 from contree_cli.skill import (
+    ALL_SKILL_TYPES,
     SKILL_NAME,
     AmpSkill,
     ClaudeAgentSkill,
@@ -28,6 +33,7 @@ from contree_cli.skill import (
     parse_version,
     skill_from_spec,
     skill_version,
+    skills_from_spec,
 )
 
 
@@ -98,19 +104,21 @@ class TestSkillInstall:
     def test_install_default_specs(
         self, tmp_path: Path, config_dir: Path, monkeypatch
     ) -> None:
-        codex_home = tmp_path / ".codex"
+        agents_home = tmp_path / ".agents"
         claude_home = tmp_path / ".claude"
         claude_home.mkdir(parents=True)
 
-        monkeypatch.setattr("contree_cli.skill.default_codex_home", lambda: codex_home)
+        monkeypatch.setattr(
+            "contree_cli.skill.default_agents_home", lambda: agents_home
+        )
         monkeypatch.setattr(
             "contree_cli.skill.default_claude_home", lambda: claude_home
         )
 
         rc = cmd_skill_install(SkillInstallArgs(specs=()))
         assert rc is None
-        # Non-claude types installed unconditionally
-        assert (codex_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
+        # Non-claude types installed unconditionally; codex under ~/.agents
+        assert (agents_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
         # Claude types require ~/.claude to exist
         assert (claude_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
         assert (claude_home / "agents" / f"{SKILL_NAME}.md").is_file()
@@ -218,6 +226,291 @@ class TestSkillRemove:
         assert rc == 1
 
 
+class TestNonDestructiveInstall:
+    """Installing into a populated directory must never delete foreign files."""
+
+    def populated_dir(self, tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "main.py").write_text("print('keep me')", encoding="utf-8")
+        (repo / "README.md").write_text("keep me too", encoding="utf-8")
+        return repo
+
+    def test_install_keeps_foreign_files(self, tmp_path: Path) -> None:
+        repo = self.populated_dir(tmp_path)
+        ClaudeSkill(path=repo).install()
+        assert (repo / "SKILL.md").is_file()
+        assert (repo / "src" / "main.py").read_text(encoding="utf-8") == (
+            "print('keep me')"
+        )
+        assert (repo / "README.md").read_text(encoding="utf-8") == "keep me too"
+
+    def test_install_without_force_works_when_no_skill_md(self, tmp_path: Path) -> None:
+        repo = self.populated_dir(tmp_path)
+        skill = ClaudeSkill(path=repo)
+        assert not skill.exists
+        skill.install()
+        assert skill.exists
+
+    def test_install_refuses_when_skill_md_present(self, tmp_path: Path) -> None:
+        repo = self.populated_dir(tmp_path)
+        skill = ClaudeSkill(path=repo)
+        skill.install()
+        with pytest.raises(FileExistsError):
+            skill.install()
+
+    def test_install_refuses_when_only_version_file_present(
+        self, tmp_path: Path
+    ) -> None:
+        """A partially-removed prior install (SKILL.md gone, .version
+        left behind) must not have .version silently overwritten."""
+        repo = self.populated_dir(tmp_path)
+        skill = ClaudeSkill(path=repo)
+        skill.install()
+        (repo / "SKILL.md").unlink()
+        assert not skill.exists
+        with pytest.raises(FileExistsError):
+            skill.install()
+        # --force still works and rewrites cleanly.
+        skill.install(force=True)
+        assert skill.exists
+
+    def test_force_reinstall_replaces_only_skill_files(self, tmp_path: Path) -> None:
+        repo = self.populated_dir(tmp_path)
+        skill = ClaudeSkill(path=repo)
+        skill.install()
+        (repo / "SKILL.md").write_text("stale", encoding="utf-8")
+        skill.install(force=True)
+        assert "stale" not in (repo / "SKILL.md").read_text(encoding="utf-8")
+        assert (repo / "src" / "main.py").read_text(encoding="utf-8") == (
+            "print('keep me')"
+        )
+        assert (repo / "README.md").read_text(encoding="utf-8") == "keep me too"
+
+    def test_remove_keeps_foreign_files_and_dir(self, tmp_path: Path) -> None:
+        repo = self.populated_dir(tmp_path)
+        skill = ClaudeSkill(path=repo)
+        skill.install()
+        skill.remove()
+        assert not (repo / "SKILL.md").exists()
+        assert not (repo / ".version").exists()
+        assert not (repo / "agents").exists()
+        assert (repo / "src" / "main.py").is_file()
+        assert (repo / "README.md").is_file()
+
+    def test_remove_clean_install_removes_dir(self, tmp_path: Path) -> None:
+        dest = tmp_path / "skills" / SKILL_NAME
+        skill = ClaudeSkill(path=dest)
+        skill.install()
+        skill.remove()
+        assert not dest.exists()
+
+    def test_remove_keeps_sibling_skills_and_agents(
+        self, tmp_path: Path, config_dir: Path, monkeypatch
+    ) -> None:
+        claude_home = tmp_path / ".claude"
+        other_skill = claude_home / "skills" / "other-skill" / "SKILL.md"
+        other_skill.parent.mkdir(parents=True)
+        other_skill.write_text("other skill", encoding="utf-8")
+        other_agent = claude_home / "agents" / "reviewer.md"
+        other_agent.parent.mkdir(parents=True)
+        other_agent.write_text("other agent", encoding="utf-8")
+        monkeypatch.setattr(
+            "contree_cli.skill.default_claude_home", lambda: claude_home
+        )
+        monkeypatch.setattr(
+            "contree_cli.skill.default_codex_home", lambda: tmp_path / ".codex"
+        )
+
+        assert cmd_skill_install(SkillInstallArgs(specs=())) is None
+        assert (claude_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
+        assert (claude_home / "agents" / f"{SKILL_NAME}.md").is_file()
+
+        assert cmd_skill_remove(SkillRemoveArgs(force=True)) is None
+        assert not (claude_home / "skills" / SKILL_NAME).exists()
+        assert not (claude_home / "agents" / f"{SKILL_NAME}.md").exists()
+        assert other_skill.read_text(encoding="utf-8") == "other skill"
+        assert other_agent.read_text(encoding="utf-8") == "other agent"
+
+    def test_remove_shared_dir_keeps_foreign_agents(self, tmp_path: Path) -> None:
+        claude_home = tmp_path / ".claude"
+        other_agent = claude_home / "agents" / "reviewer.md"
+        other_agent.parent.mkdir(parents=True)
+        other_agent.write_text("other agent", encoding="utf-8")
+
+        skill = ClaudeSkill(path=claude_home)
+        skill.install()
+        skill.remove()
+        assert other_agent.read_text(encoding="utf-8") == "other agent"
+        assert other_agent.parent.is_dir()
+
+
+class TestProjectRootSpecs:
+    """A directory spec is a project root, not the skill directory itself."""
+
+    def test_raw_dir_expands_to_all_kinds(self, tmp_path: Path, monkeypatch) -> None:
+        claude_home = tmp_path / ".claude-home"
+        claude_home.mkdir()
+        monkeypatch.setattr(
+            "contree_cli.skill.default_claude_home", lambda: claude_home
+        )
+        root = tmp_path / "proj"
+        root.mkdir()
+
+        skills = skills_from_spec(str(root))
+        paths = {s.path for s in skills}
+        assert len(skills) == len(ALL_SKILL_TYPES)
+        assert root / ".claude" / "skills" / SKILL_NAME in paths
+        assert root / ".agents" / "skills" / SKILL_NAME in paths
+        assert root / ".claude" / "agents" / f"{SKILL_NAME}.md" in paths
+        assert root / ".claude" / "agents" / f"{SKILL_NAME}-subagent.md" in paths
+        assert all(str(s.path).startswith(str(root)) for s in skills)
+
+    def test_raw_dir_without_claude_home_skips_claude_kinds(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            "contree_cli.skill.default_claude_home",
+            lambda: tmp_path / "missing",
+        )
+        root = tmp_path / "proj"
+        root.mkdir()
+
+        kinds = {s.kind for s in skills_from_spec(str(root))}
+        assert "claude" not in kinds
+        assert "codex" in kinds
+
+    def test_kind_path_resolves_project_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "proj"
+        skill = skill_from_spec(f"claude:{root}")
+        assert skill.path == root / ".claude" / "skills" / SKILL_NAME
+
+    def test_codex_kind_path_uses_agents_dir(self, tmp_path: Path) -> None:
+        root = tmp_path / "proj"
+        skill = skill_from_spec(f"codex:{root}")
+        assert skill.path == root / ".agents" / "skills" / SKILL_NAME
+
+    def test_codex_global_under_agents_home(self, tmp_path: Path, monkeypatch) -> None:
+        agents_home = tmp_path / ".agents"
+        monkeypatch.setattr(
+            "contree_cli.skill.default_agents_home", lambda: agents_home
+        )
+        skill = skill_from_spec("codex:~")
+        assert skill.path == agents_home / "skills" / SKILL_NAME
+
+    def test_dir_with_skill_md_stays_literal(self, tmp_path: Path) -> None:
+        dest = tmp_path / "somewhere"
+        dest.mkdir()
+        (dest / "SKILL.md").write_text("installed", encoding="utf-8")
+        assert skills_from_spec(str(dest)) == (ClaudeSkill(path=dest),)
+
+    def test_contree_basename_under_skills_dir_stays_literal(
+        self, tmp_path: Path
+    ) -> None:
+        """A path shaped like a real install target (.../skills/contree)
+        stays literal even without SKILL.md, e.g. a partially-removed
+        install being pointed at directly for cleanup."""
+        dest = tmp_path / "anywhere" / "skills" / SKILL_NAME
+        assert skills_from_spec(str(dest)) == (ClaudeSkill(path=dest),)
+
+    def test_contree_basename_elsewhere_expands_as_project_root(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A project directory that merely happens to be named `contree`
+        (parent isn't `skills/`) must NOT be mistaken for a skill
+        artifact -- it expands like any other project root."""
+        claude_home = tmp_path / ".claude-home"
+        claude_home.mkdir()
+        monkeypatch.setattr(
+            "contree_cli.skill.default_claude_home", lambda: claude_home
+        )
+        root = tmp_path / "anywhere" / SKILL_NAME
+        skills = skills_from_spec(str(root))
+        assert len(skills) == len(ALL_SKILL_TYPES)
+        assert all(str(s.path).startswith(str(root)) for s in skills)
+
+    def test_md_path_stays_literal(self, tmp_path: Path) -> None:
+        dest = tmp_path / "somewhere" / "custom.md"
+        assert skills_from_spec(str(dest)) == (ClaudeSubagentSkill(path=dest),)
+
+    def test_installed_path_round_trips_for_removal(self, tmp_path: Path) -> None:
+        root = tmp_path / "proj"
+        installed = root / ".claude" / "skills" / SKILL_NAME
+        skills = skills_from_spec(str(installed))
+        assert skills == (ClaudeSkill(path=installed),)
+
+    def test_project_root_inside_agent_home_expands(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A project living inside .claude/.codex/.agents is still a root."""
+        claude_home = tmp_path / ".claude-home"
+        claude_home.mkdir()
+        monkeypatch.setattr(
+            "contree_cli.skill.default_claude_home", lambda: claude_home
+        )
+        root = tmp_path / ".claude" / "projects" / "proj"
+        root.mkdir(parents=True)
+        skills = skills_from_spec(str(root))
+        assert len(skills) == len(ALL_SKILL_TYPES)
+        assert all(str(s.path).startswith(str(root)) for s in skills)
+
+    def test_install_remove_cycle_leaves_project_clean(
+        self, tmp_path: Path, config_dir: Path, monkeypatch
+    ) -> None:
+        claude_home = tmp_path / ".claude-home"
+        claude_home.mkdir()
+        monkeypatch.setattr(
+            "contree_cli.skill.default_claude_home", lambda: claude_home
+        )
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex-home"))
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "app.py").write_text("app", encoding="utf-8")
+
+        specs = frozenset(skills_from_spec(str(root)))
+        assert cmd_skill_install(SkillInstallArgs(specs=specs)) is None
+        assert cmd_skill_remove(SkillRemoveArgs(specs=specs, force=True)) is None
+        assert [p.name for p in root.iterdir()] == ["app.py"]
+
+
+class TestContreeHomeInSkill:
+    """Rendered skills and the install registry must respect CONTREE_HOME."""
+
+    def test_codex_sandbox_lists_contree_home_writable_root(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        data_home = tmp_path / "contree-data"
+        monkeypatch.setattr(config_mod, "CONTREE_HOME", data_home)
+        body = CodexSkill(path=tmp_path / "codex").body()
+        assert re.search(r'writable_roots = \["[^"]*contree-data"\]', body)
+        # TOML basic strings treat backslash as an escape; the path must
+        # be rendered with forward slashes on every platform
+        assert "\\" not in body
+
+    def test_codex_sandbox_contracts_home_prefix(self, monkeypatch) -> None:
+        monkeypatch.setattr(config_mod, "CONTREE_HOME", Path.home() / "custom-contree")
+        body = CodexSkill(path=Path("unused")).body()
+        assert 'writable_roots = ["~/custom-contree"]' in body
+
+    def test_installed_skill_md_reflects_contree_home(
+        self, tmp_path: Path, config_dir: Path, monkeypatch
+    ) -> None:
+        data_home = tmp_path / "contree-data"
+        monkeypatch.setattr(config_mod, "CONTREE_HOME", data_home)
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex-home"))
+        dest = tmp_path / ".codex" / "skills" / SKILL_NAME
+        assert cmd_skill_install(SkillInstallArgs(specs=_specs(dest))) is None
+        text = (dest / "SKILL.md").read_text(encoding="utf-8")
+        assert re.search(r'writable_roots = \["[^"]*contree-data"\]', text)
+
+    def test_registry_db_lives_under_contree_home(
+        self, tmp_path: Path, config_dir: Path
+    ) -> None:
+        dest = _installed(tmp_path)
+        assert cmd_skill_install(SkillInstallArgs(specs=_specs(dest))) is None
+        assert (config_mod.CONTREE_HOME / "cli" / "skills.db").is_file()
+
+
 class TestSkillList:
     def test_list_shows_remembered(self, tmp_path: Path, config_dir: Path) -> None:
         dest1 = tmp_path / "codex" / SKILL_NAME
@@ -286,8 +579,8 @@ class TestSkillFromSpec:
         assert skill.path == home / "skills" / SKILL_NAME
 
     def test_codex_global(self, monkeypatch) -> None:
-        home = Path("/tmp/test-codex")
-        monkeypatch.setattr("contree_cli.skill.default_codex_home", lambda: home)
+        home = Path("/tmp/test-agents")
+        monkeypatch.setattr("contree_cli.skill.default_agents_home", lambda: home)
         skill = skill_from_spec("codex:~")
         assert isinstance(skill, CodexSkill)
         assert skill.path == home / "skills" / SKILL_NAME
@@ -346,6 +639,10 @@ class TestGuessSkill:
     def test_agents_marker(self) -> None:
         p = Path("/home/user/.config/agents/skills/contree")
         assert isinstance(guess_skill(p), AmpSkill)
+
+    def test_dot_agents_marker_is_codex(self) -> None:
+        p = Path("/home/user/.agents/skills/contree")
+        assert isinstance(guess_skill(p), CodexSkill)
 
     def test_unknown_defaults_anthropic(self) -> None:
         p = Path("/some/random/path")
@@ -406,7 +703,31 @@ class TestSkillClasses:
     def test_subagent_no_fallback(self, tmp_path: Path) -> None:
         s = ClaudeSubagentSkill(path=tmp_path / "sub.md")
         assert s.fallback() == ""
-        assert s.references() == ""
+
+    def test_subagent_frontmatter_uses_tools_field(self, tmp_path: Path) -> None:
+        fm = ClaudeSubagentSkill(path=tmp_path / "sub.md").frontmatter()
+        assert "tools: Bash, Read, Grep" in fm
+        assert "allowed-tools" not in fm
+
+    def test_codex_body_has_sandbox_section(self, tmp_path: Path) -> None:
+        assert "## Codex Sandbox" in CodexSkill(path=tmp_path / "codex").body()
+
+    def test_claude_body_has_no_sandbox_section(self, tmp_path: Path) -> None:
+        assert "## Codex Sandbox" not in ClaudeSkill(path=tmp_path / "claude").body()
+
+    def test_workflow_numbering_is_sequential(self, tmp_path: Path) -> None:
+        for skill in (
+            ClaudeSkill(path=tmp_path / "claude"),
+            ClaudeSubagentSkill(path=tmp_path / "sub.md"),
+        ):
+            body = skill.body()
+            workflow = body.split("## Required Workflow", 1)[1].split("\n## ", 1)[0]
+            numbers = [
+                int(line.split(".", 1)[0])
+                for line in workflow.splitlines()
+                if line[:1].isdigit()
+            ]
+            assert numbers == list(range(1, len(numbers) + 1))
 
     def test_skill_hash_eq(self, tmp_path: Path) -> None:
         a = ClaudeSkill(path=tmp_path / "a")
@@ -422,9 +743,10 @@ class TestSkillClasses:
         assert p.name == SKILL_NAME
         assert p.is_absolute()
 
-    def test_resolve_path_explicit(self, tmp_path: Path) -> None:
+    def test_resolve_path_treats_dir_as_project_root(self, tmp_path: Path) -> None:
         p = ClaudeSkill.resolve_path(str(tmp_path / "custom"))
-        assert p == (tmp_path / "custom").resolve()
+        root = (tmp_path / "custom").resolve()
+        assert p == root / ".claude" / "skills" / SKILL_NAME
 
     def test_installed_version_missing(self, tmp_path: Path) -> None:
         s = ClaudeSkill(path=tmp_path / "noexist")
@@ -481,8 +803,7 @@ class TestClaudeAgentSkill:
         rendered = s.render()
         assert "skills:" in rendered
         assert "- contree" in rendered
-        assert "tools:" in rendered
-        assert "- Bash" in rendered
+        assert "tools: Bash, Read, Grep" in rendered
 
     def test_install_remove(self, tmp_path: Path, config_dir: Path) -> None:
         md = tmp_path / "agents" / "contree.md"
@@ -517,11 +838,13 @@ class TestClaudeAgentSkill:
     ) -> None:
         claude_home = tmp_path / ".claude"
         claude_home.mkdir(parents=True)
-        codex_home = tmp_path / ".codex-fresh"
+        agents_home = tmp_path / ".agents-fresh"
         monkeypatch.setattr(
             "contree_cli.skill.default_claude_home", lambda: claude_home
         )
-        monkeypatch.setattr("contree_cli.skill.default_codex_home", lambda: codex_home)
+        monkeypatch.setattr(
+            "contree_cli.skill.default_agents_home", lambda: agents_home
+        )
 
         rc = cmd_skill_install(SkillInstallArgs(specs=()))
         assert rc is None
@@ -529,23 +852,25 @@ class TestClaudeAgentSkill:
         assert (claude_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
         assert (claude_home / "agents" / f"{SKILL_NAME}.md").is_file()
         # Non-claude types: installed even without pre-existing home
-        assert (codex_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
+        assert (agents_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
 
     def test_no_claude_types_without_home(
         self, tmp_path: Path, config_dir: Path, monkeypatch
     ) -> None:
         claude_home = tmp_path / ".claude-nonexist"
-        codex_home = tmp_path / ".codex"
+        agents_home = tmp_path / ".agents"
         monkeypatch.setattr(
             "contree_cli.skill.default_claude_home", lambda: claude_home
         )
-        monkeypatch.setattr("contree_cli.skill.default_codex_home", lambda: codex_home)
+        monkeypatch.setattr(
+            "contree_cli.skill.default_agents_home", lambda: agents_home
+        )
 
         rc = cmd_skill_install(SkillInstallArgs(specs=()))
         assert rc is None
         assert not (claude_home / "skills" / SKILL_NAME).exists()
         assert not (claude_home / "agents").exists()
-        assert (codex_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
+        assert (agents_home / "skills" / SKILL_NAME / "SKILL.md").is_file()
 
     def test_render_mentions_subagents(self, tmp_path: Path) -> None:
         s = ClaudeAgentSkill(path=tmp_path / "agent.md")

@@ -3,13 +3,15 @@ from __future__ import annotations
 from contextvars import copy_context
 
 from conftest import ContreeTestClient
+from contree_client.exceptions import ContreeAPIError
+from contree_client.models import OperationSummary
 
 from contree_cli import CLIENT
 from contree_cli.cli.operation import ACTIVE_STATUSES, CancelArgs, cmd_cancel
 
 
-def _run_cmd(tc: ContreeTestClient, uuid, *, status=202):
-    tc.respond(status=status, body=b"")
+def _run_cmd(tc: ContreeTestClient, uuid):
+    tc.mock("cancel_operation", None)
     ctx = copy_context()
 
     args = CancelArgs(uuids=[uuid])
@@ -17,11 +19,11 @@ def _run_cmd(tc: ContreeTestClient, uuid, *, status=202):
 
 
 class TestCmdKill:
-    def test_sends_delete(self, contree_client):
+    def test_sends_cancel(self, contree_client):
         _run_cmd(contree_client, "op-123")
-        req = contree_client.get_request(0)
-        assert req.method == "DELETE"
-        assert req.path == "/v1/operations/op-123"
+        calls = contree_client.calls_for("cancel_operation")
+        assert len(calls) == 1
+        assert calls[0].args == ("op-123",)
 
     def test_logs_cancellation(self, contree_client, caplog):
         with caplog.at_level("INFO"):
@@ -29,7 +31,7 @@ class TestCmdKill:
         assert "Cancelled operation op-456" in caplog.text
 
     def test_not_found_logs_and_sets_exit(self, contree_client, caplog):
-        contree_client.respond(status=404, body=b"nope")
+        contree_client.mock("cancel_operation", error=ContreeAPIError(404, "nope"))
         CLIENT.set(contree_client)
         ctx = copy_context()
         with caplog.at_level("ERROR"):
@@ -38,7 +40,9 @@ class TestCmdKill:
         assert "Failed to cancel bad-uuid" in caplog.text
 
     def test_conflict_logs_and_sets_exit(self, contree_client, caplog):
-        contree_client.respond(status=409, body=b"already done")
+        contree_client.mock(
+            "cancel_operation", error=ContreeAPIError(409, "already done")
+        )
         CLIENT.set(contree_client)
         ctx = copy_context()
         with caplog.at_level("ERROR"):
@@ -55,23 +59,37 @@ def _ops_for_status(status, count):
     return [{"uuid": f"{status.lower()}-{i}"} for i in range(count)]
 
 
-def _run_kill_all(ops_by_status, *, delete_failures=None):
-    """Run cmd_cancel --all with mocked list + delete responses."""
-    delete_failures = delete_failures or set()
+def _run_kill_all(pages, *, cancel_failures=None):
+    """Run cmd_cancel --all with mocked list + cancel responses.
+
+    ``list_active`` queries each ACTIVE_STATUS once; the frozenset
+    iteration order is nondeterministic, so ``pages`` are queued
+    positionally (call order), not per status. Cancellations follow
+    the page order, so ``cancel_failures`` matches by UUID.
+    """
+    cancel_failures = cancel_failures or set()
     tc = ContreeTestClient()
 
-    # For each active status, one GET page (possibly empty)
-    for status in ACTIVE_STATUSES:
-        ops = ops_by_status.get(status, [])
-        tc.respond_json(ops)
+    # One page per active-status listing call; pad with empties.
+    queued = list(pages)
+    while len(queued) < len(ACTIVE_STATUSES):
+        queued.append([])
+    for page in queued:
+        tc.mock(
+            "list_operations",
+            [OperationSummary.from_dict(op) for op in page],
+        )
 
-    # Collect all UUIDs in order and queue delete responses
-    for status in ACTIVE_STATUSES:
-        for op in ops_by_status.get(status, []):
-            if op["uuid"] in delete_failures:
-                tc.respond(status=409, body=b"conflict")
+    # Queue one cancel outcome per collected UUID, in page order.
+    for page in queued:
+        for op in page:
+            if op["uuid"] in cancel_failures:
+                tc.mock(
+                    "cancel_operation",
+                    error=ContreeAPIError(409, "conflict"),
+                )
             else:
-                tc.respond(status=202, body=b"")
+                tc.mock("cancel_operation", None)
 
     CLIENT.set(tc)
     ctx = copy_context()
@@ -83,41 +101,40 @@ def _run_kill_all(ops_by_status, *, delete_failures=None):
 
 class TestKillAll:
     def test_kills_all_active(self, caplog):
-        ops = {
-            "PENDING": _ops_for_status("PENDING", 1),
-            "EXECUTING": _ops_for_status("EXECUTING", 1),
-        }
+        pages = [
+            _ops_for_status("PENDING", 1),
+            _ops_for_status("EXECUTING", 1),
+        ]
         with caplog.at_level("INFO"):
-            tc, rc = _run_kill_all(ops)
+            tc, rc = _run_kill_all(pages)
         assert rc is None
-        # 3 GETs (one per status) + 2 DELETEs
-        assert tc.request_count == 5
+        # 3 listing calls (one per status) + 2 cancels
+        assert len(tc.calls_for("list_operations")) == len(ACTIVE_STATUSES)
+        assert len(tc.calls_for("cancel_operation")) == 2
         assert "Cancelled operation pending-0" in caplog.text
         assert "Cancelled operation executing-0" in caplog.text
 
     def test_no_active_operations(self, caplog):
         with caplog.at_level("INFO"):
-            tc, rc = _run_kill_all({})
+            tc, rc = _run_kill_all([])
         assert rc is None
         assert "No active operations" in caplog.text
-        # Only 3 GETs, no DELETEs
-        assert tc.request_count == 3
+        # Only listings, no cancels
+        assert len(tc.calls_for("list_operations")) == len(ACTIVE_STATUSES)
+        assert tc.calls_for("cancel_operation") == []
 
     def test_partial_failure(self, caplog):
-        ops = {
-            "PENDING": _ops_for_status("PENDING", 2),
-        }
+        pages = [_ops_for_status("PENDING", 2)]
         with caplog.at_level("INFO"):
             _, rc = _run_kill_all(
-                ops,
-                delete_failures={"pending-1"},
+                pages,
+                cancel_failures={"pending-1"},
             )
         assert rc == 1
         assert "Cancelled operation pending-0" in caplog.text
         assert "Failed to cancel pending-1" in caplog.text
 
     def test_queries_all_statuses(self):
-        tc, _ = _run_kill_all({})
-        paths = tc.request_paths
-        for status in ACTIVE_STATUSES:
-            assert any(f"status={status}" in p for p in paths), f"{status} not queried"
+        tc, _ = _run_kill_all([])
+        statuses = {call.kwargs["status"] for call in tc.calls_for("list_operations")}
+        assert statuses == set(ACTIVE_STATUSES)

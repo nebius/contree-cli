@@ -83,7 +83,7 @@ machine -- the server stores only `uuid`, `sha256`, `size`,
 contree file ls
 contree file ls --since 1d --limit 200
 contree file ls -q                # uuid + sha256 + source only
-contree -f json file ls | jq 'select(.source != "")'
+contree -o json file ls | jq 'select(.source != "")'
 ```
 
 ```{terminal-shell} contree file ls --help

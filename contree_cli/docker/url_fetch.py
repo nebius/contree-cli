@@ -16,7 +16,6 @@ redirects and handles HTTPS.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
 import urllib.error
@@ -24,7 +23,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-from contree_cli.client import ApiError, ContreeClient
+from contree_cli.client import CliClient
 from contree_cli.session import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -44,7 +43,7 @@ class FetchedUrl:
 
 def fetch_and_upload(
     url: str,
-    client: ContreeClient,
+    client: CliClient,
     store: SessionStore,
     *,
     timeout: int = DOWNLOAD_TIMEOUT_DEFAULT,
@@ -86,16 +85,10 @@ def fetch_and_upload(
     assert isinstance(body_bytes, (bytes, bytearray))
     body_bytes = bytes(body_bytes)
 
-    resp = client.request(
-        "POST",
-        "/v1/files",
-        body=body_bytes,
-        headers={"Content-Type": "application/octet-stream"},
-    )
-    data = json.loads(resp.read())
-
-    file_uuid = str(data["uuid"])
     sha = hashlib.sha256(body_bytes).hexdigest()
+    uploaded = client.ensure_file(body_bytes, sha256=sha)
+
+    file_uuid = str(uploaded.uuid)
     size = len(body_bytes)
 
     write_metadata(
@@ -207,7 +200,9 @@ def http_head(url: str, *, timeout: int = DOWNLOAD_TIMEOUT_DEFAULT) -> dict[str,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as exc:
-        logger.debug("HEAD %s returned %d, skipping validator probe", url, exc.code)
+        code = exc.code
+        exc.close()
+        logger.debug("HEAD %s returned %d, skipping validator probe", url, code)
         return {}
     except (urllib.error.URLError, OSError, ValueError) as exc:
         logger.debug("HEAD %s failed (%s), skipping validator probe", url, exc)
@@ -260,7 +255,6 @@ def url_basename(url: str, fallback: str = "downloaded") -> str:
 
 
 __all__ = [
-    "ApiError",
     "FetchedUrl",
     "fetch_and_upload",
     "is_url",

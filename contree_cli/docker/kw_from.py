@@ -4,21 +4,20 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import logging
-import time
 from dataclasses import dataclass
 from typing import ClassVar
 
-from contree_cli.cli.images import normalize_registry_url
-from contree_cli.client import ApiError, resolve_image
+from contree_client.exceptions import ContreeAPIError
+from contree_client.models import ImageImportRegistry
 
-from .context import BuildContext
+from contree_cli.cli.images import normalize_registry_url
+
+from .context import BuildContext, resolve_stage_ref
 from .keyword import DockerKeyword
+from .kw_run import RunKeyword
 
 logger = logging.getLogger(__name__)
-
-TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 
 
 @dataclass(frozen=True, repr=False)
@@ -48,8 +47,17 @@ class FromKeyword(DockerKeyword):
         return f"FROM {self.image_ref}" + (f" AS {self.alias}" if self.alias else "")
 
     def execute(self, ctx: BuildContext) -> None:
+        if ctx.last_image:
+            seal_stage(ctx)
+        ctx.current_stage_alias = self.alias
+        ctx.env.clear()
+        ctx.workdir = "/"
+        ctx.user = ""
+
         ref = ctx.substitute(self.image_ref)
-        image_uuid = resolve_or_import(ctx, ref)
+        image_uuid = resolve_stage_ref(ctx, ref)
+        if image_uuid is None:
+            image_uuid = resolve_or_import(ctx, ref)
 
         from_hash = hashlib.sha256(f"FROM:{image_uuid}".encode()).hexdigest()
         branch_name = f"layer:{BuildContext.short_hash(from_hash)}"
@@ -70,11 +78,39 @@ class FromKeyword(DockerKeyword):
         ctx.parent_hash = from_hash
 
 
+def seal_stage(ctx: BuildContext) -> None:
+    """Close the stage in progress before the next FROM starts.
+
+    Pending files exist only as attachments for a future RUN, so a
+    stage that ends with COPY/ADD is committed through the same
+    trivial closer that finalize_pending uses; the sealed image then
+    becomes addressable via ``COPY --from=<alias|index>``.
+    """
+    if ctx.pending:
+        # Sealing just commits already-uploaded files; it must run as
+        # root regardless of the stage's active USER (matching how
+        # copy_from_image's own extraction RUN clears ctx.user).
+        saved_user = ctx.user
+        ctx.user = ""
+        try:
+            RunKeyword(parts=(":",), shell_form=True).execute(ctx)
+        finally:
+            ctx.user = saved_user
+    ctx.stage_images.append(ctx.last_image)
+    if ctx.current_stage_alias:
+        ctx.stages[ctx.current_stage_alias] = ctx.last_image
+    logger.info(
+        "stage %s sealed -> %s",
+        ctx.current_stage_alias or len(ctx.stage_images) - 1,
+        ctx.last_image,
+    )
+
+
 def resolve_or_import(ctx: BuildContext, ref: str) -> str:
     """Resolve ``ref`` to a UUID, importing from a registry on miss."""
     try:
-        return resolve_image(ctx.client, ref)
-    except ApiError as exc:
+        return ctx.client.resolve_image(ref)
+    except ContreeAPIError as exc:
         if exc.status != 404:
             raise
 
@@ -82,31 +118,22 @@ def resolve_or_import(ctx: BuildContext, ref: str) -> str:
     tag = ref if not ref.startswith("docker://") else url.removeprefix("docker://")
     logger.info("FROM auto-import %s as tag %s", url, tag)
 
-    payload: dict[str, object] = {"registry": {"url": url}, "tag": tag}
-    if ctx.timeout:
-        payload["timeout"] = ctx.timeout
-    resp = ctx.client.post_json("/v1/images/import", payload)
-    op = json.loads(resp.read())
-    op_uuid: str = op["uuid"]
+    op_uuid = ctx.client.import_image(
+        ImageImportRegistry(url=url),
+        tag=tag,
+        timeout=ctx.timeout if ctx.timeout else ...,
+    )
 
     try:
         return wait_import(ctx, op_uuid, tag)
     except KeyboardInterrupt:
-        with contextlib.suppress(ApiError, OSError):
-            ctx.client.delete(f"/v1/operations/{op_uuid}")
+        with contextlib.suppress(ContreeAPIError, OSError):
+            ctx.client.cancel_operation(op_uuid)
         raise
 
 
 def wait_import(ctx: BuildContext, op_uuid: str, tag: str) -> str:
-    delay = 1.0
-    while True:
-        time.sleep(delay)
-        resp = ctx.client.get(f"/v1/operations/{op_uuid}")
-        op = json.loads(resp.read())
-        if op["status"] in TERMINAL_STATUSES:
-            break
-        if delay < 5:
-            delay += delay
+    op = ctx.client.wait_operation(op_uuid).to_dict()
     if op["status"] != "SUCCESS":
         raise RuntimeError(
             f"image import {tag!r} ended with {op['status']}"

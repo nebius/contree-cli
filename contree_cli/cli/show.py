@@ -17,8 +17,9 @@ import sys
 from dataclasses import dataclass
 from typing import Any, cast
 
+from contree_client.models import TERMINAL_STATUSES, decode_stream
+
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol
-from contree_cli.client import decode_stream
 from contree_cli.output import DefaultFormatter, JSONFormatter, JSONPrettyFormatter
 from contree_cli.refs import history_spec_from_ref, resolve_operation_uuid
 
@@ -44,9 +45,6 @@ class ShowArgs(ArgumentsProtocol):
         return cls(uuid=ns.uuid, raw=getattr(ns, "raw", False))
 
 
-TERMINAL = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
-
-
 def cmd_show(args: ShowArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
@@ -61,19 +59,22 @@ def cmd_show(args: ShowArgs) -> int | None:
 
     cache_key = (op_uuid, "operation")
     cached = store.cache.get(cache_key)
-    if isinstance(cached, dict) and cached.get("status") in TERMINAL:
-        op = cast(dict[str, Any], cached)
+    if isinstance(cached, dict) and cached.get("status") in TERMINAL_STATUSES:
+        op = cast("dict[str, Any]", cached)
     else:
-        resp = client.get(f"/v1/operations/{op_uuid}")
-        op = json.loads(resp.read())
-        if op.get("status") in TERMINAL:
+        # Note: to_dict() round-trips through the typed model, so
+        # fields unknown to the model are dropped -- `--raw` is only
+        # as raw as the model allows.
+        op = client.get_operation_status(op_uuid).to_dict()
+        if op.get("status") in TERMINAL_STATUSES:
             store.cache[cache_key] = op
 
     if args.raw:
-        # Pass through the server payload verbatim, one operation per
-        # line (JSONL), so multi-UUID `op show --raw` streams cleanly
-        # into `jq -c`, `awk`, etc. Skips formatter routing, derived
-        # columns, and stdout/stderr decoding -- the user asked for raw.
+        # One operation per line (JSONL), so multi-UUID `op show --raw`
+        # streams cleanly into `jq -c`, `awk`, etc. Skips formatter
+        # routing, derived columns, and stdout/stderr decoding -- the
+        # typed-model round-trip above is still in effect, though (see
+        # the note on `op` a few lines up).
         json.dump(op, sys.stdout)
         sys.stdout.write("\n")
         return None

@@ -5,10 +5,10 @@ import json
 from contextvars import copy_context
 
 from conftest import ContreeTestClient
+from contree_client.models import OperationResponse, decode_stream
 
 from contree_cli import FORMATTER, SESSION_STORE
 from contree_cli.cli.show import ShowArgs, cmd_show
-from contree_cli.client import decode_stream
 from contree_cli.output import (
     CSVFormatter,
     DefaultFormatter,
@@ -18,7 +18,7 @@ from contree_cli.output import (
 
 
 def _run_cmd(tc: ContreeTestClient, op, *, formatter=None, store):
-    tc.respond_json(op)
+    tc.mock("get_operation_status", OperationResponse.from_dict(op))
 
     FORMATTER.set(formatter or CSVFormatter())
     SESSION_STORE.set(store)
@@ -41,7 +41,18 @@ def _make_op(
     stderr=None,
     exit_code=None,
 ):
-    metadata = {"result": None}
+    if kind == "instance":
+        metadata = {
+            "command": "echo hi",
+            "image": "img-base",
+            "shell": True,
+            "result": None,
+        }
+    else:
+        metadata = {
+            "registry": {"url": "docker://docker.io/busybox:latest"},
+            "tag": "busybox:latest",
+        }
     if stdout is not None or stderr is not None or exit_code is not None:
         state = {}
         if exit_code is not None:
@@ -58,7 +69,7 @@ def _make_op(
         "error": error,
         "duration": duration,
         "metadata": metadata,
-        "result": {"image": image, "tag": tag, "duration": None},
+        "result": {"image": image, "tag": tag},
     }
 
 
@@ -105,10 +116,11 @@ class TestCmdShow:
         assert "SUCCESS" in out
         assert "instance" in out
 
-    def test_request_path(self, contree_client, session_store):
+    def test_request_uuid(self, contree_client, session_store):
         _run_cmd(contree_client, _make_op(), store=session_store)
-        req = contree_client.get_request(0)
-        assert req.path == "/v1/operations/op-abc"
+        calls = contree_client.calls_for("get_operation_status")
+        assert len(calls) == 1
+        assert calls[0].args == ("op-abc",)
 
     def test_null_duration(self, contree_client, capsys, session_store):
         _run_cmd(contree_client, _make_op(duration=None), store=session_store)
@@ -146,14 +158,19 @@ class TestCmdShow:
         assert parsed["duration"] == 5.0
 
     def test_unknown_field_passes_through(self, contree_client, capsys, session_store):
-        """New server fields reach the row even when not hardcoded."""
+        """Schema fields the handler does not hardcode reach the row.
+
+        The payload round-trips through the typed OperationResponse
+        model, so only fields the API schema declares survive; the
+        handler itself must not need a code change for them.
+        """
         op = _make_op()
-        op["session_key"] = "sess-1"
-        op["future_field"] = "anything"
+        op["image_uuid"] = "img-src"
+        op["consumed_cpu"] = 0.25
         _run_cmd(contree_client, op, formatter=JSONFormatter(), store=session_store)
         parsed = json.loads(capsys.readouterr().out)
-        assert parsed["session_key"] == "sess-1"
-        assert parsed["future_field"] == "anything"
+        assert parsed["image_uuid"] == "img-src"
+        assert parsed["consumed_cpu"] == 0.25
 
     def test_table_output(self, contree_client, capsys, session_store):
         fmt = TableFormatter()
@@ -178,7 +195,7 @@ class TestCmdShow:
         session_store.set_image("img-2", kind="run", operation_uuid="op-run")
 
         op = _make_op(uuid="op-run")
-        contree_client.respond_json(op)
+        contree_client.mock("get_operation_status", OperationResponse.from_dict(op))
         SESSION_STORE.set(session_store)
         FORMATTER.set(CSVFormatter())
         ctx = copy_context()
@@ -188,8 +205,8 @@ class TestCmdShow:
 
         out = capsys.readouterr().out
         assert "op-run" in out
-        req = contree_client.get_request(0)
-        assert req.path == "/v1/operations/op-run"
+        calls = contree_client.calls_for("get_operation_status")
+        assert calls[0].args == ("op-run",)
 
 
 class TestShowStdout:
@@ -277,28 +294,31 @@ class TestShowCaching:
         """SUCCESS op is cached; second call skips API."""
         op = _make_op(status="SUCCESS")
         _run_cmd(contree_client, op, store=session_store)
-        assert contree_client.request_count == 1
+        assert len(contree_client.calls_for("get_operation_status")) == 1
 
         _run_cmd(contree_client, op, store=session_store)
-        assert contree_client.request_count == 1  # no new request (cached)
+        # no new request (cached)
+        assert len(contree_client.calls_for("get_operation_status")) == 1
 
     def test_failed_op_cached(self, contree_client, session_store):
         """FAILED op is also terminal and should be cached."""
         op = _make_op(status="FAILED", error="boom")
         _run_cmd(contree_client, op, store=session_store)
-        assert contree_client.request_count == 1
+        assert len(contree_client.calls_for("get_operation_status")) == 1
 
         _run_cmd(contree_client, op, store=session_store)
-        assert contree_client.request_count == 1  # no new request (cached)
+        # no new request (cached)
+        assert len(contree_client.calls_for("get_operation_status")) == 1
 
     def test_non_terminal_op_not_cached(self, contree_client, session_store):
         """EXECUTING op should not be cached; second call hits API."""
         op = _make_op(status="EXECUTING")
         _run_cmd(contree_client, op, store=session_store)
-        assert contree_client.request_count == 1
+        assert len(contree_client.calls_for("get_operation_status")) == 1
 
         _run_cmd(contree_client, op, store=session_store)
-        assert contree_client.request_count == 2  # new request (not cached)
+        # new request (not cached)
+        assert len(contree_client.calls_for("get_operation_status")) == 2
 
 
 class TestStatusVerbatim:
@@ -340,11 +360,12 @@ class TestShowRaw:
         self, contree_client, capsys, session_store
     ):
         # --raw skips formatter routing and derived columns and emits
-        # JSONL: one operation per line, the full server JSON, so multi-
-        # UUID `op show --raw` streams cleanly into `jq -c` / `awk`.
+        # JSONL: one operation per line, the server payload as the
+        # typed OperationResponse model round-trips it, so multi-UUID
+        # `op show --raw` streams cleanly into `jq -c` / `awk`.
         op = _make_op(status="SUCCESS", exit_code=1)
-        op["server_only_field"] = "preserved"
-        contree_client.respond_json(op)
+        op["consumed_memory"] = 4096
+        contree_client.mock("get_operation_status", OperationResponse.from_dict(op))
         FORMATTER.set(JSONFormatter())
         SESSION_STORE.set(session_store)
         ctx = copy_context()
@@ -354,9 +375,9 @@ class TestShowRaw:
         assert len(lines) == 1
         parsed = json.loads(lines[0])
         # No derived columns (no `exit_code` flattening, no `image`/`tag`
-        # promotion); the entire server payload is what came back.
+        # promotion); every schema field of the payload is kept.
         assert parsed["status"] == "SUCCESS"
-        assert parsed["server_only_field"] == "preserved"
+        assert parsed["consumed_memory"] == 4096
         assert "metadata" in parsed  # full nested structure preserved
         assert parsed["metadata"]["result"]["state"]["exit_code"] == 1
         # JSONL contract: exactly one line of compact JSON per op.

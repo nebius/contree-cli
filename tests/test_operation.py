@@ -4,6 +4,8 @@ from contextvars import copy_context
 
 import pytest
 from conftest import ContreeTestClient
+from contree_client.exceptions import ContreeAPIError
+from contree_client.models import OperationResponse, OperationSummary
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.arguments import parser
@@ -30,16 +32,32 @@ def make_op(
     image: str = "img-1",
     tag: str = "latest",
 ) -> dict:
+    if kind == "instance":
+        metadata = {
+            "command": "echo hi",
+            "image": "img-base",
+            "shell": True,
+            "result": None,
+        }
+    else:
+        metadata = {
+            "registry": {"url": "docker://docker.io/busybox:latest"},
+            "tag": "busybox:latest",
+        }
     return {
         "uuid": uuid,
         "kind": kind,
         "status": status,
         "error": error,
         "duration": duration,
-        "metadata": {"result": None},
-        "result": {"image": image, "tag": tag, "duration": None},
+        "metadata": metadata,
+        "result": {"image": image, "tag": tag},
         "created_at": "2025-06-01T00:00:00Z",
     }
+
+
+def mock_op(tc: ContreeTestClient, op: dict) -> None:
+    tc.mock("get_operation_status", OperationResponse.from_dict(op))
 
 
 def run_show_multi(
@@ -50,7 +68,7 @@ def run_show_multi(
     store: SessionStore,
 ) -> int | None:
     for op in ops:
-        tc.respond_json(op)
+        mock_op(tc, op)
     FORMATTER.set(formatter or CSVFormatter())
     SESSION_STORE.set(store)
     ctx = copy_context()
@@ -64,13 +82,18 @@ def run_cancel(
     uuids: list[str] | None = None,
     all_flag: bool = False,
     list_pages: list[list[dict]] | None = None,
-    delete_statuses: list[int] | None = None,
+    cancel_outcomes: list[BaseException | None] | None = None,
 ) -> int | None:
-    if list_pages is not None:
-        for page in list_pages:
-            tc.respond_json(page)
-    for status in delete_statuses or []:
-        tc.respond(status=status, body=b"")
+    for page in list_pages or []:
+        tc.mock(
+            "list_operations",
+            [OperationSummary.from_dict(op) for op in page],
+        )
+    for outcome in cancel_outcomes or []:
+        if isinstance(outcome, BaseException):
+            tc.mock("cancel_operation", error=outcome)
+        else:
+            tc.mock("cancel_operation", None)
     CLIENT.set(tc)
     ctx = copy_context()
     args = CancelArgs(uuids=uuids or [], all=all_flag)
@@ -168,7 +191,7 @@ class TestOperationShow:
         assert rc is None
         out = capsys.readouterr().out
         assert "op-a" in out
-        assert contree_client.request_count == 1
+        assert len(contree_client.calls_for("get_operation_status")) == 1
 
     def test_show_multiple_uuids_issues_one_get_per_uuid(
         self, contree_client, session_store, capsys
@@ -181,23 +204,24 @@ class TestOperationShow:
             store=session_store,
         )
         assert rc is None
-        assert contree_client.request_count == 3
+        calls = contree_client.calls_for("get_operation_status")
+        assert len(calls) == 3
         out = capsys.readouterr().out
         assert "op-a" in out
         assert "op-b" in out
         assert "op-c" in out
-        # All three are GETs on /v1/operations/{uuid}
-        for i, op in enumerate(ops):
-            req = contree_client.get_request(i)
-            assert req.method == "GET"
-            assert req.path == f"/v1/operations/{op['uuid']}"
+        # One status fetch per UUID, in order
+        for call, op in zip(calls, ops, strict=True):
+            assert call.args == (op["uuid"],)
 
     def test_show_continues_on_api_error(
         self, contree_client, session_store, caplog, capsys
     ):
         # First UUID -> 404, then a successful one
-        contree_client.respond(status=404, body=b"not found")
-        contree_client.respond_json(make_op("op-b"))
+        contree_client.mock(
+            "get_operation_status", error=ContreeAPIError(404, "not found")
+        )
+        mock_op(contree_client, make_op("op-b"))
 
         FORMATTER.set(JSONFormatter())
         SESSION_STORE.set(session_store)
@@ -224,7 +248,7 @@ class TestOperationShow:
             title="echo hi",
             operation_uuid="op-from-history",
         )
-        contree_client.respond_json(make_op("op-from-history"))
+        mock_op(contree_client, make_op("op-from-history"))
 
         FORMATTER.set(CSVFormatter())
         SESSION_STORE.set(session_store)
@@ -233,8 +257,9 @@ class TestOperationShow:
         rc = ctx.run(cmd_show_multi, args)
 
         assert rc is None
-        assert contree_client.request_count == 1
-        assert contree_client.get_request(0).path == "/v1/operations/op-from-history"
+        calls = contree_client.calls_for("get_operation_status")
+        assert len(calls) == 1
+        assert calls[0].args == ("op-from-history",)
 
     def test_show_raw_multi_uuid_emits_jsonl(
         self, contree_client, session_store, capsys
@@ -245,7 +270,7 @@ class TestOperationShow:
 
         ops = [make_op("op-a"), make_op("op-b"), make_op("op-c")]
         for op in ops:
-            contree_client.respond_json(op)
+            mock_op(contree_client, op)
         FORMATTER.set(JSONFormatter())
         SESSION_STORE.set(session_store)
         ctx = copy_context()
@@ -271,13 +296,12 @@ class TestOperationCancel:
             rc = run_cancel(
                 contree_client,
                 uuids=["op-a"],
-                delete_statuses=[202],
+                cancel_outcomes=[None],
             )
         assert rc is None
-        assert contree_client.request_count == 1
-        req = contree_client.get_request(0)
-        assert req.method == "DELETE"
-        assert req.path == "/v1/operations/op-a"
+        calls = contree_client.calls_for("cancel_operation")
+        assert len(calls) == 1
+        assert calls[0].args == ("op-a",)
         assert "Cancelled operation op-a" in caplog.text
 
     def test_cancel_multiple_uuids(self, contree_client, caplog):
@@ -285,21 +309,18 @@ class TestOperationCancel:
             rc = run_cancel(
                 contree_client,
                 uuids=["op-a", "op-b", "op-c"],
-                delete_statuses=[202, 202, 202],
+                cancel_outcomes=[None, None, None],
             )
         assert rc is None
-        assert contree_client.request_count == 3
-        for i, uuid in enumerate(["op-a", "op-b", "op-c"]):
-            req = contree_client.get_request(i)
-            assert req.method == "DELETE"
-            assert req.path == f"/v1/operations/{uuid}"
+        calls = contree_client.calls_for("cancel_operation")
+        assert [call.args for call in calls] == [("op-a",), ("op-b",), ("op-c",)]
 
     def test_cancel_continues_on_error(self, contree_client, caplog):
         with caplog.at_level("INFO"):
             rc = run_cancel(
                 contree_client,
                 uuids=["op-a", "op-b"],
-                delete_statuses=[409, 202],
+                cancel_outcomes=[ContreeAPIError(409, "conflict"), None],
             )
         assert rc == 1
         assert "Failed to cancel op-a" in caplog.text
@@ -310,23 +331,29 @@ class TestOperationCancel:
             rc = run_cancel(contree_client)
         assert rc == 1
         assert "Provide at least one UUID" in caplog.text
-        assert contree_client.request_count == 0
+        assert contree_client.calls == []
 
     def test_cancel_all_iterates_active_statuses(self, contree_client, caplog):
-        # One op per active status, then DELETE for each
-        list_pages = [[{"uuid": f"{s.lower()}-0"}] for s in ACTIVE_STATUSES]
+        # One op per active-status listing call. ACTIVE_STATUSES is a
+        # frozenset, so the status <-> page pairing is nondeterministic;
+        # pages are queued positionally and assertions stay unordered.
+        list_pages = [[{"uuid": f"active-{i}"}] for i in range(len(ACTIVE_STATUSES))]
         with caplog.at_level("INFO"):
             rc = run_cancel(
                 contree_client,
                 all_flag=True,
                 list_pages=list_pages,
-                delete_statuses=[202] * len(ACTIVE_STATUSES),
+                cancel_outcomes=[None] * len(ACTIVE_STATUSES),
             )
         assert rc is None
-        # 3 GETs + 3 DELETEs (one per active status)
-        assert contree_client.request_count == 2 * len(ACTIVE_STATUSES)
-        for status in ACTIVE_STATUSES:
-            assert f"Cancelled operation {status.lower()}-0" in caplog.text
+        list_calls = contree_client.calls_for("list_operations")
+        assert {call.kwargs["status"] for call in list_calls} == set(ACTIVE_STATUSES)
+        cancel_calls = contree_client.calls_for("cancel_operation")
+        assert sorted(call.args[0] for call in cancel_calls) == [
+            f"active-{i}" for i in range(len(ACTIVE_STATUSES))
+        ]
+        for i in range(len(ACTIVE_STATUSES)):
+            assert f"Cancelled operation active-{i}" in caplog.text
 
     def test_cancel_all_with_no_active(self, contree_client, caplog):
         list_pages = [[] for _ in ACTIVE_STATUSES]
@@ -337,8 +364,9 @@ class TestOperationCancel:
                 list_pages=list_pages,
             )
         assert rc is None
-        # Only GETs, no DELETEs
-        assert contree_client.request_count == len(ACTIVE_STATUSES)
+        # Only listings, no cancels
+        assert len(contree_client.calls_for("list_operations")) == len(ACTIVE_STATUSES)
+        assert contree_client.calls_for("cancel_operation") == []
         assert "No active operations" in caplog.text
 
     def test_cancel_all_overrides_explicit_uuids(self, contree_client, caplog):
@@ -352,14 +380,13 @@ class TestOperationCancel:
                 uuids=["ignored-1", "ignored-2"],
                 all_flag=True,
                 list_pages=list_pages,
-                delete_statuses=[202],
+                cancel_outcomes=[None],
             )
         assert rc is None
         assert "--all overrides explicit UUIDs" in caplog.text
-        # Only one DELETE went out -- for pending-0, not the ignored UUIDs
-        deletes = [r for r in contree_client.fake.requests if r.method == "DELETE"]
-        assert len(deletes) == 1
-        assert deletes[0].path == "/v1/operations/pending-0"
+        # Only one cancel went out -- for pending-0, not the ignored UUIDs
+        cancel_calls = contree_client.calls_for("cancel_operation")
+        assert [call.args for call in cancel_calls] == [("pending-0",)]
 
 
 # ----------------------------------------------------------------------
@@ -389,20 +416,20 @@ class TestOperationWait:
 
     def test_wait_returns_none_on_terminal_success(self, contree_client, monkeypatch):
         monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
-        contree_client.respond_json(_wait_op("op-1", status="SUCCESS"))
+        mock_op(contree_client, _wait_op("op-1", status="SUCCESS"))
 
         FORMATTER.set(JSONFormatter())
         CLIENT.set(contree_client)
         ctx = copy_context()
         rc = ctx.run(cmd_wait, WaitArgs(uuids=["op-1"], timeout=60))
         assert rc is None
-        assert contree_client.request_count == 1
+        assert len(contree_client.calls_for("get_operation_status")) == 1
 
     def test_wait_failed_op_returns_exit_code_one(
         self, contree_client, monkeypatch, capsys
     ):
         monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
-        contree_client.respond_json(_wait_op("op-fail", status="FAILED"))
+        mock_op(contree_client, _wait_op("op-fail", status="FAILED"))
 
         FORMATTER.set(JSONFormatter())
         CLIENT.set(contree_client)
@@ -424,8 +451,12 @@ class TestOperationWait:
         `op wait && next-step` still composes correctly."""
         monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
         op = _wait_op("op-false", status="SUCCESS")
-        op["metadata"] = {"result": {"state": {"exit_code": 1}}}
-        contree_client.respond_json(op)
+        op["metadata"] = {
+            "command": "false",
+            "image": "img-base",
+            "result": {"state": {"exit_code": 1}},
+        }
+        mock_op(contree_client, op)
 
         FORMATTER.set(JSONFormatter())
         CLIENT.set(contree_client)
@@ -445,8 +476,12 @@ class TestOperationWait:
         sandbox command's status."""
         monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
         op = _wait_op("op-42", status="SUCCESS")
-        op["metadata"] = {"result": {"state": {"exit_code": 42}}}
-        contree_client.respond_json(op)
+        op["metadata"] = {
+            "command": "exit 42",
+            "image": "img-base",
+            "result": {"state": {"exit_code": 42}},
+        }
+        mock_op(contree_client, op)
 
         FORMATTER.set(JSONFormatter())
         CLIENT.set(contree_client)
@@ -466,8 +501,8 @@ class TestOperationWait:
         monkeypatch.setattr("contree_cli.cli.operation.time.sleep", lambda _: None)
         # Poll: returns EXECUTING (not terminal). Second fetch (post-deadline)
         # picks up the same op for the timed-out row.
-        contree_client.respond_json(_wait_op("op-slow", status="EXECUTING"))
-        contree_client.respond_json(_wait_op("op-slow", status="EXECUTING"))
+        mock_op(contree_client, _wait_op("op-slow", status="EXECUTING"))
+        mock_op(contree_client, _wait_op("op-slow", status="EXECUTING"))
 
         FORMATTER.set(JSONFormatter())
         CLIENT.set(contree_client)
@@ -494,8 +529,7 @@ class TestOperationWait:
 
     def test_wait_all_with_no_active(self, contree_client, monkeypatch, caplog):
         # list_active returns no UUIDs after polling each ACTIVE_STATUS once.
-        for _ in ACTIVE_STATUSES:
-            contree_client.respond_json([])
+        contree_client.mock("list_operations", [])
 
         FORMATTER.set(JSONFormatter())
         CLIENT.set(contree_client)
@@ -503,6 +537,7 @@ class TestOperationWait:
         with caplog.at_level("INFO"):
             rc = ctx.run(cmd_wait, WaitArgs(uuids=[], all=True, timeout=60))
         assert rc is None
+        assert len(contree_client.calls_for("list_operations")) == len(ACTIVE_STATUSES)
         assert "No active operations to wait for" in caplog.text
 
 

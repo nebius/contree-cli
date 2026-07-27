@@ -12,13 +12,13 @@ they remain safe in tests and during partial setup.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import posixpath
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from types import EllipsisType
 from typing import TYPE_CHECKING
 
 from contree_cli.config import Config
@@ -27,7 +27,7 @@ from contree_cli.output import FORMATTERS
 from contree_cli.shell.cache import SourceCache
 
 if TYPE_CHECKING:
-    from contree_cli.client import ContreeClient
+    from contree_cli.client import CliClient
     from contree_cli.session import SessionStore
 
 log = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ SandboxListFn = Callable[
 
 @dataclass(frozen=True)
 class CompletionContext:
-    client: ContreeClient | None
+    client: CliClient | None
     store: SessionStore | None
     cache: SourceCache | None
     profile: str
@@ -95,23 +95,39 @@ def with_trailing_space(names: Iterable[str], text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def fetch_images(ctx: CompletionContext) -> list[dict[str, object]]:
-    """Return the list of images (cached, profile-namespaced)."""
+UUID_PREFIX_RE = re.compile(r"^[0-9a-f][0-9a-f-]*$", re.ASCII)
+
+
+def fetch_images(
+    ctx: CompletionContext,
+    tag_prefix: str = "",
+) -> list[dict[str, object]]:
+    """Return the list of images (cached, profile-namespaced).
+
+    ``tag_prefix`` goes into the API's server-side tag prefix filter,
+    so completion sees matching images even when the account holds
+    more than one page of them.
+    """
     if ctx.client is None:
         return []
+    cache_kind = f"images:{tag_prefix}" if tag_prefix else "images"
     if ctx.cache is not None:
-        cached = ctx.cache.get(scope="", kind="images", ttl=60.0)
+        cached = ctx.cache.get(scope="", kind=cache_kind, ttl=60.0)
         if isinstance(cached, list):
             return cached
     try:
-        resp = ctx.client.get("/v1/images", params={"limit": "100"})
-        data = json.loads(resp.read())
-        images: list[dict[str, object]] = data.get("images", [])
+        listed = ctx.client.list_images(
+            limit=100,
+            tag=tag_prefix or None,
+        ).images
+        if isinstance(listed, EllipsisType):
+            listed = []
+        images: list[dict[str, object]] = [img.to_dict() for img in listed]
     except Exception:
         log.debug("image source: API call failed", exc_info=True)
         return []
     if ctx.cache is not None:
-        ctx.cache.set(scope="", kind="images", value=images)
+        ctx.cache.set(scope="", kind=cache_kind, value=images)
     return images
 
 
@@ -120,8 +136,13 @@ def complete_image(text: str, ctx: CompletionContext) -> list[str]:
 
     Bare text matching a tag name auto-prefixes the candidate with
     ``tag:``; explicit ``tag:`` text filters by the full candidate.
+    The typed prefix is forwarded to the API request (server-side tag
+    prefix filter). UUIDs cannot be prefix-filtered server-side, so a
+    hex-looking text is additionally matched against the unfiltered
+    first page.
     """
-    images = fetch_images(ctx)
+    tag_prefix = text.removeprefix("tag:")
+    images = fetch_images(ctx, tag_prefix)
     results: list[str] = []
     for img in images:
         tag = img.get("tag")
@@ -135,6 +156,14 @@ def complete_image(text: str, ctx: CompletionContext) -> list[str]:
         uuid_str = img.get("uuid")
         if isinstance(uuid_str, str) and uuid_str.startswith(text):
             results.append(uuid_str + " ")
+
+    if text and UUID_PREFIX_RE.match(text):
+        for img in fetch_images(ctx):
+            uuid_str = img.get("uuid")
+            if isinstance(uuid_str, str) and uuid_str.startswith(text):
+                candidate = uuid_str + " "
+                if candidate not in results:
+                    results.append(candidate)
     return results
 
 
@@ -148,14 +177,7 @@ def fetch_operations(ctx: CompletionContext) -> list[dict[str, object]]:
             return cached
     ops: list[dict[str, object]]
     try:
-        resp = ctx.client.get("/v1/operations", params={"limit": "100"})
-        data = json.loads(resp.read())
-        if isinstance(data, dict):
-            ops = list(data.get("operations", []))
-        elif isinstance(data, list):
-            ops = list(data)
-        else:
-            ops = []
+        ops = [op.to_dict() for op in ctx.client.list_operations(limit=100)]
     except Exception:
         log.debug("operation source: API call failed", exc_info=True)
         return []
@@ -227,15 +249,9 @@ def list_sandbox_dir(
         if isinstance(cached, list):
             return cached
     try:
-        from contree_cli.client import resolve_image
-
-        uuid = resolve_image(ctx.client, image_uuid)
-        resp = ctx.client.get(
-            f"/v1/inspect/{uuid}/list",
-            params={"path": dir_path},
-        )
-        data = json.loads(resp.read())
-        files: list[dict[str, object]] = data.get("files", [])
+        uuid = ctx.client.resolve_image(image_uuid)
+        listing = ctx.client.inspect_image_list(uuid, dir_path)
+        files: list[dict[str, object]] = [f.to_dict() for f in listing.files]
     except Exception:
         log.debug("sandbox source: API call failed", exc_info=True)
         return None
@@ -458,7 +474,7 @@ def complete_command_name(text: str, ctx: CompletionContext) -> list[str]:
     from contree_cli.shell.parser import get_command_names
 
     builtins = ("cd", "pwd", "history", "help", "clear", "exit", "quit")
-    aliases = ("ls", "cat", "vim", "vi", "nvim", "nano", "--format", "-f")
+    aliases = ("ls", "cat", "vim", "vi", "nvim", "nano", "--format", "--output", "-o")
     names = sorted({*get_command_names(), *builtins, *aliases})
     return with_trailing_space(names, text)
 

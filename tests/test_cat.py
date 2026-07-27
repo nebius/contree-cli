@@ -4,7 +4,7 @@ import io
 from contextvars import copy_context
 from unittest.mock import patch
 
-from conftest import ContreeTestClient, FakeResponse
+from conftest import ContreeTestClient
 
 from contree_cli import FORMATTER, SESSION_STORE
 from contree_cli.cli.cat import CatArgs, cmd_cat
@@ -25,8 +25,8 @@ def _run_cmd(
 ):
     """Run cmd_cat with mocked responses and stdout."""
     if images_response is not None:
-        tc.respond_json(images_response)
-    tc.fake.responses.append(FakeResponse(body=data))
+        tc.mock("inspect_find_image_by_tag", images_response["images"][0]["uuid"])
+    tc.mock("inspect_image_download", data)
 
     FORMATTER.set(formatter or DefaultFormatter())
     store.set_image(image, kind="test")
@@ -44,12 +44,14 @@ def _run_cmd(
 
 
 class TestCmdCatTTY:
-    def test_request_path(self, contree_client, session_store):
+    def test_request_args(self, contree_client, session_store):
         _run_cmd(contree_client, b"hello", store=session_store, path="/etc/hosts")
-        paths = contree_client.request_paths
-        assert len(paths) == 1
-        assert "/v1/inspect/a1b2c3d4-5678-9abc-def0-111111111111/download" in paths[0]
-        assert "path=%2Fetc%2Fhosts" in paths[0]
+        calls = contree_client.calls_for("inspect_image_download")
+        assert len(calls) == 1
+        assert calls[0].args == (
+            "a1b2c3d4-5678-9abc-def0-111111111111",
+            "/etc/hosts",
+        )
 
     def test_outputs_content(self, contree_client, session_store):
         buf, result = _run_cmd(
@@ -67,10 +69,12 @@ class TestCmdCatTTY:
             image="tag:latest",
             images_response=images_resp,
         )
-        paths = contree_client.request_paths
-        assert len(paths) == 2
-        assert "tag=latest" in paths[0]
-        assert "/v1/inspect/resolved-uuid/download" in paths[1]
+        resolve_calls = contree_client.calls_for("inspect_find_image_by_tag")
+        assert len(resolve_calls) == 1
+        assert resolve_calls[0].args == ("latest",)
+        download_calls = contree_client.calls_for("inspect_image_download")
+        assert len(download_calls) == 1
+        assert download_calls[0].args[0] == "resolved-uuid"
 
     def test_binary_rejected_on_tty(self, contree_client, session_store):
         buf, result = _run_cmd(contree_client, b"\x80\x81\x82\xff", store=session_store)
@@ -135,19 +139,19 @@ class TestCmdCatCaching:
     def test_tty_caches_result(self, contree_client, session_store):
         """Second TTY call should not hit the API."""
         _run_cmd(contree_client, b"hello", store=session_store)
-        assert contree_client.request_count == 1
+        assert len(contree_client.calls) == 1
 
         buf2, _ = _run_cmd(contree_client, b"hello", store=session_store)
-        assert contree_client.request_count == 1  # no new request (cached)
+        assert len(contree_client.calls) == 1  # no new request (cached)
         assert buf2.getvalue() == b"hello"
 
     def test_pipe_caches_result(self, contree_client, session_store):
         """Second piped call should not hit the API."""
         _run_cmd(contree_client, b"data", store=session_store, isatty=False)
-        assert contree_client.request_count == 1
+        assert len(contree_client.calls) == 1
 
         buf2, _ = _run_cmd(contree_client, b"data", store=session_store, isatty=False)
-        assert contree_client.request_count == 1  # no new request (cached)
+        assert len(contree_client.calls) == 1  # no new request (cached)
         assert buf2.getvalue() == b"data"
 
     def test_cache_hit_returns_correct_data(self, contree_client, session_store):

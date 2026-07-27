@@ -1,52 +1,24 @@
 from __future__ import annotations
 
-import io
 import logging
 from contextlib import ExitStack
 from contextvars import copy_context
 from unittest.mock import patch
 
+import pytest
 from conftest import ContreeTestClient
+from contree_client.exceptions import NotFoundError
+from contree_client.runtime import CHUNK_SIZE
 
 from contree_cli import FORMATTER, SESSION_STORE
-from contree_cli.cli.cp import CpArgs, cmd_cp, fmt_duration, fmt_size
-from contree_cli.client import CHUNK_SIZE
+from contree_cli.cli.cp import CpArgs, cmd_cp, fmt_size
 from contree_cli.output import DefaultFormatter, JSONFormatter
 from contree_cli.session import SessionStore
 
 
-class StreamResponse:
-    """Response that supports chunked reading via BytesIO."""
-
-    def __init__(
-        self,
-        data: bytes,
-        *,
-        status: int = 200,
-        content_length: bool = True,
-    ):
-        self.status = status
-        self.reason = "OK" if status < 300 else "Error"
-        self._buf = io.BytesIO(data)
-        self._length = len(data) if content_length else None
-
-    def read(self, amt: int | None = None) -> bytes:
-        return self._buf.read(amt)
-
-    def getheader(self, name: str, default: str | None = None) -> str | None:
-        if name == "Content-Length" and self._length is not None:
-            return str(self._length)
-        return default
-
-    def getheaders(self) -> list[tuple[str, str]]:
-        if self._length is not None:
-            return [("Content-Length", str(self._length))]
-        return []
-
-
 def _run_cmd(
     tc: ContreeTestClient,
-    data: bytes = b"",
+    chunks: list[bytes] | BaseException | None = None,
     *,
     store: SessionStore,
     image: str = "a1b2c3d4-5678-9abc-def0-111111111111",
@@ -54,15 +26,15 @@ def _run_cmd(
     dest: str = "/tmp/out",
     images_response: dict | None = None,
     formatter=None,
-    content_length: bool = True,
     time_values: list[float] | None = None,
 ):
     """Run cmd_cp with mocked responses."""
     if images_response is not None:
-        tc.respond_json(images_response)
-    tc.fake.responses.append(
-        StreamResponse(data, content_length=content_length),
-    )
+        tc.mock("inspect_find_image_by_tag", images_response["images"][0]["uuid"])
+    if isinstance(chunks, BaseException):
+        tc.mock("inspect_image_download_stream", error=chunks)
+    else:
+        tc.mock("inspect_image_download_stream", chunks or [])
 
     FORMATTER.set(formatter or DefaultFormatter())
     store.set_image(image, kind="test")
@@ -84,47 +56,67 @@ def _run_cmd(
 
 
 class TestCmdCp:
-    def test_request_path(self, contree_client, session_store, tmp_path):
+    def test_request_args(self, contree_client, session_store, tmp_path):
         dest = tmp_path / "out"
         _run_cmd(
             contree_client,
-            b"hello",
+            [b"hello"],
             store=session_store,
             path="/etc/hosts",
             dest=str(dest),
         )
-        paths = contree_client.request_paths
-        assert len(paths) == 1
-        assert "/v1/inspect/a1b2c3d4-5678-9abc-def0-111111111111/download" in paths[0]
-        assert "path=%2Fetc%2Fhosts" in paths[0]
+        calls = contree_client.calls_for("inspect_image_download_stream")
+        assert len(calls) == 1
+        assert calls[0].args == (
+            "a1b2c3d4-5678-9abc-def0-111111111111",
+            "/etc/hosts",
+        )
 
     def test_writes_file(self, contree_client, session_store, tmp_path):
         dest = tmp_path / "output.bin"
         result = _run_cmd(
-            contree_client, b"file contents here", store=session_store, dest=str(dest)
+            contree_client,
+            [b"file contents here"],
+            store=session_store,
+            dest=str(dest),
         )
         assert result is None
         assert dest.read_bytes() == b"file contents here"
+
+    def test_dest_directory_appends_basename(
+        self, contree_client, session_store, tmp_path
+    ):
+        result = _run_cmd(
+            contree_client,
+            [b"content"],
+            store=session_store,
+            path="/etc/os-release",
+            dest=str(tmp_path),
+        )
+        assert result is None
+        assert (tmp_path / "os-release").read_bytes() == b"content"
 
     def test_tag_resolution(self, contree_client, session_store, tmp_path):
         dest = tmp_path / "out"
         images_resp = {"images": [{"uuid": "resolved-uuid", "tag": "latest"}]}
         _run_cmd(
             contree_client,
-            b"data",
+            [b"data"],
             store=session_store,
             image="tag:latest",
             images_response=images_resp,
             dest=str(dest),
         )
-        paths = contree_client.request_paths
-        assert len(paths) == 2
-        assert "tag=latest" in paths[0]
-        assert "/v1/inspect/resolved-uuid/download" in paths[1]
+        resolve_calls = contree_client.calls_for("inspect_find_image_by_tag")
+        assert len(resolve_calls) == 1
+        assert resolve_calls[0].args == ("latest",)
+        stream_calls = contree_client.calls_for("inspect_image_download_stream")
+        assert len(stream_calls) == 1
+        assert stream_calls[0].args[0] == "resolved-uuid"
 
     def test_empty_file(self, contree_client, session_store, tmp_path):
         dest = tmp_path / "empty"
-        result = _run_cmd(contree_client, b"", store=session_store, dest=str(dest))
+        result = _run_cmd(contree_client, [], store=session_store, dest=str(dest))
         assert result is None
         assert dest.read_bytes() == b""
 
@@ -135,7 +127,7 @@ class TestCmdCp:
         with caplog.at_level(logging.WARNING, logger="contree_cli.cli.cp"):
             _run_cmd(
                 contree_client,
-                b"hello",
+                [b"hello"],
                 store=session_store,
                 formatter=JSONFormatter(),
                 dest=str(dest),
@@ -146,17 +138,52 @@ class TestCmdCp:
         dest = tmp_path / "existing.txt"
         dest.write_bytes(b"old content")
         result = _run_cmd(
-            contree_client, b"new content", store=session_store, dest=str(dest)
+            contree_client, [b"new content"], store=session_store, dest=str(dest)
         )
         assert result is None
         assert dest.read_bytes() == b"new content"
 
-    def test_progress_log_with_content_length(
-        self, contree_client, session_store, tmp_path, caplog
+    def test_missing_path_leaves_no_partial_file(
+        self, contree_client, session_store, tmp_path
     ):
-        """After 5s elapsed, a progress line with %, ETA, and speed."""
+        dest = tmp_path / "out.bin"
+        with pytest.raises(NotFoundError):
+            _run_cmd(
+                contree_client,
+                NotFoundError(404, "path not found"),
+                store=session_store,
+                path="/nope",
+                dest=str(dest),
+            )
+        # No partial file is left behind.
+        assert not dest.exists()
+
+    def test_missing_path_preserves_existing_output(
+        self, contree_client, session_store, tmp_path
+    ):
+        dest = tmp_path / "out.bin"
+        dest.write_bytes(b"previous copy contents")
+        with pytest.raises(NotFoundError):
+            _run_cmd(
+                contree_client,
+                NotFoundError(404, "path not found"),
+                store=session_store,
+                path="/nope",
+                dest=str(dest),
+            )
+        # A failed copy must not clobber a file that already existed.
+        assert dest.read_bytes() == b"previous copy contents"
+        # No leftover temp file in the destination directory.
+        assert not list(tmp_path.glob(f".{dest.name}.*"))
+
+    def test_progress_log(self, contree_client, session_store, tmp_path, caplog):
+        """After 5s elapsed, a progress line with volume and speed.
+
+        The streaming download API exposes no response headers, so the
+        total size is unknown and progress carries no percent or ETA.
+        """
         dest = tmp_path / "out"
-        data = b"A" * CHUNK_SIZE * 2
+        chunks = [b"A" * CHUNK_SIZE, b"A" * CHUNK_SIZE]
 
         # monotonic: start, after-chunk-1 (6s), after-chunk-2, final
         time_values = [0.0, 6.0, 6.1, 6.1]
@@ -164,36 +191,10 @@ class TestCmdCp:
         with caplog.at_level(logging.INFO, logger="contree_cli.cli.cp"):
             _run_cmd(
                 contree_client,
-                data,
+                chunks,
                 store=session_store,
                 dest=str(dest),
                 time_values=time_values,
-            )
-
-        progress = [r for r in caplog.records if "downloaded" in r.message]
-        assert len(progress) == 1
-        msg = progress[0].message
-        assert "50%" in msg
-        assert "ETA" in msg
-        assert "/s" in msg
-
-    def test_progress_log_without_content_length(
-        self, contree_client, session_store, tmp_path, caplog
-    ):
-        """Without Content-Length, progress shows size and speed but no ETA."""
-        dest = tmp_path / "out"
-        data = b"B" * CHUNK_SIZE * 2
-
-        time_values = [0.0, 6.0, 6.1, 6.1]
-
-        with caplog.at_level(logging.INFO, logger="contree_cli.cli.cp"):
-            _run_cmd(
-                contree_client,
-                data,
-                store=session_store,
-                dest=str(dest),
-                time_values=time_values,
-                content_length=False,
             )
 
         progress = [r for r in caplog.records if "downloaded" in r.message]
@@ -201,6 +202,7 @@ class TestCmdCp:
         msg = progress[0].message
         assert "/s" in msg
         assert "ETA" not in msg
+        assert "%" not in msg
 
     def test_final_log_shows_total(
         self, contree_client, session_store, tmp_path, caplog
@@ -209,7 +211,7 @@ class TestCmdCp:
         dest = tmp_path / "out"
         with caplog.at_level(logging.INFO, logger="contree_cli.cli.cp"):
             _run_cmd(
-                contree_client, b"hello world", store=session_store, dest=str(dest)
+                contree_client, [b"hello world"], store=session_store, dest=str(dest)
             )
 
         written = [r for r in caplog.records if "Written" in r.message]
@@ -232,12 +234,3 @@ class TestFormatHelpers:
 
     def test_fmt_size_tib(self):
         assert fmt_size(2 * 1024**4) == "2.0 TiB"
-
-    def test_fmt_duration_seconds(self):
-        assert fmt_duration(45) == "45s"
-
-    def test_fmt_duration_minutes(self):
-        assert fmt_duration(125) == "2m05s"
-
-    def test_fmt_duration_hours(self):
-        assert fmt_duration(3723) == "1h02m03s"
