@@ -414,11 +414,16 @@ class TestProjectRootSpecs:
         assert skills_from_spec(str(dest)) == (ClaudeSkill(path=dest),)
 
     def test_contree_basename_elsewhere_expands_as_project_root(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch
     ) -> None:
         """A project directory that merely happens to be named `contree`
         (parent isn't `skills/`) must NOT be mistaken for a skill
         artifact -- it expands like any other project root."""
+        claude_home = tmp_path / ".claude-home"
+        claude_home.mkdir()
+        monkeypatch.setattr(
+            "contree_cli.skill.default_claude_home", lambda: claude_home
+        )
         root = tmp_path / "anywhere" / SKILL_NAME
         skills = skills_from_spec(str(root))
         assert len(skills) == len(ALL_SKILL_TYPES)
