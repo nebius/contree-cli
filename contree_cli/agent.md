@@ -18,6 +18,7 @@ Agent protocol — follow this sequence for every task:
 4. Inspect first (read-only):
      contree ls /path
      contree cat /path/file
+     contree grep PATTERN /path
      contree export /path -F subtree.tar.gz
      contree images --prefix=...
      contree session show

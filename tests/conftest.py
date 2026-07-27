@@ -17,6 +17,25 @@ CONTREE_HOME_TMP = Path(tempfile.mkdtemp(prefix="contree-pytest-"))
 os.environ["CONTREE_HOME"] = str(CONTREE_HOME_TMP)
 atexit.register(shutil.rmtree, CONTREE_HOME_TMP, ignore_errors=True)
 
+# Force colorless output for the whole session BEFORE any contree_cli
+# import. Two independent color mechanisms are in play, both driven by
+# env vars read at (or cached from) import time -- neither is reachable
+# by a per-test fixture:
+#   - Python 3.13+'s own argparse coloring (_colorize.can_colorize())
+#     checks FORCE_COLOR/NO_COLOR/PYTHON_COLORS directly; some help
+#     text (e.g. shell/repl.py's BUILTIN_HELP dict) is rendered once at
+#     module import and cached, so the env var must be right *before*
+#     that import, not patched afterwards.
+#   - contree_cli.types.STDOUT_IS_A_TTY/FORCE_COLOR are computed once
+#     at that same import and then copied by value into every module
+#     that does `from contree_cli.types import STDOUT_IS_A_TTY`.
+# contree_cli.types.IS_A_TTY (checked live by Colors.__call__ on every
+# call, not cached) is additionally pinned per-test by the _no_color
+# fixture below, as a second line of defense.
+os.environ["NO_COLOR"] = "1"
+for color_var in ("FORCE_COLOR", "PYTHON_COLORS"):
+    os.environ.pop(color_var, None)
+
 # The CONTREE_HOME override above MUST run before any contree_cli import
 # touches contree_cli.config, hence the deferred import block below.
 import pytest  # noqa: E402
@@ -128,6 +147,41 @@ def make_file_item(path: str, **overrides: object) -> dict[str, object]:
     return item
 
 
+def make_grep_match(path: str = "/etc/hosts", **overrides: object) -> dict[str, object]:
+    """Full GrepMatch payload exactly as the inspect API returns it.
+
+    The contree-client `GrepMatch` model requires every field
+    including nested `submatches`; test fixtures must always send the
+    complete realistic shape. Overrides replace individual top-level
+    fields.
+    """
+    item: dict[str, object] = {
+        "path": path,
+        "line_number": 1,
+        "absolute_offset": 0,
+        "line_text": "127.0.0.1 localhost\n",
+        "line_bytes": 20,
+        "submatches": [{"text": "localhost", "start": 10, "end": 19}],
+    }
+    item.update(overrides)
+    return item
+
+
+def make_grep_result(
+    path: str = "/etc",
+    patterns: list[str] | None = None,
+    matches: list[dict[str, object]] | None = None,
+    truncated: bool = False,
+) -> dict[str, object]:
+    """Full GrepResult payload exactly as the inspect API returns it."""
+    return {
+        "path": path,
+        "patterns": patterns or ["pattern"],
+        "matches": matches or [],
+        "truncated": truncated,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -172,6 +226,26 @@ def _isolate_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     unaffected: that override takes precedence over this env var.
     """
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex-home"))
+
+
+@pytest.fixture(autouse=True)
+def _no_color(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force `Colors.__call__` to no-op, regardless of the ambient
+    FORCE_COLOR/isatty state the test suite happens to run under.
+
+    `STDOUT_IS_A_TTY`/`STDERR_IS_A_TTY`/`FORCE_COLOR` are computed once
+    at `contree_cli.types` import time and then copied *by value* into
+    every module that does `from contree_cli.types import
+    STDOUT_IS_A_TTY` (output.py, cli/grep.py, ...) -- patching those
+    after the fact would mean chasing down every such copy. `IS_A_TTY`
+    is different: `Colors.__call__` (defined in `contree_cli.types`)
+    looks it up live from its own enclosing module's globals on every
+    call, so patching it here is the single choke point that actually
+    decides whether ANSI escape codes get emitted, no matter which
+    module calls `Colors.X(...)` or what FORCE_COLOR happened to be
+    when it was imported.
+    """
+    monkeypatch.setattr("contree_cli.types.IS_A_TTY", False)
 
 
 @pytest.fixture()

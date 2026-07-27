@@ -8,10 +8,10 @@ Use `contree` from PATH. If it is missing, ask the user to install it: `uv tool 
 
 1. If syntax or behavior is unclear, consult the built-in manual before retrying: `contree agent <topic>` or `contree <command> --help`. Useful topics: `sessions`, `images`, `files`, `execution`, `output`, `profiles`, `command_safety`, `all_commands`, `all`.
 2. Do not run bare or mutating auth commands. Agents may run read-only `contree -o json auth ls` / `auth profiles`; if auth is missing or invalid, ask the user to run `contree auth`.
-3. Choose one explicit session key, then pass `-S <key>` on every current-session command: `use`, `run`, `cd`, `env`, `ls`, `cat`, `cp`, `file`, implicit-current-image `tag`, and current-session `session show/branch/checkout/rollback/wait`.
+3. Choose one explicit session key, then pass `-S <key>` on every current-session command: `use`, `run`, `cd`, `env`, `ls`, `cat`, `grep`, `cp`, `file`, implicit-current-image `tag`, and current-session `session show/branch/checkout/rollback/wait`.
 4. Before `use`, list available images with a prefix. Do not assume a tag exists: `contree images --prefix python`, `contree images --prefix ubuntu`, `contree images --prefix compiler/`. An empty result just means that prefix has no tags in this project; broaden or vary the prefix (`python` vs `python-`, `compiler/` vs `compiler/python/`) before importing or rebuilding.
 5. Bootstrap: `contree -S <key> use <tag-or-image-from-list>` then `contree -S <key> cd /root`.
-6. Inspect first with `ls`, `cat`, `session show`, `ps`/`op ls`, or `op show`. Mutate in small rollbackable steps.
+6. Inspect first with `ls`, `cat`, `grep`, `session show`, `ps`/`op ls`, or `op show`. Mutate in small rollbackable steps.
 7. After installing tools or setting up an environment, tag the result: `contree -S <key> tag <purpose/base:tag>`.
 
 Project-scoped or explicit-target commands usually do not need `-S`: `images`, `auth ls/profiles`, `op ls/show/wait/cancel`, `skill`, `agent`, `build`, `session list`, `session show NAME`, and help.

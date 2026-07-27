@@ -22,6 +22,7 @@ show
 kill
 ls
 cat
+grep
 cp
 cd
 env

@@ -78,6 +78,11 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "no_cache": ("--no-cache",),
         # export
         "decompress": ("--decompress",),
+        # grep
+        "glob": ("--glob",),
+        "max_count": ("--max-count",),
+        "max_total": ("--max-total",),
+        "case": ("--case",),
     }
 )
 
