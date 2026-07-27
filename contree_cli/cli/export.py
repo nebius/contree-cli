@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -139,18 +141,24 @@ def cmd_export(args: ExportArgs) -> int | None:
     )
 
     start = time.monotonic()
+    tmp_path: str | None = None
     try:
         if args.output:
-            with Path(args.output).open("wb") as sink:
+            dest = Path(args.output)
+            fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
+            with os.fdopen(fd, "wb") as sink:
                 written = write_stream(chunks, sink)
+            os.replace(tmp_path, dest)
+            tmp_path = None
         else:
             written = write_stream(chunks, sys.stdout.buffer)
             sys.stdout.buffer.flush()
     except NotFoundError:
-        if args.output:
-            Path(args.output).unlink(missing_ok=True)
         logger.error("export: %s: not found in image", path)
         return 1
+    finally:
+        if tmp_path is not None:
+            Path(tmp_path).unlink(missing_ok=True)
 
     elapsed = time.monotonic() - start
     speed = written / elapsed if elapsed > 0 else 0

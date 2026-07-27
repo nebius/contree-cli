@@ -644,6 +644,7 @@ class TestMultistage:
         assert len(tc.calls_for("inspect_find_image_by_tag")) == 2
         archive_call = tc.calls_for("inspect_image_archive")[0]
         assert archive_call.args == (STAGE_IMG, "/out/app")
+        assert archive_call.kwargs["compressed"] is False
 
         spawn = extraction_spawn(tc)
         files = spawn.kwargs["files"]

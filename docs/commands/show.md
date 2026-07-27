@@ -74,12 +74,14 @@ operation to completion, not whether the sandbox process exited with
 zero. A `SUCCESS` row with `exit_code=1` means "the API completed the
 job; your command returned 1". `error` is pinned to the last column.
 Nested objects (`metadata`, `result`) are dropped from the flat row
-— use `--raw` for the full server payload, or `-o json` to keep the
-flat structured row.
+-- use `--raw` to keep them, or `-o json` to keep the flat structured
+row.
 
 Pass `--raw` to skip all of the above and print each operation's
-full server JSON payload as JSONL (one object per line) to stdout,
-verbatim. Streams cleanly into `jq -c`. Useful for debugging or
+JSON payload as JSONL (one object per line) to stdout. The payload
+round-trips through the typed operation model, so fields the model
+doesn't know about are dropped -- it's not the server's byte-for-byte
+response. Streams cleanly into `jq -c`. Useful for debugging or
 pulling fields the table view omits (resources, full metadata, etc.).
 
 Timestamps come back from the API in UTC and are converted to the

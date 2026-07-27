@@ -215,6 +215,24 @@ class TestCmdExport:
         # No partial file is left behind.
         assert not dest.exists()
 
+    def test_missing_path_preserves_existing_output(
+        self, contree_client, session_store, tmp_path, caplog
+    ):
+        dest = tmp_path / "out.tar.gz"
+        dest.write_bytes(b"previous export contents")
+        rc = _run_cmd(
+            contree_client,
+            NotFoundError(404, "path not found"),
+            store=session_store,
+            path="/nope",
+            output=str(dest),
+        )
+        assert rc == 1
+        # The failed export must not clobber a file that already existed.
+        assert dest.read_bytes() == b"previous export contents"
+        # No leftover temp file in the destination directory.
+        assert not list(tmp_path.glob(f".{dest.name}.*"))
+
     def test_format_warning(self, contree_client, session_store, tmp_path, caplog):
         dest = tmp_path / "out.tar.gz"
         _run_cmd(

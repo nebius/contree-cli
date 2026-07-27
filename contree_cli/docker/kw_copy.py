@@ -197,7 +197,9 @@ def fetch_archive(
 ) -> None:
     """Fill *buffer* with the tar export of *src* from *image_uuid*."""
     try:
-        for chunk in ctx.client.inspect_image_archive(image_uuid, src):
+        for chunk in ctx.client.inspect_image_archive(
+            image_uuid, src, compressed=False
+        ):
             buffer.write(chunk)
     except NotFoundError:
         raise ValueError(
