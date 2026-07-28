@@ -245,12 +245,7 @@ def cmd_file_edit(args: FileEditArgs) -> int | None:
     # 2. Record original hash, open editor
     original_hash = _file_sha256(tmp_file)
     logger.info("Opening %s in %s", tmp_file, args.editor)
-    # $EDITOR may contain shell expressions (env vars, tilde, pipes),
-    # e.g. "TERM=xterm vim" or "~/bin/editor". shlex.split would not
-    # expand those, shell=True is required. The file path is quoted
-    # via shlex.quote to prevent injection from the filename.
-    # nosemgrep: subprocess-shell-true
-    rc = subprocess.call(f"{args.editor} {shlex.quote(str(tmp_file))}", shell=True)
+    rc = subprocess.call([*shlex.split(args.editor), str(tmp_file)])
     if rc != 0:
         logger.error("Editor exited with code %d", rc)
         return 1

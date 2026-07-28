@@ -93,7 +93,7 @@ def _run_file_edit(
         captured_dir.append(d)
         return d
 
-    def fake_editor(cmd: str, *, shell: bool = True) -> int:
+    def fake_editor(cmd: list[str]) -> int:
         if editor_content is not None and captured_dir:
             for f in Path(captured_dir[-1]).iterdir():
                 f.write_bytes(editor_content)
@@ -300,14 +300,11 @@ class TestFileEditEditorFlag:
         mock_dedup_miss(contree_client)
         mock_upload(contree_client, "file-uuid-e")
 
-        called_with: list[str] = []
+        called_with: list[list[str]] = []
 
-        def fake_editor(cmd: str, *, shell: bool = True) -> int:
+        def fake_editor(cmd: list[str]) -> int:
             called_with.append(cmd)
-            import shlex
-
-            parts = shlex.split(cmd)
-            Path(parts[1]).write_bytes(b"modified")
+            Path(cmd[-1]).write_bytes(b"modified")
             return 0
 
         SESSION_STORE.set(session_store)
@@ -316,7 +313,7 @@ class TestFileEditEditorFlag:
         with patch("contree_cli.cli.file.subprocess.call", side_effect=fake_editor):
             rc = ctx.run(cmd_file_edit, args)
         assert rc is None
-        assert called_with[0].startswith("nvim ")
+        assert called_with[0][0] == "nvim"
 
 
 class TestFileEditHistoryEntry:
