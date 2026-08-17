@@ -36,6 +36,9 @@ def _run_cmd(
     raw: bool = False,
     formatter=None,
     truncated: bool = False,
+    before_context: int | None = None,
+    after_context: int | None = None,
+    context: int | None = None,
 ) -> int | None:
     """Run cmd_grep with a mocked inspect_image_grep response."""
     tc.mock(
@@ -55,12 +58,15 @@ def _run_cmd(
 
     args = GrepArgs(
         pattern=pattern,
-        path=path,
+        path=(path,) if path is not None else (),
         glob=glob,
         max_count=max_count,
         max_total=max_total,
         case=case,
         raw=raw,
+        before_context=before_context,
+        after_context=after_context,
+        context=context,
     )
     return ctx.run(cmd_grep, args)
 
@@ -76,7 +82,7 @@ class TestCmdGrep:
             path=None,
         )
         calls = contree_client.calls_for("inspect_image_grep")
-        assert calls[0].kwargs["path"] == "/app"
+        assert calls[0].kwargs["path"] == ["/app"]
 
     def test_default_path_falls_back_to_root(self, contree_client, session_store):
         _run_cmd(
@@ -86,12 +92,28 @@ class TestCmdGrep:
             path=None,
         )
         calls = contree_client.calls_for("inspect_image_grep")
-        assert calls[0].kwargs["path"] == "/"
+        assert calls[0].kwargs["path"] == ["/"]
 
     def test_explicit_path_resolved(self, contree_client, session_store):
         _run_cmd(contree_client, [make_grep_match()], store=session_store, path="/etc")
         calls = contree_client.calls_for("inspect_image_grep")
-        assert calls[0].kwargs["path"] == "/etc"
+        assert calls[0].kwargs["path"] == ["/etc"]
+
+    def test_multiple_paths_each_resolved(self, contree_client, session_store):
+        session_store.set_image(IMG_UUID, kind="test")
+        FORMATTER.set(CSVFormatter())
+        SESSION_STORE.set(session_store)
+        contree_client.mock(
+            "inspect_image_grep",
+            GrepResult.from_dict(make_grep_result(matches=[])),
+        )
+        args = GrepArgs(pattern="localhost", path=("/etc", "app.log"))
+        session_store.set_cwd("/var/log")
+        ctx = copy_context()
+        ctx.run(cmd_grep, args)
+        calls = contree_client.calls_for("inspect_image_grep")
+        # "/etc" is absolute; "app.log" is relative to the session cwd.
+        assert calls[0].kwargs["path"] == ["/etc", "/var/log/app.log"]
 
     def test_pattern_forwarded(self, contree_client, session_store):
         _run_cmd(contree_client, [], store=session_store, pattern="foo.*bar")
@@ -115,6 +137,42 @@ class TestCmdGrep:
         assert kwargs["max_count"] == 3
         assert kwargs["max_total"] == 100
         assert kwargs["case"] == "insensitive"
+
+    def test_before_after_forwarded_independently(self, contree_client, session_store):
+        _run_cmd(
+            contree_client,
+            [],
+            store=session_store,
+            before_context=1,
+            after_context=3,
+        )
+        kwargs = contree_client.calls_for("inspect_image_grep")[0].kwargs
+        assert kwargs["before"] == 1
+        assert kwargs["after"] == 3
+
+    def test_context_sets_both_before_and_after(self, contree_client, session_store):
+        _run_cmd(contree_client, [], store=session_store, context=2)
+        kwargs = contree_client.calls_for("inspect_image_grep")[0].kwargs
+        assert kwargs["before"] == 2
+        assert kwargs["after"] == 2
+
+    def test_before_after_override_context(self, contree_client, session_store):
+        _run_cmd(
+            contree_client,
+            [],
+            store=session_store,
+            context=5,
+            before_context=1,
+        )
+        kwargs = contree_client.calls_for("inspect_image_grep")[0].kwargs
+        assert kwargs["before"] == 1  # explicit -B wins over -C
+        assert kwargs["after"] == 5  # -A not given, falls back to -C
+
+    def test_no_context_flags_forwards_none(self, contree_client, session_store):
+        _run_cmd(contree_client, [], store=session_store)
+        kwargs = contree_client.calls_for("inspect_image_grep")[0].kwargs
+        assert kwargs["before"] is None
+        assert kwargs["after"] is None
 
     def test_one_row_per_match_csv(self, contree_client, session_store, capsys):
         matches = [make_grep_match(path="/a"), make_grep_match(path="/b")]
@@ -171,6 +229,94 @@ class TestCmdGrep:
                 contree_client, [], store=session_store, formatter=DefaultFormatter()
             )
         assert capsys.readouterr().out == ""
+
+    def test_context_lines_use_dash_separator(
+        self, contree_client, session_store, capsys
+    ):
+        matches = [
+            make_grep_match(path="/var/log/app.log", line_number=5, type="match"),
+            make_grep_match(path="/var/log/app.log", line_number=6, type="context"),
+        ]
+        with patch("contree_cli.cli.grep.STDOUT_IS_A_TTY", False):
+            _run_cmd(
+                contree_client,
+                matches,
+                store=session_store,
+                formatter=DefaultFormatter(),
+                context=1,
+            )
+        lines = capsys.readouterr().out.splitlines()
+        assert lines == [
+            "/var/log/app.log:5:127.0.0.1 localhost",
+            "/var/log/app.log-6-127.0.0.1 localhost",
+        ]
+
+    def test_group_separator_between_noncontiguous_groups(
+        self, contree_client, session_store, capsys
+    ):
+        matches = [
+            make_grep_match(path="/a", line_number=5, type="match"),
+            make_grep_match(path="/a", line_number=6, type="context"),
+            make_grep_match(path="/a", line_number=40, type="context"),
+            make_grep_match(path="/a", line_number=41, type="match"),
+        ]
+        with patch("contree_cli.cli.grep.STDOUT_IS_A_TTY", False):
+            _run_cmd(
+                contree_client,
+                matches,
+                store=session_store,
+                formatter=DefaultFormatter(),
+                context=1,
+            )
+        lines = capsys.readouterr().out.splitlines()
+        assert lines == [
+            "/a:5:127.0.0.1 localhost",
+            "/a-6-127.0.0.1 localhost",
+            "--",
+            "/a-40-127.0.0.1 localhost",
+            "/a:41:127.0.0.1 localhost",
+        ]
+
+    def test_group_separator_on_path_change_even_if_lines_contiguous(
+        self, contree_client, session_store, capsys
+    ):
+        matches = [
+            make_grep_match(path="/a", line_number=10, type="match"),
+            make_grep_match(path="/b", line_number=11, type="match"),
+        ]
+        with patch("contree_cli.cli.grep.STDOUT_IS_A_TTY", False):
+            _run_cmd(
+                contree_client,
+                matches,
+                store=session_store,
+                formatter=DefaultFormatter(),
+                context=1,
+            )
+        lines = capsys.readouterr().out.splitlines()
+        assert lines == [
+            "/a:10:127.0.0.1 localhost",
+            "--",
+            "/b:11:127.0.0.1 localhost",
+        ]
+
+    def test_no_group_separator_without_context_flags(
+        self, contree_client, session_store, capsys
+    ):
+        """Without -A/-B/-C, gaps between plain matches print no `--`,
+        matching real grep's own behavior."""
+        matches = [
+            make_grep_match(path="/a", line_number=5, type="match"),
+            make_grep_match(path="/a", line_number=99, type="match"),
+        ]
+        with patch("contree_cli.cli.grep.STDOUT_IS_A_TTY", False):
+            _run_cmd(
+                contree_client,
+                matches,
+                store=session_store,
+                formatter=DefaultFormatter(),
+            )
+        lines = capsys.readouterr().out.splitlines()
+        assert "--" not in lines
 
     def test_submatches_dropped_from_normal_json_row(
         self, contree_client, session_store, capsys
@@ -245,48 +391,40 @@ class TestCmdGrep:
 
 
 class TestHighlightMatch:
-    def test_wraps_matched_span(self):
-        with patch("contree_cli.types.IS_A_TTY", True):
-            result = highlight_match(
-                "127.0.0.1 localhost",
-                [{"text": "localhost", "start": 10, "end": 19}],
-            )
-            assert result == f"127.0.0.1 {Colors.BOLD_RED('localhost')}"
+    def test_wraps_matched_span(self, is_a_tty):
+        result = highlight_match(
+            "127.0.0.1 localhost",
+            [{"text": "localhost", "start": 10, "end": 19}],
+        )
+        assert result == f"127.0.0.1 {Colors.BOLD_RED('localhost')}"
 
     def test_no_tty_returns_plain_text(self):
-        with patch("contree_cli.types.IS_A_TTY", False):
-            result = highlight_match(
-                "127.0.0.1 localhost",
-                [{"text": "localhost", "start": 10, "end": 19}],
-            )
+        result = highlight_match(
+            "127.0.0.1 localhost",
+            [{"text": "localhost", "start": 10, "end": 19}],
+        )
         assert result == "127.0.0.1 localhost"
 
-    def test_multiple_submatches(self):
-        with patch("contree_cli.types.IS_A_TTY", True):
-            result = highlight_match(
-                "foo bar foo",
-                [
-                    {"text": "foo", "start": 0, "end": 3},
-                    {"text": "foo", "start": 8, "end": 11},
-                ],
-            )
-            assert result == f"{Colors.BOLD_RED('foo')} bar {Colors.BOLD_RED('foo')}"
+    def test_multiple_submatches(self, is_a_tty):
+        result = highlight_match(
+            "foo bar foo",
+            [
+                {"text": "foo", "start": 0, "end": 3},
+                {"text": "foo", "start": 8, "end": 11},
+            ],
+        )
+        assert result == f"{Colors.BOLD_RED('foo')} bar {Colors.BOLD_RED('foo')}"
 
-    def test_no_submatches_returns_unchanged(self):
-        with patch("contree_cli.types.IS_A_TTY", True):
-            assert highlight_match("plain text", []) == "plain text"
+    def test_no_submatches_returns_unchanged(self, is_a_tty):
+        assert highlight_match("plain text", []) == "plain text"
 
-    def test_multibyte_utf8_offsets(self):
+    def test_multibyte_utf8_offsets(self, is_a_tty):
         # "café " is 5 chars but 6 bytes (é is 2 bytes in UTF-8); the
         # match's byte offsets must still land on "bar", not be thrown
         # off by the multi-byte character preceding it.
-        with patch("contree_cli.types.IS_A_TTY", True):
-            result = highlight_match(
-                "café bar", [{"text": "bar", "start": 6, "end": 9}]
-            )
-            assert result == f"café {Colors.BOLD_RED('bar')}"
+        result = highlight_match("café bar", [{"text": "bar", "start": 6, "end": 9}])
+        assert result == f"café {Colors.BOLD_RED('bar')}"
 
-    def test_out_of_range_submatch_skipped(self):
-        with patch("contree_cli.types.IS_A_TTY", True):
-            result = highlight_match("short", [{"text": "x", "start": 50, "end": 51}])
+    def test_out_of_range_submatch_skipped(self, is_a_tty):
+        result = highlight_match("short", [{"text": "x", "start": 50, "end": 51}])
         assert result == "short"

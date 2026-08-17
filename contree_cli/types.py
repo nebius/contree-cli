@@ -83,6 +83,16 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "max_count": ("--max-count",),
         "max_total": ("--max-total",),
         "case": ("--case",),
+        # dest is inferred from the first long option, so the
+        # `-context` form comes first and `--before`/`--after` are
+        # just shorter aliases for the same dest.
+        "before_context": ("-B", "--before-context", "--before"),
+        "after_context": ("-A", "--after-context", "--after"),
+        # -C is already "cwd" (run) in this shared registry, so it's
+        # added directly in grep's own setup_parser() as a deliberate,
+        # one-off exception for grep/POSIX compatibility instead of
+        # being registered here.
+        "context": ("--context",),
     }
 )
 
@@ -111,6 +121,17 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
     if n < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
+def context_lines(value: str) -> int:
+    """argparse type for grep -A/-B/--context: 0..50 (the API's hard cap)."""
+    try:
+        n = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+    if not 0 <= n <= 50:
+        raise argparse.ArgumentTypeError(f"must be between 0 and 50, got {n}")
     return n
 
 

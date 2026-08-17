@@ -37,6 +37,17 @@ Prefer `--file` for files needed by one command. Use `file cp` only when the sta
 
 Directory attachments recurse and exclude common junk such as `.git`, hidden files, `__pycache__`, `.venv`, `node_modules`, `dist`, and `build`. Add patterns with `--file-excludes`.
 
+## Searching File Contents
+
+Use `contree grep PATTERN [PATH...]` for every content search, instead of spawning a run for `grep`/`ripgrep`/`ack`/`grep -r`/`find ... -exec grep` or piping `cat`/`ls` output through a local `grep`. It hits the same free `/inspect/` API as `ls`/`cat` (no VM, no session-history entry), searches with ripgrep semantics (Rust regex, `.gitignore` respected, binaries skipped), and is materially faster than a spawned search over anything but a tiny tree.
+
+- `PATH` defaults to the session cwd; pass `/` to search the whole image. `PATH` may be repeated to search several roots in one call: `contree -S <key> grep TODO src/ docs/`.
+- Narrow with `--glob '*.py'` (repeatable, `!` negates), `--case insensitive`, `--max-count N` (per file), `--max-total N` (overall, default 1000).
+- `-A NUM`/`--after`, `-B NUM`/`--before`, `-C NUM`/`--context` add surrounding lines (server-computed, max 50 each way); `-C` sets both unless overridden by an explicit `-A`/`-B`.
+- Default output is `PATH:LINE:TEXT` for a match and `PATH-LINE-TEXT` for a context line, with a bare `--` between non-adjacent groups -- parse it exactly like GNU grep/ripgrep output. For automation, use `-o json` (one row per match/context line, with a `type` field) or `--raw` (full payload including `submatches`, `patterns`, `truncated`, for `jq`).
+- Exit code is 1 when nothing matched (not an error) and 0/none otherwise, so `contree grep ERROR app.log && next-step` composes like POSIX grep.
+- Reach for a spawned `run -- grep ...` only when you need something this command cannot do (search inside a compressed archive member, use non-ripgrep flags, or filter piped output from another command already running remotely).
+
 ## Sessions And Rollback
 
 - Reuse sessions deliberately: `contree session list --filter <hint>`, then `contree -S <key> session show`.

@@ -17,25 +17,6 @@ CONTREE_HOME_TMP = Path(tempfile.mkdtemp(prefix="contree-pytest-"))
 os.environ["CONTREE_HOME"] = str(CONTREE_HOME_TMP)
 atexit.register(shutil.rmtree, CONTREE_HOME_TMP, ignore_errors=True)
 
-# Force colorless output for the whole session BEFORE any contree_cli
-# import. Two independent color mechanisms are in play, both driven by
-# env vars read at (or cached from) import time -- neither is reachable
-# by a per-test fixture:
-#   - Python 3.13+'s own argparse coloring (_colorize.can_colorize())
-#     checks FORCE_COLOR/NO_COLOR/PYTHON_COLORS directly; some help
-#     text (e.g. shell/repl.py's BUILTIN_HELP dict) is rendered once at
-#     module import and cached, so the env var must be right *before*
-#     that import, not patched afterwards.
-#   - contree_cli.types.STDOUT_IS_A_TTY/FORCE_COLOR are computed once
-#     at that same import and then copied by value into every module
-#     that does `from contree_cli.types import STDOUT_IS_A_TTY`.
-# contree_cli.types.IS_A_TTY (checked live by Colors.__call__ on every
-# call, not cached) is additionally pinned per-test by the _no_color
-# fixture below, as a second line of defense.
-os.environ["NO_COLOR"] = "1"
-for color_var in ("FORCE_COLOR", "PYTHON_COLORS"):
-    os.environ.pop(color_var, None)
-
 # The CONTREE_HOME override above MUST run before any contree_cli import
 # touches contree_cli.config, hence the deferred import block below.
 import pytest  # noqa: E402
@@ -162,6 +143,7 @@ def make_grep_match(path: str = "/etc/hosts", **overrides: object) -> dict[str, 
         "line_text": "127.0.0.1 localhost\n",
         "line_bytes": 20,
         "submatches": [{"text": "localhost", "start": 10, "end": 19}],
+        "type": "match",
     }
     item.update(overrides)
     return item
@@ -214,7 +196,7 @@ def config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Redirect CODEX_HOME so a skill install exercising CodexSkill (which
     writes a rules file under it) never touches the real ~/.codex.
 
@@ -229,7 +211,7 @@ def _isolate_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.fixture(autouse=True)
-def _no_color(monkeypatch: pytest.MonkeyPatch) -> None:
+def no_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force `Colors.__call__` to no-op, regardless of the ambient
     FORCE_COLOR/isatty state the test suite happens to run under.
 
@@ -244,8 +226,21 @@ def _no_color(monkeypatch: pytest.MonkeyPatch) -> None:
     decides whether ANSI escape codes get emitted, no matter which
     module calls `Colors.X(...)` or what FORCE_COLOR happened to be
     when it was imported.
+
+    Tests that need the opposite (verifying colored output) should
+    request the `is_a_tty` fixture instead of patching this by hand.
     """
     monkeypatch.setattr("contree_cli.types.IS_A_TTY", False)
+
+
+@pytest.fixture()
+def is_a_tty(no_a_tty: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt a single test into a colored-output TTY.
+
+    Depends on `no_a_tty` so it always runs after that autouse baseline
+    is applied, then flips `IS_A_TTY` back to True for this test only.
+    """
+    monkeypatch.setattr("contree_cli.types.IS_A_TTY", True)
 
 
 @pytest.fixture()

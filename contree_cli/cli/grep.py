@@ -3,7 +3,7 @@
 Uses the /inspect/ API (server-side ripgrep) to search file contents
 without spawning an instance. Defaults to the session working directory
 (set via `cd`) when PATH is omitted -- pass `/` explicitly to search the
-whole image.
+whole image. PATH may be repeated to search multiple roots in one call.
 """
 
 from __future__ import annotations
@@ -17,7 +17,13 @@ from typing import Any, Literal
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.output import DefaultFormatter
-from contree_cli.types import FLAGS, STDOUT_IS_A_TTY, Colors, positive_int
+from contree_cli.types import (
+    FLAGS,
+    STDOUT_IS_A_TTY,
+    Colors,
+    context_lines,
+    positive_int,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +34,7 @@ for coding agents:
   exit code 1 means zero matches (like POSIX grep), not an error
   default format prints classic PATH:LINE:TEXT; use -o json/csv/... for rows
   use --raw to preserve submatches/patterns/truncated as JSON
+  -A/-B/--context add ripgrep-side context lines (server-computed, not local)
 """
 
 CaseLiteral = Literal["sensitive", "insensitive", "smart"]
@@ -36,33 +43,47 @@ CaseLiteral = Literal["sensitive", "insensitive", "smart"]
 @dataclass(frozen=True)
 class GrepArgs(ArgumentsProtocol):
     pattern: str
-    path: str | None
+    path: tuple[str, ...]
     glob: str | None = None
     max_count: int | None = None
     max_total: int | None = None
     case: CaseLiteral | None = None
     raw: bool = False
+    before_context: int | None = None
+    after_context: int | None = None
+    context: int | None = None
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> GrepArgs:
         return cls(
             pattern=ns.pattern,
-            path=ns.path,
+            path=tuple(ns.path),
             glob=ns.glob,
             max_count=ns.max_count,
             max_total=ns.max_total,
             case=ns.case,
             raw=ns.raw,
+            before_context=ns.before_context,
+            after_context=ns.after_context,
+            context=ns.context,
         )
+
+    def before(self) -> int | None:
+        return self.before_context if self.before_context is not None else self.context
+
+    def after(self) -> int | None:
+        return self.after_context if self.after_context is not None else self.context
 
 
 def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     p.add_argument("pattern", help="Regex pattern to search for (Rust regex syntax)")
     p.add_argument(
         "path",
-        nargs="?",
-        default=None,
-        help="File or directory inside image (defaults to session cwd)",
+        nargs="*",
+        help=(
+            "File(s)/directory(ies) inside image (defaults to session cwd);"
+            " may be repeated to search multiple roots"
+        ),
     )
     p.add_argument(
         *FLAGS["glob"],
@@ -86,6 +107,32 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
         choices=("sensitive", "insensitive", "smart"),
         default=None,
         help="Case sensitivity (default: sensitive)",
+    )
+    p.add_argument(
+        *FLAGS["before_context"],
+        type=context_lines,
+        default=None,
+        metavar="NUM",
+        help="Show NUM lines of context before each match (max 50)",
+    )
+    p.add_argument(
+        *FLAGS["after_context"],
+        type=context_lines,
+        default=None,
+        metavar="NUM",
+        help="Show NUM lines of context after each match (max 50)",
+    )
+    p.add_argument(
+        # -C is grep's own long-standing flag for this; registering it
+        # in the shared FLAGS map would collide with run's --cwd, so
+        # it's added here directly as a one-off exception for grep/
+        # POSIX compatibility instead of going through FLAGS.
+        "-C",
+        *FLAGS["context"],
+        type=context_lines,
+        default=None,
+        metavar="NUM",
+        help="Show NUM lines of context before and after (overridden by -A/-B)",
     )
     p.add_argument(
         *FLAGS["raw"],
@@ -117,6 +164,40 @@ def highlight_match(line_text: str, submatches: list[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
+def write_grep_lines(matches: list[dict[str, Any]], *, with_context: bool) -> None:
+    """Print matches in classic grep format: `path:line:text` for an
+    actual match, `path-line-text` for a `-A`/`-B`/`--context` line.
+
+    A `--` separator is inserted between output groups whenever
+    `with_context` is set and the next row isn't the immediate
+    successor (same path, consecutive line number) of the previous
+    one -- exactly like GNU grep/ripgrep only ever show `--` when
+    context lines are in play.
+    """
+    prev_path: str | None = None
+    prev_line: int | None = None
+    for match in matches:
+        row_path, row_line = match["path"], match["line_number"]
+        contiguous = (
+            prev_path == row_path
+            and prev_line is not None
+            and (row_line == prev_line + 1)
+        )
+        if with_context and prev_path is not None and not contiguous:
+            sys.stdout.write("--\n")
+
+        sep = ":" if match["type"] == "match" else "-"
+        line_text = match["line_text"].rstrip("\n")
+        path_field, line_field = row_path, str(row_line)
+        if STDOUT_IS_A_TTY:
+            line_text = highlight_match(line_text, match["submatches"])
+            path_field = Colors.MAGENTA(row_path)
+            line_field = Colors.GREEN(line_field)
+        sys.stdout.write(f"{path_field}{sep}{line_field}{sep}{line_text}\n")
+
+        prev_path, prev_line = row_path, row_line
+
+
 def cmd_grep(args: GrepArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
@@ -124,20 +205,23 @@ def cmd_grep(args: GrepArgs) -> int | None:
     store = SESSION_STORE.get()
     uuid = client.resolve_image(store.current_image)
 
-    path = (
-        store.resolve_path(args.path)
-        if args.path is not None
-        else (store.get_cwd() or "/")
+    paths = (
+        [store.resolve_path(p) for p in args.path]
+        if args.path
+        else [store.get_cwd() or "/"]
     )
 
+    before, after = args.before(), args.after()
     result = client.inspect_image_grep(
         uuid,
         args.pattern,
-        path=path,
+        path=paths,
         glob=args.glob,
         max_count=args.max_count,
         max_total=args.max_total,
         case=args.case,
+        before=before,
+        after=after,
     )
     data = result.to_dict()
 
@@ -147,18 +231,11 @@ def cmd_grep(args: GrepArgs) -> int | None:
         json.dump(data, sys.stdout)
         sys.stdout.write("\n")
     elif isinstance(formatter, DefaultFormatter):
-        # Classic `path:line:text` grep output, matching ripgrep's own
-        # default rendering (path/line colored, match highlighted, when
-        # stdout is a terminal). Structured formats (json/csv/table/...)
-        # still get one row per match via the normal pipeline below.
-        for match in data["matches"]:
-            line_text = match["line_text"].rstrip("\n")
-            path, line_number = match["path"], match["line_number"]
-            if STDOUT_IS_A_TTY:
-                line_text = highlight_match(line_text, match["submatches"])
-                path = Colors.MAGENTA(path)
-                line_number = Colors.GREEN(str(line_number))
-            sys.stdout.write(f"{path}:{line_number}:{line_text}\n")
+        # Classic grep output, matching ripgrep's own default rendering
+        # (path/line colored, match highlighted, when stdout is a
+        # terminal). Structured formats (json/csv/table/...) still get
+        # one row per match/context line via the normal pipeline below.
+        write_grep_lines(data["matches"], with_context=bool(before or after))
     else:
         for match in data["matches"]:
             formatter(**{**match, "line_text": match["line_text"].rstrip("\n")})
