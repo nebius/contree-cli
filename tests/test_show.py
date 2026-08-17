@@ -289,6 +289,42 @@ class TestShowStderr:
         assert "err" in captured.err
 
 
+class TestShowJSONStdout:
+    """`metadata.result.stdout` is a raw stream envelope dict -- JSON
+    output must carry it back as a decoded "result" field shaped like
+    the API's own metadata.result, same as run.py's
+    `_display_operation`."""
+
+    def test_json_output_includes_decoded_stdout(
+        self, contree_client, capsys, session_store
+    ):
+        _run_cmd(
+            contree_client,
+            _make_op(
+                stdout=_ascii_stream("hello\n"),
+                stderr=_ascii_stream("warn\n"),
+            ),
+            formatter=JSONFormatter(),
+            store=session_store,
+        )
+        out = capsys.readouterr().out
+        # Exactly one JSON line -- no raw text appended after it.
+        (line,) = out.splitlines()
+        parsed = json.loads(line)
+        assert parsed["result"]["stdout"] == "hello\n"
+        assert parsed["result"]["stderr"] == "warn\n"
+
+    def test_json_output_no_stdout_is_empty_string(
+        self, contree_client, capsys, session_store
+    ):
+        _run_cmd(
+            contree_client, _make_op(), formatter=JSONFormatter(), store=session_store
+        )
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["result"]["stdout"] == ""
+        assert parsed["result"]["stderr"] == ""
+
+
 class TestShowCaching:
     def test_terminal_op_cached(self, contree_client, session_store):
         """SUCCESS op is cached; second call skips API."""

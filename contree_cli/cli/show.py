@@ -20,7 +20,7 @@ from typing import Any, cast
 from contree_client.models import TERMINAL_STATUSES, decode_stream
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol
-from contree_cli.output import DefaultFormatter, JSONFormatter, JSONPrettyFormatter
+from contree_cli.output import DefaultFormatter
 from contree_cli.refs import history_spec_from_ref, resolve_operation_uuid
 
 # Re-exported for backwards compatibility with anything that historically
@@ -88,6 +88,27 @@ def cmd_show(args: ShowArgs) -> int | None:
     if state:
         exit_code = state.get("exit_code")
 
+    if formatter.STREAM:
+        # JSON/JSON-pretty keep nested dict/list fields (see ListSorter),
+        # so the instance result comes through as "result", shaped like
+        # the API's own metadata.result -- just with stdout/stderr
+        # decoded to plain text instead of the raw stream envelope.
+        formatter(
+            **{
+                **op,
+                "exit_code": exit_code,
+                "image": result.get("image") or "",
+                "tag": result.get("tag") or "",
+                "result": {
+                    **instance_result,
+                    "stdout": decode_stream(instance_result.get("stdout")),
+                    "stderr": decode_stream(instance_result.get("stderr")),
+                },
+            }
+        )
+        formatter.flush()
+        return None
+
     formatter(
         **{
             **op,
@@ -98,8 +119,7 @@ def cmd_show(args: ShowArgs) -> int | None:
     )
     formatter.flush()
 
-    _STREAM_FMTS = (DefaultFormatter, JSONFormatter, JSONPrettyFormatter)
-    if not isinstance(formatter, _STREAM_FMTS):
+    if not isinstance(formatter, DefaultFormatter):
         return None
 
     stdout = decode_stream(instance_result.get("stdout"))
