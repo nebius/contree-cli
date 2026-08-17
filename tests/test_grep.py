@@ -8,7 +8,7 @@ from conftest import ContreeTestClient, make_grep_match, make_grep_result
 from contree_client.models import GrepResult
 
 from contree_cli import FORMATTER, SESSION_STORE
-from contree_cli.cli.grep import GrepArgs, cmd_grep, highlight_match
+from contree_cli.cli.grep import GrepArgs, cmd_grep, colorize, highlight_match
 from contree_cli.output import (
     CSVFormatter,
     DefaultFormatter,
@@ -342,6 +342,31 @@ class TestCmdGrep:
         parsed = json.loads(capsys.readouterr().out.strip())
         assert parsed["line_text"] == "127.0.0.1 localhost"
 
+    def test_line_text_crlf_stripped_in_normal_row(
+        self, contree_client, session_store, capsys
+    ):
+        _run_cmd(
+            contree_client,
+            [make_grep_match(line_text="127.0.0.1 localhost\r\n")],
+            store=session_store,
+            formatter=JSONFormatter(),
+        )
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["line_text"] == "127.0.0.1 localhost"
+
+    def test_line_text_crlf_stripped_in_default_formatter(
+        self, contree_client, session_store, capsys
+    ):
+        with patch("contree_cli.cli.grep.STDOUT_IS_A_TTY", False):
+            _run_cmd(
+                contree_client,
+                [make_grep_match(line_text="127.0.0.1 localhost\r\n")],
+                store=session_store,
+                formatter=DefaultFormatter(),
+            )
+        out = capsys.readouterr().out
+        assert out == "/etc/hosts:1:127.0.0.1 localhost\n"
+
     def test_raw_preserves_submatches_patterns_truncated(
         self, contree_client, session_store, capsys
     ):
@@ -371,6 +396,26 @@ class TestCmdGrep:
         exit_code = _run_cmd(contree_client, [], store=session_store, raw=True)
         assert exit_code == 1
 
+    def test_exit_code_2_when_truncated_before_any_match(
+        self, contree_client, session_store
+    ):
+        """Truncated with zero matches is inconclusive (the deadline/
+        max_total was hit before finding anything) -- distinct from a
+        completed search confirming there's nothing to find."""
+        exit_code = _run_cmd(contree_client, [], store=session_store, truncated=True)
+        assert exit_code == 2
+
+    def test_exit_code_none_when_truncated_but_matches_found(
+        self, contree_client, session_store
+    ):
+        exit_code = _run_cmd(
+            contree_client,
+            [make_grep_match()],
+            store=session_store,
+            truncated=True,
+        )
+        assert exit_code is None
+
     def test_truncated_logs_warning(self, contree_client, session_store, caplog):
         _run_cmd(
             contree_client,
@@ -391,21 +436,19 @@ class TestCmdGrep:
 
 
 class TestHighlightMatch:
-    def test_wraps_matched_span(self, is_a_tty):
+    """highlight_match() always highlights -- unconditionally, no
+    IS_A_TTY check of its own. The caller (write_grep_lines) is the
+    one that decides whether to invoke it based on STDOUT_IS_A_TTY;
+    see TestCmdGrep's DefaultFormatter tests for that side."""
+
+    def test_wraps_matched_span(self):
         result = highlight_match(
             "127.0.0.1 localhost",
             [{"text": "localhost", "start": 10, "end": 19}],
         )
-        assert result == f"127.0.0.1 {Colors.BOLD_RED('localhost')}"
+        assert result == f"127.0.0.1 {colorize(Colors.BOLD_RED, 'localhost')}"
 
-    def test_no_tty_returns_plain_text(self):
-        result = highlight_match(
-            "127.0.0.1 localhost",
-            [{"text": "localhost", "start": 10, "end": 19}],
-        )
-        assert result == "127.0.0.1 localhost"
-
-    def test_multiple_submatches(self, is_a_tty):
+    def test_multiple_submatches(self):
         result = highlight_match(
             "foo bar foo",
             [
@@ -413,18 +456,29 @@ class TestHighlightMatch:
                 {"text": "foo", "start": 8, "end": 11},
             ],
         )
-        assert result == f"{Colors.BOLD_RED('foo')} bar {Colors.BOLD_RED('foo')}"
+        assert result == (
+            f"{colorize(Colors.BOLD_RED, 'foo')} bar {colorize(Colors.BOLD_RED, 'foo')}"
+        )
 
-    def test_no_submatches_returns_unchanged(self, is_a_tty):
+    def test_no_submatches_returns_unchanged(self):
         assert highlight_match("plain text", []) == "plain text"
 
-    def test_multibyte_utf8_offsets(self, is_a_tty):
+    def test_multibyte_utf8_offsets(self):
         # "café " is 5 chars but 6 bytes (é is 2 bytes in UTF-8); the
         # match's byte offsets must still land on "bar", not be thrown
         # off by the multi-byte character preceding it.
         result = highlight_match("café bar", [{"text": "bar", "start": 6, "end": 9}])
-        assert result == f"café {Colors.BOLD_RED('bar')}"
+        assert result == f"café {colorize(Colors.BOLD_RED, 'bar')}"
 
-    def test_out_of_range_submatch_skipped(self, is_a_tty):
+    def test_out_of_range_submatch_skipped(self):
         result = highlight_match("short", [{"text": "x", "start": 50, "end": 51}])
         assert result == "short"
+
+    def test_replacement_character_skips_highlighting(self):
+        """Lossily-decoded lines (invalid UTF-8 in the source file) carry
+        U+FFFD, whose re-encoded byte length wouldn't match the
+        original offsets -- highlighting must be skipped rather than
+        risk slicing at the wrong point."""
+        line = "before � after"
+        result = highlight_match(line, [{"text": "after", "start": 11, "end": 16}])
+        assert result == line

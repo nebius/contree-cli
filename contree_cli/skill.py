@@ -122,8 +122,9 @@ def forget_installed(skill: Skill) -> None:
 SKILL_DESCRIPTION = """\
 Use when the user needs to operate ConTree sandboxes through the contree CLI: \
 choose or resume explicit sessions, run commands in VM-isolated environments, \
-inspect images without spawning a VM, stage file changes, branch or roll back \
-sandbox state, reuse tagged images, or automate rollback-safe agent workflows.\
+inspect and search image files without spawning a VM, stage file changes, \
+branch or roll back sandbox state, reuse tagged images, or automate \
+rollback-safe agent workflows.\
 """
 
 BUNDLED_INTRO = """\

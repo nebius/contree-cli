@@ -32,6 +32,8 @@ for coding agents:
   read-only command (inspect API, no instance spawn)
   defaults to session cwd when PATH is omitted; pass / to search whole image
   exit code 1 means zero matches (like POSIX grep), not an error
+  exit code 2 means the search was truncated before finding anything --
+  inconclusive, not confirmed zero matches
   default format prints classic PATH:LINE:TEXT; use -o json/csv/... for rows
   use --raw to preserve submatches/patterns/truncated as JSON
   -A/-B/--context add ripgrep-side context lines (server-computed, not local)
@@ -142,13 +144,33 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     return cmd_grep, GrepArgs
 
 
+def colorize(color: Colors, text: str) -> str:
+    """Wrap *text* in *color*'s raw ANSI codes, unconditionally.
+
+    ``Colors.__call__`` gates on ``contree_cli.types.IS_A_TTY``, which
+    is derived from *stderr*'s TTY-ness -- the wrong signal for content
+    written to stdout (e.g. stderr redirected but stdout still a
+    terminal). Callers here already gate on ``STDOUT_IS_A_TTY``
+    themselves, so this bypasses that stderr-based check entirely.
+    """
+    return f"{color.value}{text}{Colors.DEFAULT.value}"
+
+
 def highlight_match(line_text: str, submatches: list[dict[str, Any]]) -> str:
     """Wrap each submatch span in bold red, like `grep --color`.
 
     Submatch offsets are byte offsets (ripgrep operates on raw bytes),
     so slicing happens on the UTF-8 encoded line to stay correctly
-    aligned with multi-byte characters.
+    aligned with multi-byte characters. When the source file had
+    invalid UTF-8, the server lossily decodes it and ``line_text``
+    contains U+FFFD replacement characters -- those don't round-trip
+    to the same byte length as the original input the offsets refer
+    to, so re-encoding here would slice at the wrong points. Skip
+    highlighting entirely in that case; the caller still prints the
+    line as-is.
     """
+    if "\ufffd" in line_text:
+        return line_text
     data = line_text.encode("utf-8", errors="surrogateescape")
     parts: list[str] = []
     pos = 0
@@ -158,7 +180,9 @@ def highlight_match(line_text: str, submatches: list[dict[str, Any]]) -> str:
             continue  # out-of-order/out-of-range offsets -- skip defensively
         end = min(end, len(data))
         parts.append(data[pos:start].decode("utf-8", errors="replace"))
-        parts.append(Colors.BOLD_RED(data[start:end].decode("utf-8", errors="replace")))
+        parts.append(
+            colorize(Colors.BOLD_RED, data[start:end].decode("utf-8", errors="replace"))
+        )
         pos = end
     parts.append(data[pos:].decode("utf-8", errors="replace"))
     return "".join(parts)
@@ -187,12 +211,12 @@ def write_grep_lines(matches: list[dict[str, Any]], *, with_context: bool) -> No
             sys.stdout.write("--\n")
 
         sep = ":" if match["type"] == "match" else "-"
-        line_text = match["line_text"].rstrip("\n")
+        line_text = match["line_text"].rstrip("\r\n")
         path_field, line_field = row_path, str(row_line)
         if STDOUT_IS_A_TTY:
             line_text = highlight_match(line_text, match["submatches"])
-            path_field = Colors.MAGENTA(row_path)
-            line_field = Colors.GREEN(line_field)
+            path_field = colorize(Colors.MAGENTA, row_path)
+            line_field = colorize(Colors.GREEN, line_field)
         sys.stdout.write(f"{path_field}{sep}{line_field}{sep}{line_text}\n")
 
         prev_path, prev_line = row_path, row_line
@@ -238,7 +262,7 @@ def cmd_grep(args: GrepArgs) -> int | None:
         write_grep_lines(data["matches"], with_context=bool(before or after))
     else:
         for match in data["matches"]:
-            formatter(**{**match, "line_text": match["line_text"].rstrip("\n")})
+            formatter(**{**match, "line_text": match["line_text"].rstrip("\r\n")})
         formatter.flush()
 
     if data["truncated"]:
@@ -246,5 +270,11 @@ def cmd_grep(args: GrepArgs) -> int | None:
             "Results truncated (max_total or search deadline reached);"
             " narrow the search with --glob or a more specific PATH.",
         )
+        if not data["matches"]:
+            # Zero matches here is inconclusive, not confirmed: the
+            # deadline/max_total was hit before the search could even
+            # finish, unlike a normal exit 1 (search completed, found
+            # nothing).
+            return 2
 
     return 1 if not data["matches"] else None

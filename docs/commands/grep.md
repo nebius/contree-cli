@@ -97,6 +97,12 @@ if contree grep ERROR /var/log/app.log > /dev/null; then
 fi
 ```
 
+Exit status 2 is different from 1: it means the search was truncated
+(`max_total`/the server deadline was hit) *before finding anything at all*,
+which is inconclusive rather than a confirmed zero-match result. A truncated
+search that still found at least one match exits 0/none as usual --
+`truncated` only affects the exit code when combined with zero matches.
+
 ## See also
 
 - {doc}`ls` -- list files before searching
