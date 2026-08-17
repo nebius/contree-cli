@@ -237,6 +237,15 @@ Piped stdin:
   echo 'uname -a' | contree run /bin/sh
   cat deploy.sh | contree run /bin/sh
 
+  Stdin (including a large piped file) is read and forwarded in the
+  background in chunks, not buffered in full before sending. A detached
+  run's -d doesn't return until all of local stdin has been sent.
+
+Signal handling:
+  Ctrl-C during a foreground run sends SIGINT to the sandboxed process
+  first and keeps streaming its remaining output. A second Ctrl-C, or a
+  failure to deliver the first signal, cancels the whole operation.
+
 Detached mode (-d):
   contree run -d -- long-running-task
   contree ps                                  check status

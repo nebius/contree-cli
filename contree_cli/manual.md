@@ -156,6 +156,14 @@ Execution modes
 
 Exit codes propagate: contree run -- sh -c 'exit 42'; echo $?
 
+Piped/local stdin (including large input) is forwarded in the background
+in chunks rather than buffered in full; a detached run's -d doesn't
+return until it has all been sent.
+
+Ctrl-C during a foreground run sends SIGINT to the sandboxed process
+first and keeps streaming its remaining output. Press it again to
+cancel the whole operation instead.
+
 Detached workflow:
   contree run -d -- long-task
   contree ps                             check status
