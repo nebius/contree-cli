@@ -39,12 +39,15 @@ def transform_field(key: str, value: Any) -> Any:
 class ListSorter:
     """Reorder an API record dict for table output.
 
-    Drops nested values (dict/list), applies light typing to known fields
-    (timestamps, duration, mode, mtime, nullable error/tag), and yields
-    columns in a stable order: ``head`` first, then any new keys
-    discovered in record order (memoised across calls so the order stays
-    stable across rows), then ``tail`` last. Keys named in
-    ``head``/``tail`` that are absent from the record are skipped.
+    Drops nested values (dict/list) unless *allow_nested* -- tabular
+    formatters (CSV/TSV/Table) can't represent them as a flat row, but
+    JSON-like formatters can serialise them as-is. Applies light typing
+    to known fields (timestamps, duration, mode, mtime, nullable
+    error/tag), and yields columns in a stable order: ``head`` first,
+    then any new keys discovered in record order (memoised across calls
+    so the order stays stable across rows), then ``tail`` last. Keys
+    named in ``head``/``tail`` that are absent from the record are
+    skipped.
     """
 
     def __init__(
@@ -52,14 +55,19 @@ class ListSorter:
         *,
         head: tuple[str, ...] = (),
         tail: tuple[str, ...] = (),
+        allow_nested: bool = False,
     ) -> None:
         self.tail = tail
         self.columns: list[str] = list(head)
         self.seen: set[str] = set(head) | set(tail)
+        self.allow_nested = allow_nested
 
     def order(self, fields: dict[str, Any]) -> OrderedDict[str, Any]:
+        def drop(value: Any) -> bool:
+            return not self.allow_nested and isinstance(value, (dict, list))
+
         for key, value in fields.items():
-            if key in self.seen or isinstance(value, (dict, list)):
+            if key in self.seen or drop(value):
                 continue
             self.columns.append(key)
             self.seen.add(key)
@@ -69,7 +77,7 @@ class ListSorter:
             if key not in fields:
                 continue
             value = fields[key]
-            if isinstance(value, (dict, list)):
+            if drop(value):
                 continue
             out[key] = transform_field(key, value)
         return out
@@ -178,11 +186,13 @@ class OutputFormatter:
     optional ``head``/``tail`` configured via :meth:`configure`.
     """
 
-    # Not suitable for streaming stdout/stderr output (e.g. from `run`)
+    # Not suitable for streaming stdout/stderr output (e.g. from `run`).
+    # Also controls whether nested dict/list fields survive ListSorter:
+    # JSON-like formatters can serialise them as-is, tabular ones can't.
     STREAM = False
 
     def __init__(self) -> None:
-        self.sorter = ListSorter()
+        self.sorter = ListSorter(allow_nested=self.STREAM)
 
     def configure(
         self,
@@ -191,7 +201,7 @@ class OutputFormatter:
         tail: tuple[str, ...] = (),
     ) -> None:
         """Configure column ordering for this formatter."""
-        self.sorter = ListSorter(head=head, tail=tail)
+        self.sorter = ListSorter(head=head, tail=tail, allow_nested=self.STREAM)
 
     def __call__(self, **kwargs: object) -> None:
         self.write(self.sorter.order(kwargs))

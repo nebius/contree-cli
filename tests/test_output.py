@@ -12,6 +12,7 @@ from contree_cli.output import (
     DefaultFormatter,
     JSONFormatter,
     JSONPrettyFormatter,
+    ListSorter,
     PlainFormatter,
     TableFormatter,
     TSVFormatter,
@@ -79,6 +80,34 @@ class TestJSONFormatter:
     def test_valid_json(self, capsys):
         JSONFormatter()(x=1)
         assert json.loads(capsys.readouterr().out) == {"x": 1}
+
+    def test_nested_dict_survives(self, capsys):
+        """JSON.STREAM=True -> ListSorter must not drop nested values."""
+        JSONFormatter()(
+            name="alice", result={"stdout": "hi", "state": {"exit_code": 0}}
+        )
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["result"] == {"stdout": "hi", "state": {"exit_code": 0}}
+
+
+class TestListSorter:
+    def test_drops_nested_by_default(self):
+        sorter = ListSorter()
+        row = sorter.order({"name": "alice", "metadata": {"a": 1}, "tags": [1, 2]})
+        assert row == {"name": "alice"}
+
+    def test_allow_nested_keeps_dict_and_list(self):
+        sorter = ListSorter(allow_nested=True)
+        row = sorter.order({"name": "alice", "metadata": {"a": 1}, "tags": [1, 2]})
+        assert row == {"name": "alice", "metadata": {"a": 1}, "tags": [1, 2]}
+
+    def test_tabular_formatters_still_drop_nested(self, capsys):
+        """CSV/TSV/Table are not STREAM formatters -- must keep dropping
+        dict/list values, since a flat row can't represent them."""
+        CSVFormatter()(name="alice", metadata={"a": 1})
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0] == "name"
+        assert lines[1] == "alice"
 
 
 class TestJSONPrettyFormatter:
