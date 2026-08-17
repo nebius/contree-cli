@@ -520,6 +520,7 @@ class TerminalSummary:
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
     fallback_op: dict[str, Any] | None = None
+    last_event_id: int | None = None
 
 
 def stream_events_until_close(
@@ -545,40 +546,76 @@ def stream_events_until_close(
     detected the terminal status via a poll), the full operation
     payload is fetched once and parked on ``fallback_op``.
 
+    The first Ctrl-C (``KeyboardInterrupt``) signals the main process
+    (spid=1) with SIGINT -- mirroring a real terminal -- and resumes
+    streaming from ``last_event_id`` so the process's remaining output
+    (e.g. a trailing summary line) still gets shown, without replaying
+    what was already printed. A second Ctrl-C, or a failure to deliver
+    the first signal, cancels the whole operation and re-raises
+    ``KeyboardInterrupt`` to the caller.
+
     ``BrokenPipeError`` from a local stdio write propagates unchanged —
     it means the shell pipe closed and retrying cannot help; the
     caller cancels the op and exits.
     """
     is_default = isinstance(formatter, DefaultFormatter)
     summary = TerminalSummary()
+    sigint_sent = False
 
-    for ev in client.follow_operation_events(op_uuid):
-        match ev.type:
-            case "stdout":
-                chunk = decode_chunk(ev.data)
-                summary.stdout.extend(chunk)
-                if is_default:
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
-            case "stderr":
-                chunk = decode_chunk(ev.data)
-                summary.stderr.extend(chunk)
-                if is_default:
-                    sys.stderr.buffer.write(chunk)
-                    sys.stderr.buffer.flush()
-            case "exit":
-                # spid=1 is the main process — its exit code/timed_out
-                # drive the CLI's own exit code.
-                if ev.spid == 1:
-                    summary.exit_event = ev
-                logger.debug("event: %s", ev)
-            case "completion":
-                # Authoritative terminal frame; the library ends the
-                # stream right after yielding it.
-                summary.completion = ev
-                logger.debug("event: %s", ev)
-            case _:
-                logger.debug("event: %s", ev)
+    while True:
+        try:
+            for ev in client.follow_operation_events(
+                op_uuid, last_event_id=summary.last_event_id
+            ):
+                summary.last_event_id = ev.id
+                match ev.type:
+                    case "stdout":
+                        chunk = decode_chunk(ev.data)
+                        summary.stdout.extend(chunk)
+                        if is_default:
+                            sys.stdout.buffer.write(chunk)
+                            sys.stdout.buffer.flush()
+                    case "stderr":
+                        chunk = decode_chunk(ev.data)
+                        summary.stderr.extend(chunk)
+                        if is_default:
+                            sys.stderr.buffer.write(chunk)
+                            sys.stderr.buffer.flush()
+                    case "exit":
+                        # spid=1 is the main process — its exit code/timed_out
+                        # drive the CLI's own exit code.
+                        if ev.spid == 1:
+                            summary.exit_event = ev
+                        logger.debug("event: %s", ev)
+                    case "completion":
+                        # Authoritative terminal frame; the library ends the
+                        # stream right after yielding it.
+                        summary.completion = ev
+                        logger.debug("event: %s", ev)
+                    case _:
+                        logger.debug("event: %s", ev)
+            break
+        except KeyboardInterrupt as interrupt:
+            if not sigint_sent:
+                try:
+                    client.operation_subprocess_kill(op_uuid, spid=1, signal="INT")
+                except (ContreeAPIError, OSError):
+                    pass  # can't signal the process; hard-cancel below
+                else:
+                    sigint_sent = True
+                    logger.info(
+                        "Sent SIGINT to operation %s; waiting for it to exit"
+                        " (Ctrl-C again to force-cancel)",
+                        op_uuid,
+                    )
+                    continue
+            # Either the signal itself failed, or this is a second
+            # Ctrl-C after it was already sent: give up and tear down
+            # the whole operation.
+            with contextlib.suppress(ContreeAPIError, KeyboardInterrupt, OSError):
+                client.cancel_operation(op_uuid)
+                logger.info("Cancelled operation %s", op_uuid)
+            raise interrupt from None
 
     if summary.completion is None:
         # The stream ended via the terminal-status probe; fetch the op
@@ -864,15 +901,6 @@ def cmd_run(args: RunArgs) -> int | None:
             # completion or a terminal GET, so this path is only hit
             # in tests where the stub queue drains early.
             op = client.get_operation_status(op_uuid).to_dict()
-        cache_key = (op_uuid, "operation")
-        store.cache[cache_key] = op
-    except KeyboardInterrupt:
-        try:
-            client.cancel_operation(op_uuid)
-            logger.info("Cancelled operation %s", op_uuid)
-        except (ContreeAPIError, KeyboardInterrupt, OSError):
-            pass
-        raise
     except BrokenPipeError:
         # Local stdout/stderr was closed (e.g. `contree run | head`).
         # Cancel the op, silence further stdio writes, then exit 141

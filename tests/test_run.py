@@ -423,9 +423,11 @@ class TestPollLoop:
 class TestCtrlC:
     @staticmethod
     def _run_ctrl_c(mocks: list[MockSpec], store: SessionStore) -> ContreeTestClient:
-        """Run cmd_run with the events stream raising KeyboardInterrupt,
-        simulating the user hitting Ctrl-C while the CLI was waiting
-        on SSE for the operation to terminate."""
+        """Run cmd_run with `iter_operation_events` raising KeyboardInterrupt,
+        simulating the user hitting Ctrl-C while the CLI was waiting on
+        SSE for the operation to terminate. Expects KeyboardInterrupt to
+        ultimately propagate out of cmd_run (a second interruption, or a
+        failure to deliver the signal)."""
         store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         tc = ContreeTestClient()
@@ -437,21 +439,55 @@ class TestCtrlC:
         ctx = copy_context()
 
         with (
-            patch(
-                "contree_cli.cli.run.stream_events_until_close",
-                side_effect=KeyboardInterrupt,
-            ),
             patch("contree_cli.cli.run.sys.stdin", _tty_stdin()),
             pytest.raises(KeyboardInterrupt),
         ):
             ctx.run(cmd_run, args)
         return tc
 
-    def test_ctrl_c_cancels_operation(self, session_store):
-        """On KeyboardInterrupt during the wait, the op is cancelled."""
+    def test_ctrl_c_signals_main_process_first(self, session_store):
+        """First Ctrl-C sends SIGINT to spid=1 and resumes streaming
+        instead of tearing down the whole operation; once the operation
+        then finishes cleanly, cmd_run returns normally without ever
+        cancelling."""
+        store = session_store
+        store.set_image(IMG_UUID, kind="test")
+        args = _default_args()
+        tc = ContreeTestClient()
+        apply_mocks(
+            tc,
+            [
+                _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", None),
+                ("iter_operation_events", []),
+                _op_response(status="SUCCESS"),
+            ],
+        )
+
+        CLIENT.set(tc)
+        FORMATTER.set(JSONFormatter())
+        SESSION_STORE.set(store)
+        ctx = copy_context()
+
+        with patch("contree_cli.cli.run.sys.stdin", _tty_stdin()):
+            ctx.run(cmd_run, args)
+
+        kills = tc.calls_for("operation_subprocess_kill")
+        assert len(kills) == 1
+        assert kills[0].args == ("op-1",)
+        assert kills[0].kwargs == {"spid": 1, "signal": "INT"}
+        assert tc.calls_for("cancel_operation") == []
+
+    def test_second_ctrl_c_cancels_operation(self, session_store):
+        """A second Ctrl-C while waiting after the SIGINT force-cancels,
+        same as the old single-shot behavior."""
         tc = self._run_ctrl_c(
             [
                 _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", None),
+                ("iter_operation_events", KeyboardInterrupt()),
                 ("cancel_operation", None),
             ],
             session_store,
@@ -465,10 +501,30 @@ class TestCtrlC:
         self._run_ctrl_c(
             [
                 _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", None),
+                ("iter_operation_events", KeyboardInterrupt()),
                 ("cancel_operation", NotFoundError(404, "not found")),
             ],
             session_store,
         )
+
+    def test_sigint_send_failure_escalates_immediately(self, session_store):
+        """If sending SIGINT itself fails, escalate to hard-cancel right
+        away instead of waiting for a second Ctrl-C."""
+        tc = self._run_ctrl_c(
+            [
+                _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", NotFoundError(404, "not found")),
+                ("cancel_operation", None),
+            ],
+            session_store,
+        )
+        assert len(tc.calls_for("operation_subprocess_kill")) == 1
+        cancels = tc.calls_for("cancel_operation")
+        assert len(cancels) == 1
+        assert cancels[0].args == ("op-1",)
 
 
 class TestBrokenPipe:
@@ -1897,6 +1953,7 @@ class TestRunArgsFromArgs:
             preserve_env=False,
             cwd="",
             use="",
+            stdin_open=False,
         )
         args = RunArgs.from_args(ns)
         assert args.file_excludes == ["*.log", "*.tmp", "*.bak"]
@@ -1919,6 +1976,7 @@ class TestRunArgsFromArgs:
             preserve_env=False,
             cwd="",
             use="",
+            stdin_open=False,
         )
         args = RunArgs.from_args(ns)
         assert args.command_args == ["echo", "hi"]
