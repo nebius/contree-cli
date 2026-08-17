@@ -5,7 +5,6 @@ import io
 import json
 import logging
 import os
-import select
 from contextvars import copy_context
 from unittest.mock import MagicMock, patch
 
@@ -32,7 +31,6 @@ from contree_cli.cli.run import (
     _expand_mapped_files,
     _is_excluded,
     _local_file_cache_kind,
-    _read_piped_stdin,
     build_op_from_summary,
     cmd_run,
     stream_events_until_close,
@@ -1263,37 +1261,33 @@ class TestShellMode:
 
 
 class TestStdinHandling:
-    def test_skips_unready_stdin(self, contree_client, session_store, monkeypatch):
+    def test_skips_unready_stdin(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="use")
-        fake = io.BytesIO()
-        fake.isatty = lambda: False  # type: ignore[assignment]
-        fake.fileno = lambda: 0  # type: ignore[assignment]
-        fake.buffer = fake  # type: ignore[assignment]
-        monkeypatch.setattr(select, "select", lambda *args, **kwargs: ([], [], []))
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)  # immediate EOF, nothing at all
 
         args = _default_args()
         mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
+        fake = os.fdopen(read_fd, "rb", buffering=0)
         _run_cmd(contree_client, args, mocks, store=session_store, stdin_mock=fake)
-        # ensure request sent without stdin field
         body = spawn_payload(contree_client)
         assert "stdin" not in body
 
-    def test_reads_ready_stdin(self, contree_client, session_store, monkeypatch):
+    def test_reads_ready_stdin(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="use")
-        fake = io.BytesIO(b"echo hi\n")
-        fake.isatty = lambda: False  # type: ignore[assignment]
-        fake.fileno = lambda: 0  # type: ignore[assignment]
-        fake.buffer = fake  # type: ignore[assignment]
-        monkeypatch.setattr(select, "select", lambda *args, **kwargs: ([0], [], []))
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"echo hi\n")
+        os.close(write_fd)
 
         args = _default_args()
         mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
+        fake = os.fdopen(read_fd, "rb", buffering=0)
         _run_cmd(contree_client, args, mocks, store=session_store, stdin_mock=fake)
         body = spawn_payload(contree_client)
         assert "stdin" in body
@@ -1521,11 +1515,12 @@ class TestPendingFileInclusion:
 
 class TestStdinPassthrough:
     @staticmethod
-    def _piped_stdin(data: bytes) -> MagicMock:
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.buffer = io.BytesIO(data)
-        return mock
+    def _piped_stdin(data: bytes):
+        read_fd, write_fd = os.pipe()
+        if data:
+            os.write(write_fd, data)
+        os.close(write_fd)
+        return os.fdopen(read_fd, "rb", buffering=0)
 
     def test_stdin_piped(self, contree_client, session_store):
         """Piped stdin is included in payload as base64 StreamRepr."""
@@ -1813,67 +1808,6 @@ class TestEscapeSanitization:
         out = capsys.readouterr().out
         parsed = json.loads(out)
         assert "\033[2J" in parsed["stdout"]
-
-
-# ── _read_piped_stdin ────────────────────────────────────────────────────
-
-
-class TestReadPipedStdin:
-    def test_tty_returns_empty(self):
-        mock = MagicMock()
-        mock.isatty.return_value = True
-        with patch("contree_cli.cli.run.sys.stdin", mock):
-            assert _read_piped_stdin() == b""
-
-    def test_fileno_oserror_falls_back(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.side_effect = OSError("no fileno")
-        mock.buffer.read.return_value = b"data"
-        with patch("contree_cli.cli.run.sys.stdin", mock):
-            assert _read_piped_stdin() == b"data"
-
-    def test_select_error_returns_empty(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.return_value = 0
-        with (
-            patch("contree_cli.cli.run.sys.stdin", mock),
-            patch("contree_cli.cli.run.select.select", side_effect=OSError),
-        ):
-            assert _read_piped_stdin() == b""
-
-    def test_buffer_read_error_returns_empty(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.return_value = 0
-        mock.buffer.read.side_effect = OSError("read error")
-        with (
-            patch("contree_cli.cli.run.sys.stdin", mock),
-            patch("contree_cli.cli.run.select.select", return_value=([0], [], [])),
-        ):
-            assert _read_piped_stdin() == b""
-
-    def test_happy_path_with_data(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.return_value = 0
-        mock.buffer.read.return_value = b"hello\n"
-        with (
-            patch("contree_cli.cli.run.sys.stdin", mock),
-            patch("contree_cli.cli.run.select.select", return_value=([0], [], [])),
-        ):
-            assert _read_piped_stdin() == b"hello\n"
-
-    def test_not_ready_returns_empty(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.return_value = 0
-        with (
-            patch("contree_cli.cli.run.sys.stdin", mock),
-            patch("contree_cli.cli.run.select.select", return_value=([], [], [])),
-        ):
-            assert _read_piped_stdin() == b""
 
 
 # ── _is_excluded ─────────────────────────────────────────────────────────

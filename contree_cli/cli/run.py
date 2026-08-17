@@ -53,10 +53,11 @@ import functools
 import io
 import logging
 import os
+import queue
 import re
-import select
 import shlex
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ from typing import Any
 from contree_client.exceptions import ContreeAPIError
 from contree_client.models import (
     TERMINAL_STATUSES,
+    ClosableStreamRepr,
     File,
     FileSpec,
     OperationEvent,
@@ -121,33 +123,86 @@ DEFAULT_FILE_EXCLUDES = (
 )
 
 
-def _read_piped_stdin() -> bytes:
-    """Non-blocking stdin read for piped input.
+class StdInReader(threading.Thread):
+    """Read local stdin in chunks, publish ClosableStreamRepr items to
+    its own bounded queue. A pipe read(2) never returns more than
+    PIPE_READ_SIZE, so reads are coalesced up to CHUNK_SIZE -- flushed
+    early on a short read so interactive input isn't delayed. Final item
+    is always close=True."""
 
-    Returns empty when stdin is a tty, not ready, or unsupported, to avoid hangs
-    in agent/CI contexts where stdin is non-tty but has no data.
-    """
+    PIPE_READ_SIZE = 65536
+    CHUNK_SIZE = 2**19  # 512KiB; base64 overhead keeps the wire payload near 1MB
 
-    if sys.stdin.isatty():
-        return b""
+    def __init__(self, maxsize: int = 16) -> None:
+        super().__init__(daemon=True)
+        self.queue: queue.Queue[ClosableStreamRepr] = queue.Queue(maxsize=maxsize)
 
-    try:
-        fd = sys.stdin.fileno()
-    except (OSError, io.UnsupportedOperation):
-        fd = None
+    def readexactly(self, fd: int, n: int) -> bytes:
+        """Read up to n bytes, returning early on a short read."""
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                piece = os.read(fd, min(self.PIPE_READ_SIZE, n - len(buf)))
+            except (OSError, TypeError):
+                piece = b""
+            if not piece:
+                break
+            buf += piece
+            if len(piece) < self.PIPE_READ_SIZE:
+                break
+        return bytes(buf)
 
-    if isinstance(fd, int) and fd >= 0:
+    def run(self) -> None:
         try:
-            ready, _, _ = select.select([fd], [], [], 0)
-        except (OSError, ValueError, TypeError):
-            return b""
-        if not ready:
-            return b""
+            fd = sys.stdin.fileno()
+        except (OSError, io.UnsupportedOperation, TypeError):
+            self.queue.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
+            return
+        while True:
+            chunk = self.readexactly(fd, self.CHUNK_SIZE)
+            if not chunk:
+                break
+            sr = StreamRepr.from_bytes(chunk)
+            self.queue.put(
+                ClosableStreamRepr(value=sr.value, encoding=sr.encoding, close=False)
+            )
+        self.queue.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
 
-    try:
-        return sys.stdin.buffer.read()
-    except (OSError, AttributeError):
-        return b""
+
+class StdinForwarder(threading.Thread):
+    """Drain a StdInReader's queue, forwarding each item to a still-open
+    operation's stdin. The queue's first item was already sent as part
+    of the spawn payload; this only forwards what comes after."""
+
+    def __init__(
+        self,
+        client: CliClient,
+        op_uuid: str,
+        source: queue.Queue[ClosableStreamRepr],
+        *,
+        spid: int = 1,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.client = client
+        self.op_uuid = op_uuid
+        self.source = source
+        self.spid = spid
+
+    def send(self, sr: ClosableStreamRepr) -> None:
+        self.client.operation_subprocess_stdin(
+            self.op_uuid, self.spid, sr.value, encoding=sr.encoding, close=sr.close
+        )
+
+    def run(self) -> None:
+        while True:
+            sr = self.source.get()
+            try:
+                self.send(sr)
+            except Exception as exc:
+                logger.debug("stdin forward stopped: %s", exc)
+                return
+            if sr.close:
+                return
 
 
 # Escape sequences that corrupt the terminal when replayed from captured output.
@@ -527,8 +582,16 @@ def stream_events_until_close(
     client: CliClient,
     op_uuid: str,
     formatter: OutputFormatter,
+    stdin_forwarder: StdinForwarder | None = None,
+    *,
+    stop_after_forwarder: bool = False,
 ) -> TerminalSummary:
     """Stream *op_uuid* events to stdio and collect a terminal summary.
+
+    *stdin_forwarder*, if given, is started on the first event from
+    spid=1 (proof the process is registered; an earlier write 404s).
+    *stop_after_forwarder* returns once that forwarder finishes instead
+    of waiting for completion -- used by detach mode.
 
     Reconnection is the library's job: ``follow_operation_events``
     resumes dropped streams with ``Last-Event-Id`` and stops after the
@@ -561,12 +624,27 @@ def stream_events_until_close(
     is_default = isinstance(formatter, DefaultFormatter)
     summary = TerminalSummary()
     sigint_sent = False
+    stdin_forwarder_started = threading.Event()
 
     while True:
         try:
             for ev in client.follow_operation_events(
                 op_uuid, last_event_id=summary.last_event_id
             ):
+                if (
+                    stdin_forwarder is not None
+                    and ev.spid == 1
+                    and not stdin_forwarder_started.is_set()
+                ):
+                    stdin_forwarder_started.set()
+                    stdin_forwarder.start()
+                if (
+                    stop_after_forwarder
+                    and stdin_forwarder_started.is_set()
+                    and stdin_forwarder is not None
+                    and not stdin_forwarder.is_alive()
+                ):
+                    return summary
                 summary.last_event_id = ev.id
                 match ev.type:
                     case "stdout":
@@ -751,6 +829,9 @@ def _display_operation(
             sys.stderr.write("\n")
 
 
+STDIN_FIRST_CHUNK_TIMEOUT = 0.05  # how long cmd_run waits before spawning anyway
+
+
 def cmd_run(args: RunArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
@@ -821,14 +902,25 @@ def cmd_run(args: RunArgs) -> int | None:
         else:
             payload["args"] = ["-s"]
 
-    # Read piped stdin (skip if shebang already set it)
+    # Read piped/local stdin (skip if shebang already set it). Whatever's
+    # available within STDIN_FIRST_CHUNK_TIMEOUT decides the spawn
+    # payload; any more is forwarded after spawn via StdinForwarder.
+    reader: StdInReader | None = None
+    open_pipe = False
     if "stdin" not in payload:
-        stdin_data = _read_piped_stdin()
-        if stdin_data:
-            payload["stdin"] = StreamRepr.from_bytes(stdin_data)
-            logger.debug("Piped stdin: %d bytes", len(stdin_data))
-        elif not sys.stdin.isatty():
-            logger.debug("No piped stdin available; skipping read")
+        reader = StdInReader()
+        reader.start()
+        try:
+            first = reader.queue.get(timeout=STDIN_FIRST_CHUNK_TIMEOUT)
+        except queue.Empty:
+            payload["stdin"] = ClosableStreamRepr(
+                value="", encoding="ascii", close=False
+            )
+            open_pipe = True
+        else:
+            if not first.close:
+                payload["stdin"] = first
+                open_pipe = True
 
     command = str(payload.pop("command"))
     image = str(payload.pop("image"))
@@ -843,6 +935,11 @@ def cmd_run(args: RunArgs) -> int | None:
     op_uuid = str(op["uuid"])
 
     logger.debug("Spawned operation %s", op_uuid)
+
+    forwarder: StdinForwarder | None = None
+    if open_pipe:
+        assert reader is not None
+        forwarder = StdinForwarder(client, op_uuid, reader.queue)
 
     if args.detach:
         pending_key = ("", f"ops:{store.session_key}")
@@ -876,10 +973,21 @@ def cmd_run(args: RunArgs) -> int | None:
         )
         store.cache[pending_key] = normalized
 
-    # 4. Detach mode - exit immediately
+    # 4. Detach mode - exit immediately, but only once local stdin has
+    # actually been sent.
     if args.detach:
-        formatter.configure(tail=("error",))
-        formatter(**{"uuid": op_uuid, "status": "PENDING", **op})
+        if forwarder is not None:
+            stream_events_until_close(
+                client, op_uuid, formatter, forwarder, stop_after_forwarder=True
+            )
+            # Spawn response has no status field; re-fetch rather than
+            # assume PENDING, since sending stdin may have taken a while.
+            op = client.get_operation_status(op_uuid).to_dict()
+            formatter.configure(tail=("error",))
+            formatter(**op)
+        else:
+            formatter.configure(tail=("error",))
+            formatter(**{"uuid": op_uuid, "status": "PENDING", **op})
         formatter.flush()
         return None
 
@@ -887,7 +995,7 @@ def cmd_run(args: RunArgs) -> int | None:
     # come, log other events at debug, accumulate the terminal frame.
     store = SESSION_STORE.get()
     try:
-        summary = stream_events_until_close(client, op_uuid, formatter)
+        summary = stream_events_until_close(client, op_uuid, formatter, forwarder)
         if summary.completion is not None:
             # Authoritative terminal frame from the server — build the
             # full op dict from the SSE events themselves, no GET.
