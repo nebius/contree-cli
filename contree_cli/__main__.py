@@ -108,7 +108,17 @@ def main() -> None:
             CLIENT.set(stack.enter_context(client))
 
         formatter = FORMATTERS[args.output_format]()
-        stack.callback(formatter.close)
+
+        def close_formatter() -> None:
+            # A closed stdout (e.g. piping into `less` and quitting
+            # early) can make this final flush itself raise
+            # BrokenPipeError -- the handler's own _NETWORK_ERRORS catch
+            # already reported and exited by the time this callback
+            # runs, so a second traceback here would just be noise.
+            with suppress(BrokenPipeError):
+                formatter.close()
+
+        stack.callback(close_formatter)
 
         session_key = get_session_key(profile.name, override=args.session_key)
         db_path = config_mod.session_db_path(profile.name)
