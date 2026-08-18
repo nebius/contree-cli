@@ -97,6 +97,35 @@ FLAGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 )
 
 
+def ask(
+    title: str,
+    *options: str,
+    default: str,
+    strict: bool = True,
+    ignorecase: bool = True,
+) -> str:
+    """Prompt for one of *options*; returns *default* on empty input or EOF."""
+
+    def key(s: str) -> str:
+        return s.lower() if ignorecase else s
+
+    valid = {key(o): o for o in options}
+    labels = (o.upper() if key(o) == key(default) else o for o in options)
+    prompt = f"{title} [{'/'.join(labels)}] "
+    while True:
+        try:
+            answer = input(prompt).strip()
+        except EOFError:
+            return default
+        if not answer:
+            return default
+        if key(answer) in valid:
+            return valid[key(answer)]
+        if not strict:
+            return default
+        print(f"Please answer one of: {', '.join(options)}")
+
+
 class ArgumentsFormatter(argparse.RawDescriptionHelpFormatter):
     """Formatter that preserves description/epilog whitespace.
 

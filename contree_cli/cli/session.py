@@ -29,7 +29,7 @@ from contree_client.runtime import RequestSpec, error_for_response
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.output import DefaultFormatter
 from contree_cli.refs import resolve_operation_uuids
-from contree_cli.types import FLAGS, parse_datetime, parse_interval
+from contree_cli.types import FLAGS, ask, parse_datetime, parse_interval
 
 logger = logging.getLogger(__name__)
 
@@ -778,8 +778,8 @@ def cmd_delete(args: DeleteArgs) -> int | None:
     failed = False
     for key in args.keys:
         if not args.force:
-            answer = input(f"Delete session {key!r}? [y/N] ")
-            if answer.lower() != "y":
+            answer = ask(f"Delete session {key!r}?", "y", "n", default="n")
+            if answer != "y":
                 print("Aborted.")
                 failed = True
                 continue
