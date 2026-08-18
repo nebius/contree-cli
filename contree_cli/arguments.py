@@ -13,6 +13,7 @@ from contree_cli.cli import (
     env,
     export,
     file,
+    grep,
     images,
     ls,
     operation,
@@ -51,6 +52,7 @@ examples:
   contree tag IMAGE_UUID latest
   contree ls /etc                    list files in session image
   contree cat /etc/os-release        show file from session image
+  contree grep TODO /app             search file contents in session image
   contree auth                       save token (secure prompt)
   contree auth switch staging
   contree man                        user manual
@@ -68,7 +70,8 @@ before running tasks:
   ensure auth exists; if missing/invalid, ask user to run `contree auth`
 
 high-signal read-only commands:
-  contree images | ps | show UUID | ls [PATH] | cat PATH | session | session show
+  contree images | ps | show UUID | ls [PATH] | cat PATH
+  contree grep PATTERN [PATH] | session | session show
 
 mutating commands (change remote or local session state):
   contree use IMAGE | run -- CMD | file edit PATH | file cp SRC DEST
@@ -235,6 +238,7 @@ register(
 )
 register("ls", "List files in image", ls.setup_parser)
 register("cat", "Show file content from image", cat.setup_parser)
+register("grep", "Search file contents in image", grep.setup_parser)
 register("cp", "Copy file from image to local path", cp.setup_parser)
 register("export", "Export image rootfs or a subtree as tar.gz", export.setup_parser)
 register("file", "Manage files in session image", file.setup_parser, aliases=["f"])

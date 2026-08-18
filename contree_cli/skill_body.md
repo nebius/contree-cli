@@ -8,10 +8,10 @@ Use `contree` from PATH. If it is missing, ask the user to install it: `uv tool 
 
 1. If syntax or behavior is unclear, consult the built-in manual before retrying: `contree agent <topic>` or `contree <command> --help`. Useful topics: `sessions`, `images`, `files`, `execution`, `output`, `profiles`, `command_safety`, `all_commands`, `all`.
 2. Do not run bare or mutating auth commands. Agents may run read-only `contree -o json auth ls` / `auth profiles`; if auth is missing or invalid, ask the user to run `contree auth`.
-3. Choose one explicit session key, then pass `-S <key>` on every current-session command: `use`, `run`, `cd`, `env`, `ls`, `cat`, `cp`, `file`, implicit-current-image `tag`, and current-session `session show/branch/checkout/rollback/wait`.
+3. Choose one explicit session key, then pass `-S <key>` on every current-session command: `use`, `run`, `cd`, `env`, `ls`, `cat`, `grep`, `cp`, `file`, implicit-current-image `tag`, and current-session `session show/branch/checkout/rollback/wait`.
 4. Before `use`, list available images with a prefix. Do not assume a tag exists: `contree images --prefix python`, `contree images --prefix ubuntu`, `contree images --prefix compiler/`. An empty result just means that prefix has no tags in this project; broaden or vary the prefix (`python` vs `python-`, `compiler/` vs `compiler/python/`) before importing or rebuilding.
 5. Bootstrap: `contree -S <key> use <tag-or-image-from-list>` then `contree -S <key> cd /root`.
-6. Inspect first with `ls`, `cat`, `session show`, `ps`/`op ls`, or `op show`. Mutate in small rollbackable steps.
+6. Inspect first with `ls`, `cat`, `grep`, `session show`, `ps`/`op ls`, or `op show`. Mutate in small rollbackable steps.
 7. After installing tools or setting up an environment, tag the result: `contree -S <key> tag <purpose/base:tag>`.
 
 Project-scoped or explicit-target commands usually do not need `-S`: `images`, `auth ls/profiles`, `op ls/show/wait/cancel`, `skill`, `agent`, `build`, `session list`, `session show NAME`, and help.
@@ -36,6 +36,17 @@ Project-scoped or explicit-target commands usually do not need `-S`: `images`, `
 Prefer `--file` for files needed by one command. Use `file cp` only when the staged file should be injected into multiple future runs. Pending files are included in the next run, including disposable runs; they are cleared only after a successful non-disposable run commits them into the next image. Explicit `--file` mappings win over pending files at the same destination.
 
 Directory attachments recurse and exclude common junk such as `.git`, hidden files, `__pycache__`, `.venv`, `node_modules`, `dist`, and `build`. Add patterns with `--file-excludes`.
+
+## Searching File Contents
+
+Use `contree grep PATTERN [PATH...]` for every content search, instead of spawning a run for `grep`/`ripgrep`/`ack`/`grep -r`/`find ... -exec grep` or piping `cat`/`ls` output through a local `grep`. It hits the same free `/inspect/` API as `ls`/`cat` (no VM, no session-history entry), searches with ripgrep semantics (Rust regex, `.gitignore` respected, binaries skipped), and is materially faster than a spawned search over anything but a tiny tree.
+
+- `PATH` defaults to the session cwd; pass `/` to search the whole image. `PATH` may be repeated to search several roots in one call: `contree -S <key> grep TODO src/ docs/`.
+- Narrow with `--glob '*.py'` (repeatable, `!` negates), `--case insensitive`, `--max-count N` (per file), `--max-total N` (overall, default 1000).
+- `-A NUM`/`--after`, `-B NUM`/`--before`, `-C NUM`/`--context` add surrounding lines (server-computed, max 50 each way); `-C` sets both unless overridden by an explicit `-A`/`-B`.
+- Default output is `PATH:LINE:TEXT` for a match and `PATH-LINE-TEXT` for a context line, with a bare `--` between non-adjacent groups -- parse it exactly like GNU grep/ripgrep output. For automation, use `-o json` (one row per match/context line, with a `type` field) or `--raw` (full payload including `submatches`, `patterns`, `truncated`, for `jq`).
+- Exit code is 1 when nothing matched (not an error) and 0/none otherwise, so `contree grep ERROR app.log && next-step` composes like POSIX grep.
+- Reach for a spawned `run -- grep ...` only when you need something this command cannot do (search inside a compressed archive member, use non-ripgrep flags, or filter piped output from another command already running remotely).
 
 ## Sessions And Rollback
 

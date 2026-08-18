@@ -13,6 +13,7 @@ First sandbox:
   contree run -- uname -a
   contree ls /etc
   contree cat /etc/os-release
+  contree grep TODO /app        search file contents
   contree shell                 interactive REPL
 
 More: contree --help

@@ -44,6 +44,7 @@ ARG_SOURCES: dict[ArgKey, str] = {
     # Sandbox filesystem.
     (("ls",), "path"): "sandbox-path",
     (("cat",), "path"): "sandbox-path",
+    (("grep",), "path"): "sandbox-path",
     (("cp",), "path"): "sandbox-path",
     (("cp",), "dest"): "host-path",
     (("export",), "path"): "sandbox-path",

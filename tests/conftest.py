@@ -128,6 +128,42 @@ def make_file_item(path: str, **overrides: object) -> dict[str, object]:
     return item
 
 
+def make_grep_match(path: str = "/etc/hosts", **overrides: object) -> dict[str, object]:
+    """Full GrepMatch payload exactly as the inspect API returns it.
+
+    The contree-client `GrepMatch` model requires every field
+    including nested `submatches`; test fixtures must always send the
+    complete realistic shape. Overrides replace individual top-level
+    fields.
+    """
+    item: dict[str, object] = {
+        "path": path,
+        "line_number": 1,
+        "absolute_offset": 0,
+        "line_text": "127.0.0.1 localhost\n",
+        "line_bytes": 20,
+        "submatches": [{"text": "localhost", "start": 10, "end": 19}],
+        "type": "match",
+    }
+    item.update(overrides)
+    return item
+
+
+def make_grep_result(
+    path: str = "/etc",
+    patterns: list[str] | None = None,
+    matches: list[dict[str, object]] | None = None,
+    truncated: bool = False,
+) -> dict[str, object]:
+    """Full GrepResult payload exactly as the inspect API returns it."""
+    return {
+        "path": path,
+        "patterns": patterns or ["pattern"],
+        "matches": matches or [],
+        "truncated": truncated,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -160,7 +196,7 @@ def config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Redirect CODEX_HOME so a skill install exercising CodexSkill (which
     writes a rules file under it) never touches the real ~/.codex.
 
@@ -172,6 +208,39 @@ def _isolate_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     unaffected: that override takes precedence over this env var.
     """
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex-home"))
+
+
+@pytest.fixture(autouse=True)
+def no_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force `Colors.__call__` to no-op, regardless of the ambient
+    FORCE_COLOR/isatty state the test suite happens to run under.
+
+    `STDOUT_IS_A_TTY`/`STDERR_IS_A_TTY`/`FORCE_COLOR` are computed once
+    at `contree_cli.types` import time and then copied *by value* into
+    every module that does `from contree_cli.types import
+    STDOUT_IS_A_TTY` (output.py, cli/grep.py, ...) -- patching those
+    after the fact would mean chasing down every such copy. `IS_A_TTY`
+    is different: `Colors.__call__` (defined in `contree_cli.types`)
+    looks it up live from its own enclosing module's globals on every
+    call, so patching it here is the single choke point that actually
+    decides whether ANSI escape codes get emitted, no matter which
+    module calls `Colors.X(...)` or what FORCE_COLOR happened to be
+    when it was imported.
+
+    Tests that need the opposite (verifying colored output) should
+    request the `is_a_tty` fixture instead of patching this by hand.
+    """
+    monkeypatch.setattr("contree_cli.types.IS_A_TTY", False)
+
+
+@pytest.fixture()
+def is_a_tty(no_a_tty: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt a single test into a colored-output TTY.
+
+    Depends on `no_a_tty` so it always runs after that autouse baseline
+    is applied, then flips `IS_A_TTY` back to True for this test only.
+    """
+    monkeypatch.setattr("contree_cli.types.IS_A_TTY", True)
 
 
 @pytest.fixture()
