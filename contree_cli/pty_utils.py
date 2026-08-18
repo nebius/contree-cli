@@ -53,10 +53,14 @@ if sys.platform == "win32":
     import msvcrt
 
     class Win32StdInReader(PlatformStdInReader):
-        """Polls msvcrt: a blocked console read can't be interrupted
-        from another thread, so stop_event is checked between polls."""
+        """Polls msvcrt for a real console (a blocked console read
+        can't be interrupted, so stop_event is checked between polls);
+        msvcrt can't see piped/redirected stdin at all, so that case
+        falls back to a plain blocking read instead."""
 
         POLL_INTERVAL = 0.05
+        PIPE_READ_SIZE = 65536
+        CHUNK_SIZE = 2**19
 
         def __init__(self, maxsize: int = 16, fd: int = 0) -> None:
             super().__init__(maxsize=maxsize, fd=fd)
@@ -67,6 +71,12 @@ if sys.platform == "win32":
             self.join()
 
         def run(self) -> None:
+            if os.isatty(self.fd):
+                self.run_console()
+            else:
+                self.run_piped()
+
+        def run_console(self) -> None:
             try:
                 while not self.stop_event.is_set():
                     if msvcrt.kbhit():
@@ -81,6 +91,32 @@ if sys.platform == "win32":
                         self.stop_event.wait(self.POLL_INTERVAL)
             except OSError:
                 pass
+            self.queue.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
+
+        def run_piped(self) -> None:
+            while True:
+                buf = bytearray()
+                while len(buf) < self.CHUNK_SIZE:
+                    try:
+                        piece = os.read(
+                            self.fd,
+                            min(self.PIPE_READ_SIZE, self.CHUNK_SIZE - len(buf)),
+                        )
+                    except (OSError, TypeError):
+                        piece = b""
+                    if not piece:
+                        break
+                    buf += piece
+                    if len(piece) < self.PIPE_READ_SIZE:
+                        break
+                if not buf:
+                    break
+                sr = StreamRepr.from_bytes(bytes(buf))
+                self.queue.put(
+                    ClosableStreamRepr(
+                        value=sr.value, encoding=sr.encoding, close=False
+                    )
+                )
             self.queue.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
 
     StdInReader = Win32StdInReader
