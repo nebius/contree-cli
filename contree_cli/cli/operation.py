@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import itertools
-import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -504,13 +503,7 @@ def cmd_events(args: EventsArgs) -> int | None:
     for uuid in args.uuids:
         try:
             for ev in client.iter_operation_events(uuid, follow=False):
-                row = ev.to_dict()
-                if not formatter.STREAM:
-                    # Table/csv/tsv can't render a nested dict (and
-                    # ListSorter would otherwise drop it) -- flatten to
-                    # a compact JSON string so the body still shows up.
-                    row["data"] = json.dumps(row.get("data") or {})
-                formatter(uuid=uuid, **row)
+                formatter(uuid=uuid, **ev.to_dict())
         except ContreeAPIError as exc:
             logger.error("Failed to fetch events for %s: %s", uuid, exc)
             exit_code = 1

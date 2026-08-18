@@ -26,17 +26,17 @@ log = logging.getLogger(__name__)
 # the backend instead of `requests` (whose exceptions do subclass
 # OSError). Both imports are optional, mirroring how
 # contree_client.sync.detect_backend() itself probes for them.
-_NETWORK_ERRORS: tuple[type[BaseException], ...] = (OSError, http.client.HTTPException)
+NETWORK_ERRORS: tuple[type[BaseException], ...] = (OSError, http.client.HTTPException)
 try:
     import urllib3.exceptions  # type: ignore[import-not-found]
 
-    _NETWORK_ERRORS = (*_NETWORK_ERRORS, urllib3.exceptions.HTTPError)
+    NETWORK_ERRORS = (*NETWORK_ERRORS, urllib3.exceptions.HTTPError)
 except ModuleNotFoundError:
     pass
 try:
     import httpx  # type: ignore[import-not-found]
 
-    _NETWORK_ERRORS = (*_NETWORK_ERRORS, httpx.HTTPError)
+    NETWORK_ERRORS = (*NETWORK_ERRORS, httpx.HTTPError)
 except ModuleNotFoundError:
     pass
 
@@ -142,7 +142,12 @@ def main() -> None:
             # (invalid UUIDs, etc.); the message is already user-facing.
             log.error("%s", exc)
             exit(1)
-        except _NETWORK_ERRORS as exc:
+        except BrokenPipeError:
+            # Reader closed its end of the pipe (e.g. `| head`, `| less`
+            # and quit) -- not a network error, exit with the SIGPIPE
+            # convention instead of logging a misleading message.
+            exit(141)
+        except NETWORK_ERRORS as exc:
             log.error("Network error: %s", exc)
             exit(1)
         except KeyboardInterrupt:

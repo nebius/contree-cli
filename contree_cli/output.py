@@ -18,7 +18,7 @@ from contree_cli.types import STDOUT_IS_A_TTY, Colors, parse_datetime
 log = logging.getLogger(__name__)
 
 
-DATETIME_FIELDS = frozenset({"created_at", "updated_at"})
+DATETIME_FIELDS = frozenset({"created_at", "updated_at", "ts"})
 
 
 def transform_field(key: str, value: Any) -> Any:
@@ -39,15 +39,11 @@ def transform_field(key: str, value: Any) -> Any:
 class ListSorter:
     """Reorder an API record dict for table output.
 
-    Drops nested values (dict/list) unless *allow_nested* -- tabular
-    formatters (CSV/TSV/Table) can't represent them as a flat row, but
-    JSON-like formatters can serialise them as-is. Applies light typing
-    to known fields (timestamps, duration, mode, mtime, nullable
-    error/tag), and yields columns in a stable order: ``head`` first,
-    then any new keys discovered in record order (memoised across calls
-    so the order stays stable across rows), then ``tail`` last. Keys
-    named in ``head``/``tail`` that are absent from the record are
-    skipped.
+    Nested values (dict/list) are flattened to a compact JSON string
+    unless *allow_nested* (JSON-like formatters serialise them as-is).
+    Yields columns as ``head``, then discovered keys, then ``tail``.
+    ``optional`` (explicit, or auto = discovered keys in order) lists
+    columns a table can drop, back first, when there isn't room.
     """
 
     def __init__(
@@ -55,30 +51,37 @@ class ListSorter:
         *,
         head: tuple[str, ...] = (),
         tail: tuple[str, ...] = (),
+        optional: tuple[str, ...] | None = None,
         allow_nested: bool = False,
     ) -> None:
         self.tail = tail
         self.columns: list[str] = list(head)
         self.seen: set[str] = set(head) | set(tail)
         self.allow_nested = allow_nested
+        self._explicit_optional = optional
+        self.discovered: list[str] = []
+
+    @functools.cached_property
+    def optional(self) -> tuple[str, ...]:
+        if self._explicit_optional is not None:
+            return self._explicit_optional
+        return tuple(self.discovered)
 
     def order(self, fields: dict[str, Any]) -> OrderedDict[str, Any]:
-        def drop(value: Any) -> bool:
-            return not self.allow_nested and isinstance(value, (dict, list))
-
-        for key, value in fields.items():
-            if key in self.seen or drop(value):
+        for key in fields:
+            if key in self.seen:
                 continue
             self.columns.append(key)
             self.seen.add(key)
+            self.discovered.append(key)
 
         out: OrderedDict[str, Any] = OrderedDict()
         for key in (*self.columns, *self.tail):
             if key not in fields:
                 continue
             value = fields[key]
-            if drop(value):
-                continue
+            if not self.allow_nested and isinstance(value, (dict, list)):
+                value = json.dumps(value, default=_json_default)
             out[key] = transform_field(key, value)
         return out
 
@@ -94,6 +97,8 @@ def _(value: datetime) -> str:
     # API returns UTC; render in the user's local timezone for readability.
     if value.tzinfo is not None:
         value = value.astimezone()
+    if value.date() == datetime.now(value.tzinfo).date():
+        return value.strftime("%H:%M:%S")
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -177,6 +182,57 @@ def _fit_columns(
     return result, truncated
 
 
+def row_width(columns: list[str], widths: dict[str, int]) -> int:
+    return sum(widths[c] for c in columns) + max(len(columns) - 1, 0) * 2
+
+
+def layout_columns(
+    columns: list[str],
+    widths: dict[str, int],
+    optional: tuple[str, ...],
+    tail: tuple[str, ...],
+    term_width: int,
+    min_col_width: int,
+) -> tuple[list[str], dict[str, int], list[str], bool]:
+    """Fit columns into term_width.
+
+    1. Drop optional columns, back of *optional* first (later-discovered
+       columns are more peripheral than earlier ones), while it still
+       doesn't fit at natural width (never below one column).
+    2. If it still doesn't fit, shrink non-tail columns first -- tail
+       columns (e.g. "result") keep their natural width as long as
+       shrinking the rest is enough.
+    3. If that alone isn't enough, shrink everything, tail included.
+
+    Returns (kept_columns, widths, dropped_columns, was_truncated).
+    """
+    kept = list(columns)
+    dropped: list[str] = []
+    for col in reversed(optional):
+        if len(kept) <= 1 or col not in kept or row_width(kept, widths) <= term_width:
+            continue
+        kept.remove(col)
+        dropped.append(col)
+
+    truncated = False
+    if row_width(kept, widths) > term_width:
+        separator_space = max(len(kept) - 1, 0) * 2
+        shrinkable = [c for c in kept if c not in tail] or kept
+        pinned_width = sum(widths[c] for c in kept if c not in shrinkable)
+        available = term_width - separator_space - pinned_width
+        if available > 0:
+            fit_widths, truncated = _fit_columns(
+                {c: widths[c] for c in shrinkable}, shrinkable, available, min_col_width
+            )
+            widths = {**widths, **fit_widths}
+        if row_width(kept, widths) > term_width:
+            available = term_width - separator_space
+            widths, truncated = _fit_columns(
+                {c: widths[c] for c in kept}, kept, available, min_col_width
+            )
+    return kept, widths, dropped, truncated
+
+
 class OutputFormatter:
     """Base formatter - subclasses decide the serialisation style.
 
@@ -199,9 +255,12 @@ class OutputFormatter:
         *,
         head: tuple[str, ...] = (),
         tail: tuple[str, ...] = (),
+        optional: tuple[str, ...] | None = None,
     ) -> None:
         """Configure column ordering for this formatter."""
-        self.sorter = ListSorter(head=head, tail=tail, allow_nested=self.STREAM)
+        self.sorter = ListSorter(
+            head=head, tail=tail, optional=optional, allow_nested=self.STREAM
+        )
 
     def __call__(self, **kwargs: object) -> None:
         self.write(self.sorter.order(kwargs))
@@ -342,17 +401,17 @@ class TableFormatter(OutputFormatter):
                         for line in _format_value(row.get(col, "")).split("\n"):
                             widths[col] = max(widths[col], len(line))
                 truncated = False
+                dropped: list[str] = []
                 if STDOUT_IS_A_TTY:
                     term_width = shutil.get_terminal_size().columns
-                    separator_space = (len(columns) - 1) * 2
-                    available = term_width - separator_space
-                    if sum(widths.values()) > available > 0:
-                        widths, truncated = _fit_columns(
-                            widths,
-                            columns,
-                            available,
-                            self.MIN_COL_WIDTH,
-                        )
+                    columns, widths, dropped, truncated = layout_columns(
+                        columns,
+                        widths,
+                        self.sorter.optional,
+                        tuple(self.sorter.tail),
+                        term_width,
+                        self.MIN_COL_WIDTH,
+                    )
                 self._columns = columns
                 self._widths = widths
                 if STDOUT_IS_A_TTY:
@@ -362,15 +421,21 @@ class TableFormatter(OutputFormatter):
                         ]
                 header_parts: list[str] = []
                 for col in columns:
-                    padded = _truncate(
-                        col.upper(),
-                        widths[col],
-                        self.ELLIPSIS,
-                    ).ljust(widths[col])
+                    # Truncating/padding is a TTY-only affordance.
                     if STDOUT_IS_A_TTY:
+                        padded = _truncate(
+                            col.upper(), widths[col], self.ELLIPSIS
+                        ).ljust(widths[col])
                         padded = Colors.BOLD(padded)
+                    else:
+                        padded = col.upper()
                     header_parts.append(padded)
                 sys.stdout.write("  ".join(header_parts) + "\n")
+                if dropped:
+                    log.warning(
+                        "Hid %s to fit terminal; use --format json to see everything",
+                        ", ".join(dropped),
+                    )
                 if truncated:
                     log.warning(
                         "Output truncated to fit terminal;"
@@ -390,11 +455,12 @@ class TableFormatter(OutputFormatter):
                     for col in columns:
                         lines = split_row[col]
                         cell = lines[i] if i < len(lines) else ""
-                        padded = _truncate(
-                            cell,
-                            widths[col],
-                            self.ELLIPSIS,
-                        ).ljust(widths[col])
+                        if STDOUT_IS_A_TTY:
+                            padded = _truncate(cell, widths[col], self.ELLIPSIS).ljust(
+                                widths[col]
+                            )
+                        else:
+                            padded = cell
                         if col in self._col_colors:
                             color = self.VALUE_COLORS.get(
                                 cell.strip(),

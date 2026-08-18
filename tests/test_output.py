@@ -91,23 +91,24 @@ class TestJSONFormatter:
 
 
 class TestListSorter:
-    def test_drops_nested_by_default(self):
+    def test_flattens_nested_by_default(self):
         sorter = ListSorter()
         row = sorter.order({"name": "alice", "metadata": {"a": 1}, "tags": [1, 2]})
-        assert row == {"name": "alice"}
+        assert row == {"name": "alice", "metadata": '{"a": 1}', "tags": "[1, 2]"}
 
     def test_allow_nested_keeps_dict_and_list(self):
         sorter = ListSorter(allow_nested=True)
         row = sorter.order({"name": "alice", "metadata": {"a": 1}, "tags": [1, 2]})
         assert row == {"name": "alice", "metadata": {"a": 1}, "tags": [1, 2]}
 
-    def test_tabular_formatters_still_drop_nested(self, capsys):
-        """CSV/TSV/Table are not STREAM formatters -- must keep dropping
-        dict/list values, since a flat row can't represent them."""
+    def test_tabular_formatters_flatten_nested_to_json_string(self, capsys):
+        """CSV/TSV/Table are not STREAM formatters -- a flat row can't
+        represent a nested value directly, so it's flattened to JSON
+        rather than dropped (the field is still the point of the row)."""
         CSVFormatter()(name="alice", metadata={"a": 1})
         lines = capsys.readouterr().out.splitlines()
-        assert lines[0] == "name"
-        assert lines[1] == "alice"
+        assert lines[0] == "name,metadata"
+        assert lines[1] == 'alice,"{""a"": 1}"'
 
 
 class TestJSONPrettyFormatter:
@@ -171,16 +172,32 @@ class TestTableFormatter:
         assert "30" in lines[1]
 
     def test_column_alignment(self, capsys):
+        """On a real TTY, columns are padded to a consistent width."""
+        with (
+            patch("contree_cli.output.STDOUT_IS_A_TTY", True),
+            patch(
+                "contree_cli.output.shutil.get_terminal_size",
+                return_value=os.terminal_size((80, 24)),
+            ),
+        ):
+            fmt = TableFormatter()
+            fmt(name="ab", val="x")
+            fmt(name="abcdef", val="y")
+            fmt.flush()
+        lines = [_strip_ansi(line) for line in capsys.readouterr().out.splitlines()]
+        assert len(lines) == 3
+        assert len(lines[0]) == len(lines[1]) == len(lines[2])
+
+    def test_no_alignment_when_not_tty(self, capsys):
+        """Piped output isn't padded -- alignment is a TTY-only affordance,
+        and a wide value in one row shouldn't pad every other row."""
         with patch("contree_cli.output.STDOUT_IS_A_TTY", False):
             fmt = TableFormatter()
             fmt(name="ab", val="x")
             fmt(name="abcdef", val="y")
             fmt.flush()
         lines = capsys.readouterr().out.splitlines()
-        # header and rows have consistent column widths
-        assert len(lines) == 3
-        # all lines should have the same length (padded)
-        assert len(lines[0]) == len(lines[1]) == len(lines[2])
+        assert lines == ["NAME  VAL", "ab  x", "abcdef  y"]
 
     def test_flush_empty(self, capsys):
         fmt = TableFormatter()
@@ -221,8 +238,15 @@ class TestTableFormatter:
         assert "bob" in second
 
     def test_column_widths_stable_across_flushes(self, capsys):
-        """Column widths from the first flush apply to later flushes."""
-        with patch("contree_cli.output.STDOUT_IS_A_TTY", False):
+        """On a real TTY, column widths from the first flush apply to
+        later flushes."""
+        with (
+            patch("contree_cli.output.STDOUT_IS_A_TTY", True),
+            patch(
+                "contree_cli.output.shutil.get_terminal_size",
+                return_value=os.terminal_size((80, 24)),
+            ),
+        ):
             fmt = TableFormatter()
             fmt(name="ab", val="x")
             fmt.flush()
@@ -232,7 +256,9 @@ class TestTableFormatter:
             fmt(name="abcdef", val="y")
             fmt.flush()
             second_lines = capsys.readouterr().out.splitlines()
-        assert len(first_lines[0]) == len(second_lines[0])
+        first = _strip_ansi(first_lines[0])
+        second = _strip_ansi(second_lines[0])
+        assert len(first) == len(second)
 
 
 class TestFormatValue:

@@ -48,7 +48,10 @@ class ShowArgs(ArgumentsProtocol):
 def cmd_show(args: ShowArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
-    formatter.configure(tail=("error",))
+    formatter.configure(
+        head=("uuid", "status", "exit_code", "duration", "result_image_uuid"),
+        tail=("error", "result"),
+    )
     store = SESSION_STORE.get()
 
     try:
@@ -88,33 +91,21 @@ def cmd_show(args: ShowArgs) -> int | None:
     if state:
         exit_code = state.get("exit_code")
 
-    if formatter.STREAM:
-        # JSON/JSON-pretty keep nested dict/list fields (see ListSorter),
-        # so the instance result comes through as "result", shaped like
-        # the API's own metadata.result -- just with stdout/stderr
-        # decoded to plain text instead of the raw stream envelope.
-        formatter(
-            **{
-                **op,
-                "exit_code": exit_code,
-                "image": result.get("image") or "",
-                "tag": result.get("tag") or "",
-                "result": {
-                    **instance_result,
-                    "stdout": decode_stream(instance_result.get("stdout")),
-                    "stderr": decode_stream(instance_result.get("stderr")),
-                },
-            }
-        )
-        formatter.flush()
-        return None
+    # "metadata" is the raw spawn-request echo, not operation state;
+    # "result" is superseded by the derived version below.
+    op_fields = {k: v for k, v in op.items() if k not in ("metadata", "result")}
 
     formatter(
         **{
-            **op,
+            **op_fields,
             "exit_code": exit_code,
             "image": result.get("image") or "",
             "tag": result.get("tag") or "",
+            "result": {
+                **instance_result,
+                "stdout": decode_stream(instance_result.get("stdout")),
+                "stderr": decode_stream(instance_result.get("stderr")),
+            },
         }
     )
     formatter.flush()
