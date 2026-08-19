@@ -610,13 +610,9 @@ def stream_events_until_close(
                 ):
                     stdin_forwarder_started.set()
                     stdin_forwarder.start()
-                if (
-                    stop_after_forwarder
-                    and stdin_forwarder_started.is_set()
-                    and stdin_forwarder is not None
-                    and not stdin_forwarder.is_alive()
-                ):
-                    return summary
+                    if stop_after_forwarder:
+                        stdin_forwarder.join()
+                        return summary
                 summary.last_event_id = ev.id
                 match ev.type:
                     case "stdout":

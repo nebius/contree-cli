@@ -2394,6 +2394,22 @@ class TestStreamEventsUntilClose:
         assert len(tc.calls_for("iter_operation_events")) == 1
         assert tc.calls_for("get_operation_status") == []
 
+    def test_stop_after_forwarder_does_not_wait_for_more_events(self):
+        """Detach mode must return once the forwarder finishes, without
+        needing a second SSE event -- regression for `run -d` blocking
+        past a quiet detached process (only mocked event is spid=1;
+        a second `iter_operation_events` call would raise NotMockedError)."""
+        tc = ContreeTestClient()
+        tc.mock("iter_operation_events", [stream_event("stdout", "x", event_id=1)])
+        q: queue.Queue[ClosableStreamRepr] = queue.Queue()
+        q.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
+        forwarder = StdinForwarder(tc, "op-1", q)
+        summary = stream_events_until_close(
+            tc, "op-1", DefaultFormatter(), forwarder, stop_after_forwarder=True
+        )
+        assert summary is not None
+        assert len(tc.calls_for("iter_operation_events")) == 1
+
 
 class TestBuildOpFromSummary:
     def _completion(self, **overrides) -> OperationEvent:
