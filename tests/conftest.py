@@ -17,6 +17,13 @@ CONTREE_HOME_TMP = Path(tempfile.mkdtemp(prefix="contree-pytest-"))
 os.environ["CONTREE_HOME"] = str(CONTREE_HOME_TMP)
 atexit.register(shutil.rmtree, CONTREE_HOME_TMP, ignore_errors=True)
 
+# Same deal for PYTHON_COLORS: contree_cli.shell.repl.BUILTIN_HELP calls
+# ArgumentParser.format_help() at import time, and Python 3.14's argparse
+# colorizes it per the ambient FORCE_COLOR/isatty state (stdlib
+# `_colorize.can_colorize`). A later per-test monkeypatch can't undo
+# colors already baked into that module-level dict.
+os.environ["PYTHON_COLORS"] = "0"
+
 # The CONTREE_HOME override above MUST run before any contree_cli import
 # touches contree_cli.config, hence the deferred import block below.
 import pytest  # noqa: E402
