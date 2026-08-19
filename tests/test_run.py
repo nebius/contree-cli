@@ -5,7 +5,7 @@ import io
 import json
 import logging
 import os
-import select
+import queue
 from contextvars import copy_context
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +17,7 @@ from contree_client.exceptions import (
     SSEStreamError,
 )
 from contree_client.models import (
+    ClosableStreamRepr,
     File,
     FileResponse,
     InstanceSpawnResponse,
@@ -25,14 +26,15 @@ from contree_client.models import (
     StreamRepr,
 )
 
+import contree_cli.cli.run as run_module
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.cli.run import (
     RunArgs,
+    StdinForwarder,
     TerminalSummary,
     _expand_mapped_files,
     _is_excluded,
     _local_file_cache_kind,
-    _read_piped_stdin,
     build_op_from_summary,
     cmd_run,
     stream_events_until_close,
@@ -423,9 +425,11 @@ class TestPollLoop:
 class TestCtrlC:
     @staticmethod
     def _run_ctrl_c(mocks: list[MockSpec], store: SessionStore) -> ContreeTestClient:
-        """Run cmd_run with the events stream raising KeyboardInterrupt,
-        simulating the user hitting Ctrl-C while the CLI was waiting
-        on SSE for the operation to terminate."""
+        """Run cmd_run with `iter_operation_events` raising KeyboardInterrupt,
+        simulating the user hitting Ctrl-C while the CLI was waiting on
+        SSE for the operation to terminate. Expects KeyboardInterrupt to
+        ultimately propagate out of cmd_run (a second interruption, or a
+        failure to deliver the signal)."""
         store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         tc = ContreeTestClient()
@@ -437,21 +441,55 @@ class TestCtrlC:
         ctx = copy_context()
 
         with (
-            patch(
-                "contree_cli.cli.run.stream_events_until_close",
-                side_effect=KeyboardInterrupt,
-            ),
             patch("contree_cli.cli.run.sys.stdin", _tty_stdin()),
             pytest.raises(KeyboardInterrupt),
         ):
             ctx.run(cmd_run, args)
         return tc
 
-    def test_ctrl_c_cancels_operation(self, session_store):
-        """On KeyboardInterrupt during the wait, the op is cancelled."""
+    def test_ctrl_c_signals_main_process_first(self, session_store):
+        """First Ctrl-C sends SIGINT to spid=1 and resumes streaming
+        instead of tearing down the whole operation; once the operation
+        then finishes cleanly, cmd_run returns normally without ever
+        cancelling."""
+        store = session_store
+        store.set_image(IMG_UUID, kind="test")
+        args = _default_args()
+        tc = ContreeTestClient()
+        apply_mocks(
+            tc,
+            [
+                _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", None),
+                ("iter_operation_events", []),
+                _op_response(status="SUCCESS"),
+            ],
+        )
+
+        CLIENT.set(tc)
+        FORMATTER.set(JSONFormatter())
+        SESSION_STORE.set(store)
+        ctx = copy_context()
+
+        with patch("contree_cli.cli.run.sys.stdin", _tty_stdin()):
+            ctx.run(cmd_run, args)
+
+        kills = tc.calls_for("operation_subprocess_kill")
+        assert len(kills) == 1
+        assert kills[0].args == ("op-1",)
+        assert kills[0].kwargs == {"spid": 1, "signal": "INT"}
+        assert tc.calls_for("cancel_operation") == []
+
+    def test_second_ctrl_c_cancels_operation(self, session_store):
+        """A second Ctrl-C while waiting after the SIGINT force-cancels,
+        same as the old single-shot behavior."""
         tc = self._run_ctrl_c(
             [
                 _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", None),
+                ("iter_operation_events", KeyboardInterrupt()),
                 ("cancel_operation", None),
             ],
             session_store,
@@ -465,10 +503,58 @@ class TestCtrlC:
         self._run_ctrl_c(
             [
                 _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", None),
+                ("iter_operation_events", KeyboardInterrupt()),
                 ("cancel_operation", NotFoundError(404, "not found")),
             ],
             session_store,
         )
+
+    def test_sigint_send_failure_escalates_immediately(self, session_store):
+        """If sending SIGINT itself fails, escalate to hard-cancel right
+        away instead of waiting for a second Ctrl-C."""
+        tc = self._run_ctrl_c(
+            [
+                _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", NotFoundError(404, "not found")),
+                ("cancel_operation", None),
+            ],
+            session_store,
+        )
+        assert len(tc.calls_for("operation_subprocess_kill")) == 1
+        cancels = tc.calls_for("cancel_operation")
+        assert len(cancels) == 1
+        assert cancels[0].args == ("op-1",)
+
+    def test_non_oserror_transport_error_still_escalates(
+        self, session_store, monkeypatch
+    ):
+        """A backend transport error (httpx/urllib3/... none of which
+        inherit from OSError) must still hit the hard-cancel fallback
+        instead of escaping to main() as an unhandled network error."""
+
+        class FakeTransportTimeout(Exception):
+            pass
+
+        monkeypatch.setattr(
+            "contree_cli.cli.run.SIGNAL_ERRORS",
+            (*run_module.SIGNAL_ERRORS, FakeTransportTimeout),
+        )
+        tc = self._run_ctrl_c(
+            [
+                _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", FakeTransportTimeout()),
+                ("cancel_operation", None),
+            ],
+            session_store,
+        )
+        assert len(tc.calls_for("operation_subprocess_kill")) == 1
+        cancels = tc.calls_for("cancel_operation")
+        assert len(cancels) == 1
+        assert cancels[0].args == ("op-1",)
 
 
 class TestBrokenPipe:
@@ -1207,37 +1293,33 @@ class TestShellMode:
 
 
 class TestStdinHandling:
-    def test_skips_unready_stdin(self, contree_client, session_store, monkeypatch):
+    def test_skips_unready_stdin(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="use")
-        fake = io.BytesIO()
-        fake.isatty = lambda: False  # type: ignore[assignment]
-        fake.fileno = lambda: 0  # type: ignore[assignment]
-        fake.buffer = fake  # type: ignore[assignment]
-        monkeypatch.setattr(select, "select", lambda *args, **kwargs: ([], [], []))
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)  # immediate EOF, nothing at all
 
         args = _default_args()
         mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
+        fake = os.fdopen(read_fd, "rb", buffering=0)
         _run_cmd(contree_client, args, mocks, store=session_store, stdin_mock=fake)
-        # ensure request sent without stdin field
         body = spawn_payload(contree_client)
         assert "stdin" not in body
 
-    def test_reads_ready_stdin(self, contree_client, session_store, monkeypatch):
+    def test_reads_ready_stdin(self, contree_client, session_store):
         session_store.set_image(IMG_UUID, kind="use")
-        fake = io.BytesIO(b"echo hi\n")
-        fake.isatty = lambda: False  # type: ignore[assignment]
-        fake.fileno = lambda: 0  # type: ignore[assignment]
-        fake.buffer = fake  # type: ignore[assignment]
-        monkeypatch.setattr(select, "select", lambda *args, **kwargs: ([0], [], []))
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"echo hi\n")
+        os.close(write_fd)
 
         args = _default_args()
         mocks = [
             _spawn_response(),
             _op_response(status="SUCCESS", exit_code=0, image=IMG_NEW),
         ]
+        fake = os.fdopen(read_fd, "rb", buffering=0)
         _run_cmd(contree_client, args, mocks, store=session_store, stdin_mock=fake)
         body = spawn_payload(contree_client)
         assert "stdin" in body
@@ -1460,16 +1542,45 @@ class TestPendingFileInclusion:
         assert "/a.txt" in body["files"]
 
 
-# ── Stdin passthrough ────────────────────────────────────────────────────
+# --- Stdin forwarder ---
+
+
+class TestStdinForwarder:
+    def test_ambiguous_failure_is_not_retried(self):
+        """A 504 on the non-idempotent stdin POST is ambiguous (may or
+        may not have been delivered) -- retrying it can duplicate data,
+        so a single failed attempt must stop forwarding, not retry."""
+        tc = ContreeTestClient()
+        tc.respond_raw(status=504, body=b'{"error": "timeout"}')
+        q: queue.Queue[ClosableStreamRepr] = queue.Queue()
+        q.put(ClosableStreamRepr(value="aGk=", encoding="base64", close=False))
+        forwarder = StdinForwarder(tc, "op-1", q)
+        forwarder.run()
+        assert forwarder.error is not None
+        assert len(tc.raw_requests) == 1
+
+    def test_success_does_not_touch_raw_client(self):
+        tc = ContreeTestClient()
+        tc.respond_raw(status=200)
+        q: queue.Queue[ClosableStreamRepr] = queue.Queue()
+        q.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
+        forwarder = StdinForwarder(tc, "op-1", q)
+        forwarder.run()
+        assert forwarder.error is None
+        assert len(tc.raw_requests) == 1
+
+
+# --- Stdin passthrough ---
 
 
 class TestStdinPassthrough:
     @staticmethod
-    def _piped_stdin(data: bytes) -> MagicMock:
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.buffer = io.BytesIO(data)
-        return mock
+    def _piped_stdin(data: bytes):
+        read_fd, write_fd = os.pipe()
+        if data:
+            os.write(write_fd, data)
+        os.close(write_fd)
+        return os.fdopen(read_fd, "rb", buffering=0)
 
     def test_stdin_piped(self, contree_client, session_store):
         """Piped stdin is included in payload as base64 StreamRepr."""
@@ -1759,67 +1870,6 @@ class TestEscapeSanitization:
         assert "\033[2J" in parsed["stdout"]
 
 
-# ── _read_piped_stdin ────────────────────────────────────────────────────
-
-
-class TestReadPipedStdin:
-    def test_tty_returns_empty(self):
-        mock = MagicMock()
-        mock.isatty.return_value = True
-        with patch("contree_cli.cli.run.sys.stdin", mock):
-            assert _read_piped_stdin() == b""
-
-    def test_fileno_oserror_falls_back(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.side_effect = OSError("no fileno")
-        mock.buffer.read.return_value = b"data"
-        with patch("contree_cli.cli.run.sys.stdin", mock):
-            assert _read_piped_stdin() == b"data"
-
-    def test_select_error_returns_empty(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.return_value = 0
-        with (
-            patch("contree_cli.cli.run.sys.stdin", mock),
-            patch("contree_cli.cli.run.select.select", side_effect=OSError),
-        ):
-            assert _read_piped_stdin() == b""
-
-    def test_buffer_read_error_returns_empty(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.return_value = 0
-        mock.buffer.read.side_effect = OSError("read error")
-        with (
-            patch("contree_cli.cli.run.sys.stdin", mock),
-            patch("contree_cli.cli.run.select.select", return_value=([0], [], [])),
-        ):
-            assert _read_piped_stdin() == b""
-
-    def test_happy_path_with_data(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.return_value = 0
-        mock.buffer.read.return_value = b"hello\n"
-        with (
-            patch("contree_cli.cli.run.sys.stdin", mock),
-            patch("contree_cli.cli.run.select.select", return_value=([0], [], [])),
-        ):
-            assert _read_piped_stdin() == b"hello\n"
-
-    def test_not_ready_returns_empty(self):
-        mock = MagicMock()
-        mock.isatty.return_value = False
-        mock.fileno.return_value = 0
-        with (
-            patch("contree_cli.cli.run.sys.stdin", mock),
-            patch("contree_cli.cli.run.select.select", return_value=([], [], [])),
-        ):
-            assert _read_piped_stdin() == b""
-
-
 # ── _is_excluded ─────────────────────────────────────────────────────────
 
 
@@ -1897,6 +1947,7 @@ class TestRunArgsFromArgs:
             preserve_env=False,
             cwd="",
             use="",
+            stdin_open=False,
         )
         args = RunArgs.from_args(ns)
         assert args.file_excludes == ["*.log", "*.tmp", "*.bak"]
@@ -1919,6 +1970,7 @@ class TestRunArgsFromArgs:
             preserve_env=False,
             cwd="",
             use="",
+            stdin_open=False,
         )
         args = RunArgs.from_args(ns)
         assert args.command_args == ["echo", "hi"]
@@ -2370,6 +2422,22 @@ class TestStreamEventsUntilClose:
         # GET (BrokenPipeError bypasses the retry path entirely).
         assert len(tc.calls_for("iter_operation_events")) == 1
         assert tc.calls_for("get_operation_status") == []
+
+    def test_stop_after_forwarder_does_not_wait_for_more_events(self):
+        """Detach mode must return once the forwarder finishes, without
+        needing a second SSE event -- regression for `run -d` blocking
+        past a quiet detached process (only mocked event is spid=1;
+        a second `iter_operation_events` call would raise NotMockedError)."""
+        tc = ContreeTestClient()
+        tc.mock("iter_operation_events", [stream_event("stdout", "x", event_id=1)])
+        q: queue.Queue[ClosableStreamRepr] = queue.Queue()
+        q.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
+        forwarder = StdinForwarder(tc, "op-1", q)
+        summary = stream_events_until_close(
+            tc, "op-1", DefaultFormatter(), forwarder, stop_after_forwarder=True
+        )
+        assert summary is not None
+        assert len(tc.calls_for("iter_operation_events")) == 1
 
 
 class TestBuildOpFromSummary:

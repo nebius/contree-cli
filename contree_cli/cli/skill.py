@@ -25,7 +25,7 @@ from contree_cli.skill import (
     skill_version,
     skills_from_spec,
 )
-from contree_cli.types import FLAGS
+from contree_cli.types import FLAGS, ask
 
 logger = logging.getLogger(__name__)
 
@@ -186,10 +186,13 @@ def cmd_skill_remove(args: SkillRemoveArgs) -> int | None:
             continue
 
         if not args.force:
-            answer = input(
-                f"Remove {SKILL_NAME!r} from {display_path(skill.path)}? [y/N] "
+            answer = ask(
+                f"Remove {SKILL_NAME!r} from {display_path(skill.path)}?",
+                "y",
+                "n",
+                default="n",
             )
-            if answer.lower() != "y":
+            if answer != "y":
                 print("Aborted.")
                 failed = True
                 continue

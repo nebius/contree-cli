@@ -65,8 +65,13 @@ echo "runs inside a ConTree sandbox"
 echo 'uname -a' | contree run /bin/sh
 ```
 
-When stdin is not a TTY, it is read, base64-encoded, and sent as the
-`stdin` field.
+Local stdin -- piped input, or even a large file -- is read in the
+background and forwarded in bounded chunks rather than buffered in full
+before sending, so piping in a large file doesn't load it all into
+memory at once. The first chunk rides along in the spawn request itself;
+the pipe is left open and more is forwarded as it arrives, until local
+stdin closes. With `-d`/`--detach`, `run` doesn't return until all of
+local stdin has actually been sent.
 
 ## Lifecycle
 
@@ -77,6 +82,8 @@ When stdin is not a TTY, it is read, base64-encoded, and sent as the
 5. Poll until terminal status (unless `-d`)
 6. Print stdout/stderr; propagate the exit code
 
-On Ctrl-C the operation is cancelled via DELETE.
+On Ctrl-C, the first interrupt sends SIGINT to the spawned process and
+keeps streaming its remaining output. A second Ctrl-C, or a failure to
+deliver the first signal, cancels the whole operation.
 
 See {doc}`/tutorial/files` for `--file` syntax details.

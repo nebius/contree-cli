@@ -262,7 +262,14 @@ def cmd_grep(args: GrepArgs) -> int | None:
         write_grep_lines(data["matches"], with_context=bool(before or after))
     else:
         for match in data["matches"]:
-            formatter(**{**match, "line_text": match["line_text"].rstrip("\r\n")})
+            # `submatches` (byte-offset highlight positions) is only
+            # useful for --raw or the DefaultFormatter highlighting
+            # above -- drop it explicitly rather than relying on
+            # ListSorter, which now lets JSON-like formatters keep
+            # nested fields (see show.py's "result").
+            row = {k: v for k, v in match.items() if k != "submatches"}
+            row["line_text"] = row["line_text"].rstrip("\r\n")
+            formatter(**row)
         formatter.flush()
 
     if data["truncated"]:

@@ -20,7 +20,7 @@ from typing import Any, cast
 from contree_client.models import TERMINAL_STATUSES, decode_stream
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol
-from contree_cli.output import DefaultFormatter, JSONFormatter, JSONPrettyFormatter
+from contree_cli.output import DefaultFormatter
 from contree_cli.refs import history_spec_from_ref, resolve_operation_uuid
 
 # Re-exported for backwards compatibility with anything that historically
@@ -48,7 +48,10 @@ class ShowArgs(ArgumentsProtocol):
 def cmd_show(args: ShowArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
-    formatter.configure(tail=("error",))
+    formatter.configure(
+        head=("uuid", "status", "exit_code", "duration", "result_image_uuid"),
+        tail=("error", "result"),
+    )
     store = SESSION_STORE.get()
 
     try:
@@ -88,22 +91,28 @@ def cmd_show(args: ShowArgs) -> int | None:
     if state:
         exit_code = state.get("exit_code")
 
-    formatter(
-        **{
-            **op,
-            "exit_code": exit_code,
-            "image": result.get("image") or "",
-            "tag": result.get("tag") or "",
-        }
-    )
-    formatter.flush()
-
-    _STREAM_FMTS = (DefaultFormatter, JSONFormatter, JSONPrettyFormatter)
-    if not isinstance(formatter, _STREAM_FMTS):
-        return None
-
+    # "metadata" is the raw spawn-request echo, not operation state;
+    # "result" is superseded by the derived version below.
+    op_fields = {k: v for k, v in op.items() if k not in ("metadata", "result")}
+    is_default = isinstance(formatter, DefaultFormatter)
     stdout = decode_stream(instance_result.get("stdout"))
     stderr = decode_stream(instance_result.get("stderr"))
+
+    fields = {
+        **op_fields,
+        "exit_code": exit_code,
+        "image": result.get("image") or "",
+        "tag": result.get("tag") or "",
+    }
+    if not is_default:
+        # DefaultFormatter prints stdout/stderr raw below instead --
+        # embedding them here too would duplicate the captured stream.
+        fields["result"] = {**instance_result, "stdout": stdout, "stderr": stderr}
+    formatter(**fields)
+    formatter.flush()
+
+    if not is_default:
+        return None
 
     if stdout:
         sys.stdout.write(stdout)

@@ -128,6 +128,15 @@ class WaitArgs(ArgumentsProtocol):
         )
 
 
+@dataclass(frozen=True)
+class EventsArgs(ArgumentsProtocol):
+    uuids: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_args(cls, ns: argparse.Namespace) -> EventsArgs:
+        return cls(uuids=resolve_operation_uuids(list(ns.uuids or [])))
+
+
 def setup_cancel_parser(p: argparse.ArgumentParser) -> SetupResult:
     """Configure the cancel parser used by both `operation cancel` and `kill`."""
     p.add_argument(
@@ -201,6 +210,20 @@ def setup_wait_parser(p: argparse.ArgumentParser) -> SetupResult:
         ),
     )
     return cmd_wait, WaitArgs
+
+
+def setup_events_parser(p: argparse.ArgumentParser) -> SetupResult:
+    """Configure the parser for `operation events`."""
+    p.add_argument(
+        "uuids",
+        nargs="+",
+        metavar="UUID_OR_REF",
+        help=(
+            "Operations whose event log to print. Accepts UUIDs and "
+            "session-history references (HEAD, HEAD~N, @, @N, @-N, @+N, :N, bare N)."
+        ),
+    )
+    return cmd_events, EventsArgs
 
 
 def setup_list_parser(p: argparse.ArgumentParser) -> SetupResult:
@@ -315,6 +338,29 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     )
     wait_handler, wait_loader = setup_wait_parser(wait_p)
     wait_p.set_defaults(handler=wait_handler, load_args=wait_loader)
+
+    events_p = sub.add_parser(
+        "events",
+        aliases=["ev"],
+        help="Print an operation's full raw event log",
+        description=(
+            "Fetch and print every recorded event for each given operation, "
+            "one row per event via the active formatter (a table by "
+            "default; JSONL with -o json). Events are stored independently "
+            "of the operation's summarized result and are available "
+            "whether the operation is still running, finished in the "
+            "foreground, or ran detached."
+        ),
+        epilog=(
+            "for coding agents:\n"
+            "  read-only command\n"
+            "  use -o json for JSONL, one full OperationEvent per line"
+            " (id, ts, type, spid, data)\n"
+            "  useful when `show`'s result snapshot looks truncated/incomplete"
+        ),
+    )
+    events_handler, events_loader = setup_events_parser(events_p)
+    events_p.set_defaults(handler=events_handler, load_args=events_loader)
 
     return cmd_show_multi, ShowMultiArgs
 
@@ -448,6 +494,23 @@ def cmd_cancel(args: CancelArgs) -> int | None:
             logger.error("Failed to cancel %s: %s", uuid, exc)
             failed += 1
     return 1 if failed else None
+
+
+def cmd_events(args: EventsArgs) -> int | None:
+    client = CLIENT.get()
+    formatter = FORMATTER.get()
+    formatter.configure(head=("uuid", "id", "ts", "type", "spid"), tail=("data",))
+
+    exit_code = 0
+    for uuid in args.uuids:
+        try:
+            for ev in client.iter_operation_events(uuid, follow=False):
+                formatter(uuid=uuid, **ev.to_dict())
+        except ContreeAPIError as exc:
+            logger.error("Failed to fetch events for %s: %s", uuid, exc)
+            exit_code = 1
+    formatter.flush()
+    return exit_code or None
 
 
 def cmd_wait(args: WaitArgs) -> int | None:

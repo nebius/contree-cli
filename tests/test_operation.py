@@ -1,24 +1,27 @@
 from __future__ import annotations
 
+import json
 from contextvars import copy_context
 
 import pytest
 from conftest import ContreeTestClient
 from contree_client.exceptions import ContreeAPIError
-from contree_client.models import OperationResponse, OperationSummary
+from contree_client.models import OperationEvent, OperationResponse, OperationSummary
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.arguments import parser
 from contree_cli.cli.operation import (
     ACTIVE_STATUSES,
     CancelArgs,
+    EventsArgs,
     ShowMultiArgs,
     WaitArgs,
     cmd_cancel,
+    cmd_events,
     cmd_show_multi,
     cmd_wait,
 )
-from contree_cli.output import CSVFormatter, JSONFormatter
+from contree_cli.output import CSVFormatter, DefaultFormatter, JSONFormatter
 from contree_cli.session import SessionStore
 
 
@@ -283,6 +286,61 @@ class TestOperationShow:
         assert len(lines) == 3
         parsed = [_json.loads(line) for line in lines]
         assert [p["uuid"] for p in parsed] == ["op-a", "op-b", "op-c"]
+
+
+# ----------------------------------------------------------------------
+# op events
+# ----------------------------------------------------------------------
+
+
+def make_event(
+    event_id: int, event_type: str, data: dict, *, spid: int = 1
+) -> OperationEvent:
+    return OperationEvent.from_dict(
+        {
+            "id": event_id,
+            "ts": "2025-06-01T00:00:00Z",
+            "type": event_type,
+            "spid": spid,
+            "data": data,
+        }
+    )
+
+
+class TestCmdEvents:
+    def test_default_formatter_is_not_jsonl(self, contree_client, capsys):
+        """The default formatter is a table, not JSONL -- help text and
+        behavior must agree on that."""
+        contree_client.mock(
+            "iter_operation_events",
+            [make_event(1, "stdout", {"value": "hi", "encoding": "ascii"})],
+        )
+        FORMATTER.set(DefaultFormatter())
+        ctx = copy_context()
+        ctx.run(cmd_events, EventsArgs(uuids=["op-1"]))
+        out = capsys.readouterr().out
+        lines = [line for line in out.splitlines() if line.strip()]
+        assert lines
+        for line in lines:
+            with pytest.raises(json.JSONDecodeError):
+                json.loads(line)
+
+    def test_json_output_is_jsonl(self, contree_client, capsys):
+        contree_client.mock(
+            "iter_operation_events",
+            [
+                make_event(1, "stdout", {"value": "hi", "encoding": "ascii"}),
+                make_event(2, "exit", {"exit_code": 0}),
+            ],
+        )
+        FORMATTER.set(JSONFormatter())
+        ctx = copy_context()
+        ctx.run(cmd_events, EventsArgs(uuids=["op-1"]))
+        lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+        assert len(lines) == 2
+        for line in lines:
+            row = json.loads(line)
+            assert row["uuid"] == "op-1"
 
 
 # ----------------------------------------------------------------------

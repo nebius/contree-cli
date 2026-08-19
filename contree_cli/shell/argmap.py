@@ -29,6 +29,7 @@ ARG_SOURCES: dict[ArgKey, str] = {
     (("session", "wait"), "op_ids"): "operation",
     (("operation", "show"), "uuids"): "operation",
     (("operation", "cancel"), "uuids"): "operation",
+    (("operation", "events"), "uuids"): "operation",
     # Session keys.
     (("session", "use"), "session_name"): "session",
     (("session", "show"), "session_name"): "session",

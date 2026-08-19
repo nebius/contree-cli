@@ -273,9 +273,9 @@ class TestFlags:
 
 
 class TestListSorter:
-    def test_skips_nested_dict_and_list(self) -> None:
+    def test_flattens_nested_dict_and_list(self) -> None:
         out = ListSorter().order({"a": 1, "b": {"x": 1}, "c": [1, 2]})
-        assert dict(out) == {"a": 1}
+        assert dict(out) == {"a": 1, "b": '{"x": 1}', "c": "[1, 2]"}
 
     def test_unknown_fields_pass_through(self) -> None:
         out = ListSorter().order({"future": "anything", "n": 42})

@@ -26,6 +26,8 @@ Project-scoped or explicit-target commands usually do not need `-S`: `images`, `
 - Keep one mutating step per non-disposable run. Avoid chaining setup, build, and test into one history entry.
 - Use `contree -S <key> cd /path` or `run -C /path`; do not put `cd` inside shell expressions just to set the workdir.
 - Use `--disposable` only for throwaway checks. Non-disposable runs persist the resulting image in session history.
+- Piped/local stdin (`echo foo | contree run -- cat`, or a large file) is forwarded in the background, chunked, so it's not buffered in full before sending; a detached run's `-d` doesn't return until it's all been sent.
+- Ctrl-C during a foreground `run` sends SIGINT to the sandboxed process first and keeps streaming its remaining output; press it again to cancel the whole operation.
 
 ## Files
 

@@ -53,12 +53,14 @@ import functools
 import io
 import logging
 import os
+import queue
 import re
-import select
 import shlex
 import sys
+import threading
 import time
 import uuid
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
 from typing import Any
@@ -66,12 +68,17 @@ from typing import Any
 from contree_client.exceptions import ContreeAPIError
 from contree_client.models import (
     TERMINAL_STATUSES,
+    ClosableStreamRepr,
     File,
     FileSpec,
     OperationEvent,
     StreamRepr,
     decode_chunk,
     decode_stream,
+)
+from contree_client.operations import (
+    build_operation_subprocess_stdin,
+    parse_operation_subprocess_stdin,
 )
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
@@ -81,10 +88,20 @@ from contree_cli.output import (
     DefaultFormatter,
     OutputFormatter,
 )
+from contree_cli.pty_utils import PlatformStdInReader, StdInReader
 from contree_cli.session import CONTREE_CONCURRENCY, SessionStore
 from contree_cli.types import FLAGS
 
 logger = logging.getLogger(__name__)
+
+# Backend transport exceptions (httpx/urllib3/aiohttp/...) don't inherit
+# from OSError, so ContreeAPIError/OSError alone miss a lost connection.
+SIGNAL_ERRORS: tuple[type[BaseException], ...] = (
+    ContreeAPIError,
+    OSError,
+    *CliClient.retryable_errors,
+    *CliClient.nonretryable_errors,
+)
 
 EPILOG = """\
 examples:
@@ -121,33 +138,52 @@ DEFAULT_FILE_EXCLUDES = (
 )
 
 
-def _read_piped_stdin() -> bytes:
-    """Non-blocking stdin read for piped input.
+class StdinForwarder(threading.Thread):
+    """Drain a StdInReader's queue, forwarding each item to a still-open
+    operation's stdin. The queue's first item was already sent as part
+    of the spawn payload; this only forwards what comes after."""
 
-    Returns empty when stdin is a tty, not ready, or unsupported, to avoid hangs
-    in agent/CI contexts where stdin is non-tty but has no data.
-    """
+    def __init__(
+        self,
+        client: CliClient,
+        op_uuid: str,
+        source: queue.Queue[ClosableStreamRepr],
+        *,
+        spid: int = 1,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.client = client
+        self.op_uuid = op_uuid
+        self.source = source
+        self.spid = spid
+        self.error: Exception | None = None
 
-    if sys.stdin.isatty():
-        return b""
+    def send(self, sr: ClosableStreamRepr) -> None:
+        # This POST is non-idempotent and a lost response is ambiguous
+        # (contree-client docs a 504 as "may or may not have been
+        # delivered"), so it bypasses CliClient's global unsafe-retry
+        # policy here -- a blind retry could duplicate stdin content.
+        spec = build_operation_subprocess_stdin(
+            self.op_uuid, self.spid, sr.value, encoding=sr.encoding, close=sr.close
+        )
+        self.client.log_request(spec)
+        response = self.client.request(spec)
+        self.client.log_response(spec, response)
+        parse_operation_subprocess_stdin(response)
 
-    try:
-        fd = sys.stdin.fileno()
-    except (OSError, io.UnsupportedOperation):
-        fd = None
-
-    if isinstance(fd, int) and fd >= 0:
-        try:
-            ready, _, _ = select.select([fd], [], [], 0)
-        except (OSError, ValueError, TypeError):
-            return b""
-        if not ready:
-            return b""
-
-    try:
-        return sys.stdin.buffer.read()
-    except (OSError, AttributeError):
-        return b""
+    def run(self) -> None:
+        while True:
+            sr = self.source.get()
+            try:
+                self.send(sr)
+            except Exception as exc:
+                self.error = exc
+                logger.error(
+                    "stdin forwarding failed, remaining input was not sent: %s", exc
+                )
+                return
+            if sr.close:
+                return
 
 
 # Escape sequences that corrupt the terminal when replayed from captured output.
@@ -520,14 +556,23 @@ class TerminalSummary:
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
     fallback_op: dict[str, Any] | None = None
+    last_event_id: int | None = None
 
 
 def stream_events_until_close(
     client: CliClient,
     op_uuid: str,
     formatter: OutputFormatter,
+    stdin_forwarder: StdinForwarder | None = None,
+    *,
+    stop_after_forwarder: bool = False,
 ) -> TerminalSummary:
     """Stream *op_uuid* events to stdio and collect a terminal summary.
+
+    *stdin_forwarder*, if given, is started on the first event from
+    spid=1 (proof the process is registered; an earlier write 404s).
+    *stop_after_forwarder* returns once that forwarder finishes instead
+    of waiting for completion -- used by detach mode.
 
     Reconnection is the library's job: ``follow_operation_events``
     resumes dropped streams with ``Last-Event-Id`` and stops after the
@@ -545,40 +590,87 @@ def stream_events_until_close(
     detected the terminal status via a poll), the full operation
     payload is fetched once and parked on ``fallback_op``.
 
+    The first Ctrl-C (``KeyboardInterrupt``) signals the main process
+    (spid=1) with SIGINT -- mirroring a real terminal -- and resumes
+    streaming from ``last_event_id`` so the process's remaining output
+    (e.g. a trailing summary line) still gets shown, without replaying
+    what was already printed. A second Ctrl-C, or a failure to deliver
+    the first signal, cancels the whole operation and re-raises
+    ``KeyboardInterrupt`` to the caller.
+
     ``BrokenPipeError`` from a local stdio write propagates unchanged —
     it means the shell pipe closed and retrying cannot help; the
     caller cancels the op and exits.
     """
     is_default = isinstance(formatter, DefaultFormatter)
     summary = TerminalSummary()
+    sigint_sent = False
+    stdin_forwarder_started = threading.Event()
 
-    for ev in client.follow_operation_events(op_uuid):
-        match ev.type:
-            case "stdout":
-                chunk = decode_chunk(ev.data)
-                summary.stdout.extend(chunk)
-                if is_default:
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
-            case "stderr":
-                chunk = decode_chunk(ev.data)
-                summary.stderr.extend(chunk)
-                if is_default:
-                    sys.stderr.buffer.write(chunk)
-                    sys.stderr.buffer.flush()
-            case "exit":
-                # spid=1 is the main process — its exit code/timed_out
-                # drive the CLI's own exit code.
-                if ev.spid == 1:
-                    summary.exit_event = ev
-                logger.debug("event: %s", ev)
-            case "completion":
-                # Authoritative terminal frame; the library ends the
-                # stream right after yielding it.
-                summary.completion = ev
-                logger.debug("event: %s", ev)
-            case _:
-                logger.debug("event: %s", ev)
+    while True:
+        try:
+            for ev in client.follow_operation_events(
+                op_uuid, last_event_id=summary.last_event_id
+            ):
+                if (
+                    stdin_forwarder is not None
+                    and ev.spid == 1
+                    and not stdin_forwarder_started.is_set()
+                ):
+                    stdin_forwarder_started.set()
+                    stdin_forwarder.start()
+                    if stop_after_forwarder:
+                        stdin_forwarder.join()
+                        return summary
+                summary.last_event_id = ev.id
+                match ev.type:
+                    case "stdout":
+                        chunk = decode_chunk(ev.data)
+                        summary.stdout.extend(chunk)
+                        if is_default:
+                            sys.stdout.buffer.write(chunk)
+                            sys.stdout.buffer.flush()
+                    case "stderr":
+                        chunk = decode_chunk(ev.data)
+                        summary.stderr.extend(chunk)
+                        if is_default:
+                            sys.stderr.buffer.write(chunk)
+                            sys.stderr.buffer.flush()
+                    case "exit":
+                        # spid=1 is the main process — its exit code/timed_out
+                        # drive the CLI's own exit code.
+                        if ev.spid == 1:
+                            summary.exit_event = ev
+                        logger.debug("event: %s", ev)
+                    case "completion":
+                        # Authoritative terminal frame; the library ends the
+                        # stream right after yielding it.
+                        summary.completion = ev
+                        logger.debug("event: %s", ev)
+                    case _:
+                        logger.debug("event: %s", ev)
+            break
+        except KeyboardInterrupt as interrupt:
+            if not sigint_sent:
+                try:
+                    client.operation_subprocess_kill(op_uuid, spid=1, signal="INT")
+                except SIGNAL_ERRORS:
+                    pass  # can't signal the process; hard-cancel below
+                else:
+                    sigint_sent = True
+                    logger.info(
+                        "Sent SIGINT to operation %s; waiting for it to exit"
+                        " (Ctrl-C again to force-cancel)",
+                        op_uuid,
+                    )
+                    continue
+            # Either the signal itself failed, or this is a second
+            # Ctrl-C after it was already sent: give up and tear down
+            # the whole operation.
+            with contextlib.suppress(KeyboardInterrupt, *SIGNAL_ERRORS):
+                client.cancel_operation(op_uuid)
+                logger.info("Cancelled operation %s", op_uuid)
+            raise interrupt from None
 
     if summary.completion is None:
         # The stream ended via the terminal-status probe; fetch the op
@@ -714,6 +806,9 @@ def _display_operation(
             sys.stderr.write("\n")
 
 
+STDIN_FIRST_CHUNK_TIMEOUT = 0.05  # how long cmd_run waits before spawning anyway
+
+
 def cmd_run(args: RunArgs) -> int | None:
     client = CLIENT.get()
     formatter = FORMATTER.get()
@@ -784,161 +879,203 @@ def cmd_run(args: RunArgs) -> int | None:
         else:
             payload["args"] = ["-s"]
 
-    # Read piped stdin (skip if shebang already set it)
+    # Read piped/local stdin (skip if shebang already set it). Whatever's
+    # available within STDIN_FIRST_CHUNK_TIMEOUT decides the spawn
+    # payload; any more is forwarded after spawn via StdinForwarder.
+    reader_cm: AbstractContextManager[PlatformStdInReader | None] = (
+        contextlib.nullcontext(None)
+    )
     if "stdin" not in payload:
-        stdin_data = _read_piped_stdin()
-        if stdin_data:
-            payload["stdin"] = StreamRepr.from_bytes(stdin_data)
-            logger.debug("Piped stdin: %d bytes", len(stdin_data))
-        elif not sys.stdin.isatty():
-            logger.debug("No piped stdin available; skipping read")
-
-    command = str(payload.pop("command"))
-    image = str(payload.pop("image"))
-    raw_files = payload.pop("files", None)
-    if isinstance(raw_files, dict) and raw_files:
-        payload["files"] = {
-            path: FileSpec.from_dict(spec) for path, spec in raw_files.items()
-        }
-
-    spawn_response = client.spawn_instance(command, image, **payload)  # type: ignore[arg-type]
-    op = spawn_response.to_dict()
-    op_uuid = str(op["uuid"])
-
-    logger.debug("Spawned operation %s", op_uuid)
-
-    if args.detach:
-        pending_key = ("", f"ops:{store.session_key}")
-        existing = store.cache.get(pending_key) or []
-
-        def _norm(item: object) -> dict[str, object]:
-            if isinstance(item, dict) and "op" in item:
-                return {
-                    "op": str(item.get("op", "")),
-                    "title": str(item.get("title", "")),
-                    "disposable": bool(item.get("disposable", False)),
-                }
-            return {"op": str(item), "title": "", "disposable": False}
-
-        normalized = [_norm(x) for x in existing] if isinstance(existing, list) else []
-        if args.disposable:
-            branch_name = store.create_disposable_branch(
-                op_uuid, " ".join(args.command_args)
-            )
-        else:
-            branch_name = store.create_detached_branch(
-                op_uuid, " ".join(args.command_args)
-            )
-        normalized.append(
-            {
-                "op": op_uuid,
-                "title": " ".join(args.command_args),
-                "disposable": bool(args.disposable),
-                "branch": branch_name,
-            }
-        )
-        store.cache[pending_key] = normalized
-
-    # 4. Detach mode - exit immediately
-    if args.detach:
-        formatter.configure(tail=("error",))
-        formatter(**{"uuid": op_uuid, "status": "PENDING", **op})
-        formatter.flush()
-        return None
-
-    # 5. Stream events (follow=1) — write stdout/stderr to stdtio as they
-    # come, log other events at debug, accumulate the terminal frame.
-    store = SESSION_STORE.get()
-    try:
-        summary = stream_events_until_close(client, op_uuid, formatter)
-        if summary.completion is not None:
-            # Authoritative terminal frame from the server — build the
-            # full op dict from the SSE events themselves, no GET.
-            op = build_op_from_summary(op_uuid, summary)
-        elif summary.fallback_op is not None:
-            # SSE couldn't deliver `completion`, but a GET between
-            # retries confirmed the op is terminal — use that dict.
-            op = summary.fallback_op
-        else:
-            # Safety net: streamer normally loops until either
-            # completion or a terminal GET, so this path is only hit
-            # in tests where the stub queue drains early.
-            op = client.get_operation_status(op_uuid).to_dict()
-        cache_key = (op_uuid, "operation")
-        store.cache[cache_key] = op
-    except KeyboardInterrupt:
         try:
-            client.cancel_operation(op_uuid)
-            logger.info("Cancelled operation %s", op_uuid)
-        except (ContreeAPIError, KeyboardInterrupt, OSError):
-            pass
-        raise
-    except BrokenPipeError:
-        # Local stdout/stderr was closed (e.g. `contree run | head`).
-        # Cancel the op, silence further stdio writes, then exit 141
-        # so callers see the SIGPIPE convention (128 + 13).
-        with contextlib.suppress(ContreeAPIError, OSError):
-            client.cancel_operation(op_uuid)
-        with contextlib.suppress(OSError):
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
-            os.close(devnull)
-        raise SystemExit(141) from None
+            stdin_fd = sys.stdin.fileno()
+        except (OSError, io.UnsupportedOperation, TypeError):
+            stdin_fd = -1
+        if not isinstance(stdin_fd, int):
+            stdin_fd = -1
+        reader_cm = StdInReader(fd=stdin_fd)
 
-    # 6. Cache terminal operation result
-    store.cache[(op_uuid, "operation")] = op
+    open_pipe = False
+    with reader_cm as reader:
+        if reader is not None:
+            try:
+                first = reader.queue.get(timeout=STDIN_FIRST_CHUNK_TIMEOUT)
+            except queue.Empty:
+                payload["stdin"] = ClosableStreamRepr(
+                    value="", encoding="ascii", close=False
+                )
+                open_pipe = True
+            else:
+                if not first.close:
+                    payload["stdin"] = first
+                    open_pipe = True
 
-    metadata = op.get("metadata") or {}
-    assert isinstance(metadata, dict)
-    instance_result = metadata.get("result") or {}
-    assert isinstance(instance_result, dict)
-    state = instance_result.get("state") or {}
-    assert isinstance(state, dict)
-    timed_out = bool(state.get("timed_out"))
+        command = str(payload.pop("command"))
+        image = str(payload.pop("image"))
+        raw_files = payload.pop("files", None)
+        if isinstance(raw_files, dict) and raw_files:
+            payload["files"] = {
+                path: FileSpec.from_dict(spec) for path, spec in raw_files.items()
+            }
 
-    if timed_out:
-        logger.warning(
-            "Operation %s timed out after %ss",
-            op_uuid,
-            args.timeout if args.timeout is not None else "?",
-        )
-    elif op["status"] != "SUCCESS":
-        logger.fatal(
-            "Operation %s ended with status %s%s",
-            op_uuid,
-            op["status"],
-            f": {op['error']}" if op.get("error") else "",
-        )
+        spawn_response = client.spawn_instance(command, image, **payload)  # type: ignore[arg-type]
+        op = spawn_response.to_dict()
+        op_uuid = str(op["uuid"])
 
-    # 7. Display result
-    _display_operation(op, formatter, live_streamed=summary.completion is not None)
+        logger.debug("Spawned operation %s", op_uuid)
 
-    result = op.get("result") or {}
-    assert isinstance(result, dict)
-    new_image = result.get("image")
-    if new_image and op["status"] == "SUCCESS":
-        logger.debug("New image: %s", new_image)
-        if not args.disposable:
-            title = " ".join(args.command_args) if args.command_args else ""
-            store.set_image(
-                str(new_image),
-                kind="run",
-                title=title,
-                operation_uuid=op_uuid,
+        forwarder: StdinForwarder | None = None
+        if open_pipe:
+            assert reader is not None
+            forwarder = StdinForwarder(client, op_uuid, reader.queue)
+
+        if args.detach:
+            pending_key = ("", f"ops:{store.session_key}")
+            existing = store.cache.get(pending_key) or []
+
+            def norm(item: object) -> dict[str, object]:
+                if isinstance(item, dict) and "op" in item:
+                    return {
+                        "op": str(item.get("op", "")),
+                        "title": str(item.get("title", "")),
+                        "disposable": bool(item.get("disposable", False)),
+                    }
+                return {"op": str(item), "title": "", "disposable": False}
+
+            normalized = (
+                [norm(x) for x in existing] if isinstance(existing, list) else []
             )
-            if args.preserve_env:
-                env_dict = store.get_env()
-                for item in args.env:
-                    key, _, value = item.partition("=")
-                    env_dict[key] = value
-                store.cache[(str(new_image), "preserved_env")] = env_dict
-        else:
-            title = " ".join(args.command_args) if args.command_args else ""
-            store.create_disposable_branch(op_uuid, title)
+            if args.disposable:
+                branch_name = store.create_disposable_branch(
+                    op_uuid, " ".join(args.command_args)
+                )
+            else:
+                branch_name = store.create_detached_branch(
+                    op_uuid, " ".join(args.command_args)
+                )
+            normalized.append(
+                {
+                    "op": op_uuid,
+                    "title": " ".join(args.command_args),
+                    "disposable": bool(args.disposable),
+                    "branch": branch_name,
+                }
+            )
+            store.cache[pending_key] = normalized
 
-    exit_code = state.get("exit_code")
-    if isinstance(exit_code, int):
-        return exit_code
-    if op["status"] != "SUCCESS":
-        return 1
-    return None
+        # 4. Detach mode - exit immediately, but only once local stdin has
+        # actually been sent.
+        if args.detach:
+            if forwarder is not None:
+                stream_events_until_close(
+                    client, op_uuid, formatter, forwarder, stop_after_forwarder=True
+                )
+                if forwarder.error is not None:
+                    logger.warning(
+                        "stdin delivery to %s may be incomplete: %s",
+                        op_uuid,
+                        forwarder.error,
+                    )
+                # Spawn response has no status field; re-fetch rather than
+                # assume PENDING, since sending stdin may have taken a while.
+                op = client.get_operation_status(op_uuid).to_dict()
+                formatter.configure(tail=("error",))
+                formatter(**op)
+            else:
+                formatter.configure(tail=("error",))
+                formatter(**{"uuid": op_uuid, "status": "PENDING", **op})
+            formatter.flush()
+            return None
+
+        # 5. Stream events (follow=1) -- write stdout/stderr to stdtio as they
+        # come, log other events at debug, accumulate the terminal frame.
+        store = SESSION_STORE.get()
+        try:
+            summary = stream_events_until_close(client, op_uuid, formatter, forwarder)
+            if forwarder is not None and forwarder.error is not None:
+                logger.warning(
+                    "stdin delivery to %s may be incomplete: %s",
+                    op_uuid,
+                    forwarder.error,
+                )
+            if summary.completion is not None:
+                # Authoritative terminal frame from the server -- build the
+                # full op dict from the SSE events themselves, no GET.
+                op = build_op_from_summary(op_uuid, summary)
+            elif summary.fallback_op is not None:
+                # SSE couldn't deliver `completion`, but a GET between
+                # retries confirmed the op is terminal -- use that dict.
+                op = summary.fallback_op
+            else:
+                # Safety net: streamer normally loops until either
+                # completion or a terminal GET, so this path is only hit
+                # in tests where the stub queue drains early.
+                op = client.get_operation_status(op_uuid).to_dict()
+        except BrokenPipeError:
+            # Local stdout/stderr was closed (e.g. `contree run | head`).
+            # Cancel the op, silence further stdio writes, then exit 141
+            # so callers see the SIGPIPE convention (128 + 13).
+            with contextlib.suppress(ContreeAPIError, OSError):
+                client.cancel_operation(op_uuid)
+            with contextlib.suppress(OSError):
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, sys.stdout.fileno())
+                os.close(devnull)
+            raise SystemExit(141) from None
+
+        # 6. Cache terminal operation result
+        store.cache[(op_uuid, "operation")] = op
+
+        metadata = op.get("metadata") or {}
+        assert isinstance(metadata, dict)
+        instance_result = metadata.get("result") or {}
+        assert isinstance(instance_result, dict)
+        state = instance_result.get("state") or {}
+        assert isinstance(state, dict)
+        timed_out = bool(state.get("timed_out"))
+
+        if timed_out:
+            logger.warning(
+                "Operation %s timed out after %ss",
+                op_uuid,
+                args.timeout if args.timeout is not None else "?",
+            )
+        elif op["status"] != "SUCCESS":
+            logger.fatal(
+                "Operation %s ended with status %s%s",
+                op_uuid,
+                op["status"],
+                f": {op['error']}" if op.get("error") else "",
+            )
+
+        # 7. Display result
+        _display_operation(op, formatter, live_streamed=summary.completion is not None)
+
+        result = op.get("result") or {}
+        assert isinstance(result, dict)
+        new_image = result.get("image")
+        if new_image and op["status"] == "SUCCESS":
+            logger.debug("New image: %s", new_image)
+            if not args.disposable:
+                title = " ".join(args.command_args) if args.command_args else ""
+                store.set_image(
+                    str(new_image),
+                    kind="run",
+                    title=title,
+                    operation_uuid=op_uuid,
+                )
+                if args.preserve_env:
+                    env_dict = store.get_env()
+                    for item in args.env:
+                        key, _, value = item.partition("=")
+                        env_dict[key] = value
+                    store.cache[(str(new_image), "preserved_env")] = env_dict
+            else:
+                title = " ".join(args.command_args) if args.command_args else ""
+                store.create_disposable_branch(op_uuid, title)
+
+        exit_code = state.get("exit_code")
+        if isinstance(exit_code, int):
+            return exit_code
+        if op["status"] != "SUCCESS":
+            return 1
+        return None

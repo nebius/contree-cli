@@ -43,7 +43,7 @@ from contree_cli.config import (
     Config,
     Profile,
 )
-from contree_cli.types import FLAGS
+from contree_cli.types import FLAGS, ask
 
 logger = logging.getLogger(__name__)
 PROFILE_CHECK_TIMEOUT = 2.0
@@ -208,10 +208,13 @@ def cmd_auth(args: AuthArgs) -> int | None:
     )
 
     if exists and not args.force:
-        answer = input(
-            f"Profile {args.profile!r} already exists. Overwrite? [y/N] ",
+        answer = ask(
+            f"Profile {args.profile!r} already exists. Overwrite?",
+            "y",
+            "n",
+            default="n",
         )
-        if answer.lower() != "y":
+        if answer != "y":
             print("Aborted.")
             return 1
 
@@ -363,8 +366,8 @@ def cmd_remove(args: RemoveArgs) -> int | None:
         logger.error("Profile %r does not exist", args.profile_name)
         return 1
     if not args.force:
-        answer = input(f"Remove profile {args.profile_name!r}? [y/N] ")
-        if answer.lower() != "y":
+        answer = ask(f"Remove profile {args.profile_name!r}?", "y", "n", default="n")
+        if answer != "y":
             print("Aborted.")
             return 1
     del cfg[args.profile_name]
