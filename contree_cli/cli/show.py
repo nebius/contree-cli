@@ -94,27 +94,25 @@ def cmd_show(args: ShowArgs) -> int | None:
     # "metadata" is the raw spawn-request echo, not operation state;
     # "result" is superseded by the derived version below.
     op_fields = {k: v for k, v in op.items() if k not in ("metadata", "result")}
-
-    formatter(
-        **{
-            **op_fields,
-            "exit_code": exit_code,
-            "image": result.get("image") or "",
-            "tag": result.get("tag") or "",
-            "result": {
-                **instance_result,
-                "stdout": decode_stream(instance_result.get("stdout")),
-                "stderr": decode_stream(instance_result.get("stderr")),
-            },
-        }
-    )
-    formatter.flush()
-
-    if not isinstance(formatter, DefaultFormatter):
-        return None
-
+    is_default = isinstance(formatter, DefaultFormatter)
     stdout = decode_stream(instance_result.get("stdout"))
     stderr = decode_stream(instance_result.get("stderr"))
+
+    fields = {
+        **op_fields,
+        "exit_code": exit_code,
+        "image": result.get("image") or "",
+        "tag": result.get("tag") or "",
+    }
+    if not is_default:
+        # DefaultFormatter prints stdout/stderr raw below instead --
+        # embedding them here too would duplicate the captured stream.
+        fields["result"] = {**instance_result, "stdout": stdout, "stderr": stderr}
+    formatter(**fields)
+    formatter.flush()
+
+    if not is_default:
+        return None
 
     if stdout:
         sys.stdout.write(stdout)

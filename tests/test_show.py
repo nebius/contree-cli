@@ -211,6 +211,8 @@ class TestCmdShow:
 
 class TestShowStdout:
     def test_stdout_base64(self, contree_client, capsys, session_store):
+        """Default formatter prints the captured stream exactly once --
+        not once raw and once again embedded in a flattened column."""
         _run_cmd(
             contree_client,
             _make_op(stdout=_b64_stream("hello\n")),
@@ -218,7 +220,7 @@ class TestShowStdout:
             store=session_store,
         )
         out = capsys.readouterr().out
-        assert "hello\n" in out
+        assert out.count("hello\n") == 1
 
     def test_stdout_ascii(self, contree_client, capsys, session_store):
         _run_cmd(
@@ -228,7 +230,7 @@ class TestShowStdout:
             store=session_store,
         )
         out = capsys.readouterr().out
-        assert "world\n" in out
+        assert out.count("world\n") == 1
 
     def test_stdout_no_trailing_newline(self, contree_client, capsys, session_store):
         _run_cmd(
@@ -262,7 +264,7 @@ class TestShowStderr:
             store=session_store,
         )
         err = capsys.readouterr().err
-        assert "error msg\n" in err
+        assert err.count("error msg\n") == 1
 
     def test_stderr_no_trailing_newline(self, contree_client, capsys, session_store):
         _run_cmd(
@@ -285,8 +287,8 @@ class TestShowStderr:
             store=session_store,
         )
         captured = capsys.readouterr()
-        assert "out" in captured.out
-        assert "err" in captured.err
+        assert captured.out.count("out") == 1
+        assert captured.err.count("err") == 1
 
 
 class TestShowJSONStdout:
