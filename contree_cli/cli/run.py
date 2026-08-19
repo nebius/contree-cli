@@ -76,6 +76,10 @@ from contree_client.models import (
     decode_chunk,
     decode_stream,
 )
+from contree_client.operations import (
+    build_operation_subprocess_stdin,
+    parse_operation_subprocess_stdin,
+)
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
 from contree_cli.client import CliClient
@@ -143,11 +147,20 @@ class StdinForwarder(threading.Thread):
         self.op_uuid = op_uuid
         self.source = source
         self.spid = spid
+        self.error: Exception | None = None
 
     def send(self, sr: ClosableStreamRepr) -> None:
-        self.client.operation_subprocess_stdin(
+        # This POST is non-idempotent and a lost response is ambiguous
+        # (contree-client docs a 504 as "may or may not have been
+        # delivered"), so it bypasses CliClient's global unsafe-retry
+        # policy here -- a blind retry could duplicate stdin content.
+        spec = build_operation_subprocess_stdin(
             self.op_uuid, self.spid, sr.value, encoding=sr.encoding, close=sr.close
         )
+        self.client.log_request(spec)
+        response = self.client.request(spec)
+        self.client.log_response(spec, response)
+        parse_operation_subprocess_stdin(response)
 
     def run(self) -> None:
         while True:
@@ -155,7 +168,10 @@ class StdinForwarder(threading.Thread):
             try:
                 self.send(sr)
             except Exception as exc:
-                logger.debug("stdin forward stopped: %s", exc)
+                self.error = exc
+                logger.error(
+                    "stdin forwarding failed, remaining input was not sent: %s", exc
+                )
                 return
             if sr.close:
                 return
@@ -948,6 +964,12 @@ def cmd_run(args: RunArgs) -> int | None:
                 stream_events_until_close(
                     client, op_uuid, formatter, forwarder, stop_after_forwarder=True
                 )
+                if forwarder.error is not None:
+                    logger.warning(
+                        "stdin delivery to %s may be incomplete: %s",
+                        op_uuid,
+                        forwarder.error,
+                    )
                 # Spawn response has no status field; re-fetch rather than
                 # assume PENDING, since sending stdin may have taken a while.
                 op = client.get_operation_status(op_uuid).to_dict()
@@ -964,6 +986,12 @@ def cmd_run(args: RunArgs) -> int | None:
         store = SESSION_STORE.get()
         try:
             summary = stream_events_until_close(client, op_uuid, formatter, forwarder)
+            if forwarder is not None and forwarder.error is not None:
+                logger.warning(
+                    "stdin delivery to %s may be incomplete: %s",
+                    op_uuid,
+                    forwarder.error,
+                )
             if summary.completion is not None:
                 # Authoritative terminal frame from the server -- build the
                 # full op dict from the SSE events themselves, no GET.

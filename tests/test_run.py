@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import queue
 from contextvars import copy_context
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +17,7 @@ from contree_client.exceptions import (
     SSEStreamError,
 )
 from contree_client.models import (
+    ClosableStreamRepr,
     File,
     FileResponse,
     InstanceSpawnResponse,
@@ -27,6 +29,7 @@ from contree_client.models import (
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.cli.run import (
     RunArgs,
+    StdinForwarder,
     TerminalSummary,
     _expand_mapped_files,
     _is_excluded,
@@ -1510,7 +1513,35 @@ class TestPendingFileInclusion:
         assert "/a.txt" in body["files"]
 
 
-# ── Stdin passthrough ────────────────────────────────────────────────────
+# --- Stdin forwarder ---
+
+
+class TestStdinForwarder:
+    def test_ambiguous_failure_is_not_retried(self):
+        """A 504 on the non-idempotent stdin POST is ambiguous (may or
+        may not have been delivered) -- retrying it can duplicate data,
+        so a single failed attempt must stop forwarding, not retry."""
+        tc = ContreeTestClient()
+        tc.respond_raw(status=504, body=b'{"error": "timeout"}')
+        q: queue.Queue[ClosableStreamRepr] = queue.Queue()
+        q.put(ClosableStreamRepr(value="aGk=", encoding="base64", close=False))
+        forwarder = StdinForwarder(tc, "op-1", q)
+        forwarder.run()
+        assert forwarder.error is not None
+        assert len(tc.raw_requests) == 1
+
+    def test_success_does_not_touch_raw_client(self):
+        tc = ContreeTestClient()
+        tc.respond_raw(status=200)
+        q: queue.Queue[ClosableStreamRepr] = queue.Queue()
+        q.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
+        forwarder = StdinForwarder(tc, "op-1", q)
+        forwarder.run()
+        assert forwarder.error is None
+        assert len(tc.raw_requests) == 1
+
+
+# --- Stdin passthrough ---
 
 
 class TestStdinPassthrough:
