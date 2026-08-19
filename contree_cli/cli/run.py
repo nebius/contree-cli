@@ -94,6 +94,15 @@ from contree_cli.types import FLAGS
 
 logger = logging.getLogger(__name__)
 
+# Backend transport exceptions (httpx/urllib3/aiohttp/...) don't inherit
+# from OSError, so ContreeAPIError/OSError alone miss a lost connection.
+SIGNAL_ERRORS: tuple[type[BaseException], ...] = (
+    ContreeAPIError,
+    OSError,
+    *CliClient.retryable_errors,
+    *CliClient.nonretryable_errors,
+)
+
 EPILOG = """\
 examples:
   contree use ubuntu && contree run -- uname -a
@@ -645,7 +654,7 @@ def stream_events_until_close(
             if not sigint_sent:
                 try:
                     client.operation_subprocess_kill(op_uuid, spid=1, signal="INT")
-                except (ContreeAPIError, OSError):
+                except SIGNAL_ERRORS:
                     pass  # can't signal the process; hard-cancel below
                 else:
                     sigint_sent = True
@@ -658,7 +667,7 @@ def stream_events_until_close(
             # Either the signal itself failed, or this is a second
             # Ctrl-C after it was already sent: give up and tear down
             # the whole operation.
-            with contextlib.suppress(ContreeAPIError, KeyboardInterrupt, OSError):
+            with contextlib.suppress(KeyboardInterrupt, *SIGNAL_ERRORS):
                 client.cancel_operation(op_uuid)
                 logger.info("Cancelled operation %s", op_uuid)
             raise interrupt from None

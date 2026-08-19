@@ -26,6 +26,7 @@ from contree_client.models import (
     StreamRepr,
 )
 
+import contree_cli.cli.run as run_module
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.cli.run import (
     RunArgs,
@@ -518,6 +519,34 @@ class TestCtrlC:
                 _spawn_response(),
                 ("iter_operation_events", KeyboardInterrupt()),
                 ("operation_subprocess_kill", NotFoundError(404, "not found")),
+                ("cancel_operation", None),
+            ],
+            session_store,
+        )
+        assert len(tc.calls_for("operation_subprocess_kill")) == 1
+        cancels = tc.calls_for("cancel_operation")
+        assert len(cancels) == 1
+        assert cancels[0].args == ("op-1",)
+
+    def test_non_oserror_transport_error_still_escalates(
+        self, session_store, monkeypatch
+    ):
+        """A backend transport error (httpx/urllib3/... none of which
+        inherit from OSError) must still hit the hard-cancel fallback
+        instead of escaping to main() as an unhandled network error."""
+
+        class FakeTransportTimeout(Exception):
+            pass
+
+        monkeypatch.setattr(
+            "contree_cli.cli.run.SIGNAL_ERRORS",
+            (*run_module.SIGNAL_ERRORS, FakeTransportTimeout),
+        )
+        tc = self._run_ctrl_c(
+            [
+                _spawn_response(),
+                ("iter_operation_events", KeyboardInterrupt()),
+                ("operation_subprocess_kill", FakeTransportTimeout()),
                 ("cancel_operation", None),
             ],
             session_store,
