@@ -342,18 +342,20 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
     events_p = sub.add_parser(
         "events",
         aliases=["ev"],
-        help="Print an operation's full raw event log (JSONL)",
+        help="Print an operation's full raw event log",
         description=(
-            "Fetch and print every recorded event for each given operation "
-            "as JSONL (one event object per line). Events are stored "
-            "independently of the operation's summarized result and are "
-            "available whether the operation is still running, finished "
-            "in the foreground, or ran detached."
+            "Fetch and print every recorded event for each given operation, "
+            "one row per event via the active formatter (a table by "
+            "default; JSONL with -o json). Events are stored independently "
+            "of the operation's summarized result and are available "
+            "whether the operation is still running, finished in the "
+            "foreground, or ran detached."
         ),
         epilog=(
             "for coding agents:\n"
             "  read-only command\n"
-            "  each line is a full OperationEvent (id, ts, type, spid, data)\n"
+            "  use -o json for JSONL, one full OperationEvent per line"
+            " (id, ts, type, spid, data)\n"
             "  useful when `show`'s result snapshot looks truncated/incomplete"
         ),
     )
