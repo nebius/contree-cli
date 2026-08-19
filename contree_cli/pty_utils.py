@@ -7,11 +7,13 @@ stdout/stderr too.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import queue
 import sys
 import threading
+import time
 from abc import ABC, abstractmethod
 from types import TracebackType
 
@@ -23,6 +25,9 @@ log = logging.getLogger(__name__)
 class PlatformStdInReader(threading.Thread, ABC):
     """Publishes ClosableStreamRepr items to its queue; the final item
     always has close=True."""
+
+    STOP_POLL = 0.05
+    STOP_TIMEOUT = 2.0
 
     def __init__(self, maxsize: int = 16, fd: int = 0) -> None:
         super().__init__(daemon=True)
@@ -41,9 +46,26 @@ class PlatformStdInReader(threading.Thread, ABC):
     ) -> None:
         self.stop()
 
-    @abstractmethod
     def stop(self) -> None:
-        """Block until the read loop has actually exited."""
+        """Unblock queue waiters; doesn't guarantee the read itself exited."""
+        self.request_stop()
+        deadline = time.monotonic() + self.STOP_TIMEOUT
+        while self.is_alive() and time.monotonic() < deadline:
+            with contextlib.suppress(queue.Empty):
+                self.queue.get(timeout=self.STOP_POLL)
+        self.join(timeout=self.STOP_POLL)
+        with contextlib.suppress(queue.Full):
+            self.queue.put_nowait(
+                ClosableStreamRepr(value="", encoding="ascii", close=True)
+            )
+        self.cleanup()
+
+    def cleanup(self) -> None:
+        """No-op by default; overridden where stop() needs extra teardown."""
+
+    @abstractmethod
+    def request_stop(self) -> None:
+        """Ask the read loop to stop attempting new reads."""
 
     @abstractmethod
     def run(self) -> None: ...
@@ -66,9 +88,8 @@ if sys.platform == "win32":
             super().__init__(maxsize=maxsize, fd=fd)
             self.stop_event = threading.Event()
 
-        def stop(self) -> None:
+        def request_stop(self) -> None:
             self.stop_event.set()
-            self.join()
 
         def run(self) -> None:
             if os.isatty(self.fd):
@@ -135,9 +156,10 @@ else:
             super().__init__(maxsize=maxsize, fd=fd)
             self.wake_r, self.wake_w = os.pipe()
 
-        def stop(self) -> None:
+        def request_stop(self) -> None:
             os.write(self.wake_w, b"x")
-            self.join()
+
+        def cleanup(self) -> None:
             os.close(self.wake_r)
             os.close(self.wake_w)
 
