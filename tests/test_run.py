@@ -1569,6 +1569,18 @@ class TestStdinForwarder:
         assert forwarder.error is None
         assert len(tc.raw_requests) == 1
 
+    def test_abandon_drops_pending_item_instead_of_sending(self):
+        """Regression: a close frame arriving after the operation is
+        already terminal must not reach the API (would 409)."""
+        tc = ContreeTestClient()
+        q: queue.Queue[ClosableStreamRepr] = queue.Queue()
+        q.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
+        forwarder = StdinForwarder(tc, "op-1", q)
+        forwarder.abandon()
+        forwarder.run()
+        assert forwarder.error is None
+        assert tc.raw_requests == []
+
 
 # --- Stdin passthrough ---
 
@@ -2422,6 +2434,32 @@ class TestStreamEventsUntilClose:
         # GET (BrokenPipeError bypasses the retry path entirely).
         assert len(tc.calls_for("iter_operation_events")) == 1
         assert tc.calls_for("get_operation_status") == []
+
+    def test_abandons_forwarder_on_normal_completion(self):
+        """Regression: a fast operation that never reads local stdin
+        still leaves the forwarder waiting on its queue. The reader's
+        own shutdown later pushes a close frame through that same
+        queue -- once the op is terminal, the forwarder must drop it
+        instead of POSTing to an operation that's already SUCCESS."""
+        tc = ContreeTestClient()
+        tc.mock(
+            "iter_operation_events",
+            [
+                stream_event("stdout", "hi", event_id=1),
+                completion_event(event_id=2),
+            ],
+        )
+        q: queue.Queue[ClosableStreamRepr] = queue.Queue()
+        forwarder = StdinForwarder(tc, "op-1", q)
+        summary = stream_events_until_close(tc, "op-1", DefaultFormatter(), forwarder)
+        assert summary.completion is not None
+        assert forwarder.abandoned.is_set()
+
+        q.put(ClosableStreamRepr(value="", encoding="ascii", close=True))
+        forwarder.join(timeout=1)
+        assert not forwarder.is_alive()
+        assert forwarder.error is None
+        assert tc.raw_requests == []
 
     def test_stop_after_forwarder_does_not_wait_for_more_events(self):
         """Detach mode must return once the forwarder finishes, without

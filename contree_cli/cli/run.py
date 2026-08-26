@@ -157,6 +157,11 @@ class StdinForwarder(threading.Thread):
         self.source = source
         self.spid = spid
         self.error: Exception | None = None
+        self.abandoned = threading.Event()
+
+    def abandon(self) -> None:
+        """Drop further queue items instead of sending them to a terminal operation."""
+        self.abandoned.set()
 
     def send(self, sr: ClosableStreamRepr) -> None:
         # This POST is non-idempotent and a lost response is ambiguous
@@ -174,6 +179,8 @@ class StdinForwarder(threading.Thread):
     def run(self) -> None:
         while True:
             sr = self.source.get()
+            if self.abandoned.is_set():
+                return
             try:
                 self.send(sr)
             except Exception as exc:
@@ -649,6 +656,8 @@ def stream_events_until_close(
                         logger.debug("event: %s", ev)
                     case _:
                         logger.debug("event: %s", ev)
+            if stdin_forwarder is not None:
+                stdin_forwarder.abandon()
             break
         except KeyboardInterrupt as interrupt:
             if not sigint_sent:
@@ -667,6 +676,8 @@ def stream_events_until_close(
             # Either the signal itself failed, or this is a second
             # Ctrl-C after it was already sent: give up and tear down
             # the whole operation.
+            if stdin_forwarder is not None:
+                stdin_forwarder.abandon()
             with contextlib.suppress(KeyboardInterrupt, *SIGNAL_ERRORS):
                 client.cancel_operation(op_uuid)
                 logger.info("Cancelled operation %s", op_uuid)
@@ -1014,6 +1025,8 @@ def cmd_run(args: RunArgs) -> int | None:
             # Local stdout/stderr was closed (e.g. `contree run | head`).
             # Cancel the op, silence further stdio writes, then exit 141
             # so callers see the SIGPIPE convention (128 + 13).
+            if forwarder is not None:
+                forwarder.abandon()
             with contextlib.suppress(ContreeAPIError, OSError):
                 client.cancel_operation(op_uuid)
             with contextlib.suppress(OSError):
