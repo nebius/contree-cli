@@ -2,6 +2,7 @@ import configparser
 import os
 import stat
 import sys
+from pathlib import Path
 
 import pytest
 from contree_client.profiles import (
@@ -476,3 +477,27 @@ class TestDefaultContreeHome:
         xdg = get_default_path("XDG_CONFIG_HOME", "~/.config")
         home = get_default_path("CONTREE_HOME", xdg / "contree")
         assert home == tmp_path / "explicit"
+
+
+# ---------------------------------------------------------------------------
+# session_db_path respects CONTREE_SESSION_DB
+# ---------------------------------------------------------------------------
+
+
+class TestSessionDbPath:
+    def test_default_path_is_per_profile(self, config_dir, monkeypatch):
+        monkeypatch.delenv("CONTREE_SESSION_DB", raising=False)
+        path = config_mod.session_db_path("default")
+        assert path == config_mod.CONTREE_HOME / "cli" / "sessions" / "default.db"
+
+    def test_env_var_overrides_computed_path(self, config_dir, tmp_path, monkeypatch):
+        override = tmp_path / "custom.db"
+        monkeypatch.setenv("CONTREE_SESSION_DB", str(override))
+        assert config_mod.session_db_path("default") == override
+
+    def test_env_var_expands_user(self, config_dir, monkeypatch):
+        monkeypatch.setenv("CONTREE_SESSION_DB", "~/custom-session.db")
+        assert (
+            config_mod.session_db_path("default")
+            == Path("~/custom-session.db").expanduser()
+        )
