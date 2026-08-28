@@ -78,7 +78,13 @@ EDITOR = (
 
 
 def session_db_path(profile_name: str) -> Path:
-    """Per-profile session database location (CLI-owned layout)."""
+    """Per-profile session database location (CLI-owned layout).
+
+    ``CONTREE_SESSION_DB`` overrides the computed path entirely.
+    """
+    override = os.getenv("CONTREE_SESSION_DB")
+    if override:
+        return Path(override).expanduser()
     return CONTREE_HOME / "cli" / "sessions" / f"{profile_name}.db"
 
 
