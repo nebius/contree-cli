@@ -14,7 +14,7 @@ import logging
 import posixpath
 from dataclasses import dataclass
 
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 
 from contree_cli import CLIENT, SESSION_STORE, ArgumentsProtocol, SetupResult
 
@@ -64,7 +64,7 @@ def cmd_cd(args: CdArgs) -> int | None:
             client = CLIENT.get()
             uuid = client.resolve_image(session.current_image)
             client.inspect_image_list(uuid, new_cwd)
-        except ContreeAPIError as exc:
+        except APIStatusError as exc:
             if exc.status == 404:
                 logger.error("cd: %s: no such directory", new_cwd)
                 return 1

@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
 from typing import Any
 
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError, ContreeError
 from contree_client.models import (
     TERMINAL_STATUSES,
     ClosableStreamRepr,
@@ -94,14 +94,8 @@ from contree_cli.types import FLAGS
 
 logger = logging.getLogger(__name__)
 
-# Backend transport exceptions (httpx/urllib3/aiohttp/...) don't inherit
-# from OSError, so ContreeAPIError/OSError alone miss a lost connection.
-SIGNAL_ERRORS: tuple[type[BaseException], ...] = (
-    ContreeAPIError,
-    OSError,
-    *CliClient.retryable_errors,
-    *CliClient.nonretryable_errors,
-)
+# ContreeError covers APIConnectionError from any transport backend.
+SIGNAL_ERRORS: tuple[type[BaseException], ...] = (ContreeError, OSError)
 
 EPILOG = """\
 examples:
@@ -688,7 +682,7 @@ def stream_events_until_close(
         # payload the caller would otherwise build from `completion`.
         try:
             op = client.get_operation_status(op_uuid).to_dict()
-        except ContreeAPIError as exc:
+        except APIStatusError as exc:
             logger.debug("terminal op fetch failed: %s", exc)
             return summary
         if op.get("status") in TERMINAL_STATUSES:
@@ -1027,7 +1021,7 @@ def cmd_run(args: RunArgs) -> int | None:
             # so callers see the SIGPIPE convention (128 + 13).
             if forwarder is not None:
                 forwarder.abandon()
-            with contextlib.suppress(ContreeAPIError, OSError):
+            with contextlib.suppress(APIStatusError, OSError):
                 client.cancel_operation(op_uuid)
             with contextlib.suppress(OSError):
                 devnull = os.open(os.devnull, os.O_WRONLY)

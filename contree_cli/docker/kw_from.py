@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass
 from typing import ClassVar
 
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 from contree_client.models import ImageImportRegistry
 
 from contree_cli.cli.images import normalize_registry_url
@@ -110,7 +110,7 @@ def resolve_or_import(ctx: BuildContext, ref: str) -> str:
     """Resolve ``ref`` to a UUID, importing from a registry on miss."""
     try:
         return ctx.client.resolve_image(ref)
-    except ContreeAPIError as exc:
+    except APIStatusError as exc:
         if exc.status != 404:
             raise
 
@@ -127,7 +127,7 @@ def resolve_or_import(ctx: BuildContext, ref: str) -> str:
     try:
         return wait_import(ctx, op_uuid, tag)
     except KeyboardInterrupt:
-        with contextlib.suppress(ContreeAPIError, OSError):
+        with contextlib.suppress(APIStatusError, OSError):
             ctx.client.cancel_operation(op_uuid)
         raise
 

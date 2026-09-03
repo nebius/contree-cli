@@ -4,7 +4,7 @@ from contextvars import copy_context
 
 import pytest
 from conftest import ContreeTestClient
-from contree_client.exceptions import ContreeAPIError, NotFoundError
+from contree_client.exceptions import APIStatusError, NotFoundError
 from contree_client.models import Image
 
 from contree_cli import SESSION_STORE
@@ -71,7 +71,7 @@ class TestCmdTag:
         )
         ctx = copy_context()
         args = TagArgs(tag="latest", image_ref="bad-uuid")
-        with pytest.raises(ContreeAPIError) as exc_info:
+        with pytest.raises(APIStatusError) as exc_info:
             ctx.run(cmd_tag, args)
         assert exc_info.value.status == 404
 

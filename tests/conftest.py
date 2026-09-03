@@ -87,7 +87,7 @@ class ContreeTestClient(testing.ContreeClient):
         self.raw_requests.append(spec)
         if self.raw_responses:
             return self.raw_responses.popleft()
-        raise testing.unmocked(spec)
+        return self.mocked_response(spec)
 
 
 class ContreeTestIAMClient(ContreeTestClient):
