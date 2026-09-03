@@ -31,7 +31,7 @@ import os
 from dataclasses import dataclass
 from multiprocessing.pool import ThreadPool
 
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 from contree_client.models import WhoAmIResponse
 
 from contree_cli import FORMATTER, ArgumentsProtocol, SetupResult
@@ -263,12 +263,13 @@ def cmd_auth(args: AuthArgs) -> int | None:
     try:
         with client:
             whoami = client.whoami()
-    except ContreeAPIError as exc:
+    except (APIStatusError, ValueError) as exc:
+        # ValueError covers parse_whoami's own non-2xx status check.
         # Logs the API error message, not the token itself.
         # nosemgrep: python-logger-credential-disclosure
         logger.error("Token verification failed: %s. Profile not changed.", exc)
         return 1
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError) as exc:
         # Strict contree-client models raise TypeError (missing required
         # field) or KeyError (parse_fields lookup) on incomplete payloads.
         logger.error("Could not parse /v1/whoami response: %s", exc)

@@ -664,7 +664,9 @@ def cmd_wait(args: WaitArgs) -> int | None:
                 RequestSpec(method="GET", path="/operations", idempotent=True)
             )
             if response.status != 200:
-                raise error_for_response(response)
+                raise error_for_response(
+                    response.status, response.headers, response.body
+                )
             operations = json.loads(response.body)
             api_op_ids: list[str] = []
             for op in operations:

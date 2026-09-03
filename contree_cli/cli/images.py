@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 from contree_client.models import (
     TERMINAL_STATUSES,
     ImageImportRegistry,
@@ -393,7 +393,7 @@ def cmd_import(args: ImportArgs) -> int | None:
             try:
                 client.cancel_operation(op_uuid)
                 logger.info("Cancelled operation %s", op_uuid)
-            except (ContreeAPIError, KeyboardInterrupt, OSError):
+            except (APIStatusError, KeyboardInterrupt, OSError):
                 pass
         raise
 

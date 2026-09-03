@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import ContreeTestClient
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
 from contree_cli.output import (
@@ -128,7 +128,7 @@ class TestExecute:
 
         with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
-            ns.handler = MagicMock(side_effect=ContreeAPIError(404, "gone"))
+            ns.handler = MagicMock(side_effect=APIStatusError(404, "gone"))
             ns.load_args = MagicMock()
             ns.load_args.from_args.return_value = "args"
             ns.output_format = None
@@ -477,7 +477,7 @@ class TestImplicitRun:
         with (
             _mock_session(),
             patch(
-                "contree_cli.cli.run.cmd_run", side_effect=ContreeAPIError(500, "err")
+                "contree_cli.cli.run.cmd_run", side_effect=APIStatusError(500, "err")
             ),
         ):
             shell.dispatch_run("echo hello")
@@ -723,7 +723,7 @@ class TestFormatOverride:
 
         with patch.object(shell.parser, "parse_args") as mock_parse:
             ns = MagicMock()
-            ns.handler = MagicMock(side_effect=ContreeAPIError(500, "err"))
+            ns.handler = MagicMock(side_effect=APIStatusError(500, "err"))
             ns.load_args = MagicMock()
             ns.load_args.from_args.return_value = "args"
             ns.output_format = "json"

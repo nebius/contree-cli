@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from functools import cached_property
 
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 
 from contree_cli import FORMATTER, IN_SHELL, PROFILE, SESSION_STORE, ArgumentsProtocol
 from contree_cli.output import FORMATTERS, OutputFormatter
@@ -519,7 +519,7 @@ class ContreeShell:
         before = self.session_snapshot()
         try:
             handler(loader.from_args(ns))
-        except ContreeAPIError as exc:
+        except APIStatusError as exc:
             print(f"API error: {exc}", file=sys.stderr)
         except KeyboardInterrupt:
             print()
@@ -558,7 +558,7 @@ class ContreeShell:
         before = self.session_snapshot()
         try:
             cmd_run(args)
-        except ContreeAPIError as exc:
+        except APIStatusError as exc:
             print(f"API error: {exc}", file=sys.stderr)
         except KeyboardInterrupt:
             print()

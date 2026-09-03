@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextvars import copy_context
 
 from conftest import ContreeTestClient
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 from contree_client.models import OperationSummary
 
 from contree_cli import CLIENT
@@ -31,7 +31,7 @@ class TestCmdKill:
         assert "Cancelled operation op-456" in caplog.text
 
     def test_not_found_logs_and_sets_exit(self, contree_client, caplog):
-        contree_client.mock("cancel_operation", error=ContreeAPIError(404, "nope"))
+        contree_client.mock("cancel_operation", error=APIStatusError(404, "nope"))
         CLIENT.set(contree_client)
         ctx = copy_context()
         with caplog.at_level("ERROR"):
@@ -41,7 +41,7 @@ class TestCmdKill:
 
     def test_conflict_logs_and_sets_exit(self, contree_client, caplog):
         contree_client.mock(
-            "cancel_operation", error=ContreeAPIError(409, "already done")
+            "cancel_operation", error=APIStatusError(409, "already done")
         )
         CLIENT.set(contree_client)
         ctx = copy_context()
@@ -86,7 +86,7 @@ def _run_kill_all(pages, *, cancel_failures=None):
             if op["uuid"] in cancel_failures:
                 tc.mock(
                     "cancel_operation",
-                    error=ContreeAPIError(409, "conflict"),
+                    error=APIStatusError(409, "conflict"),
                 )
             else:
                 tc.mock("cancel_operation", None)

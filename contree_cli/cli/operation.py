@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 from contree_client.models import ACTIVE_STATUSES, TERMINAL_STATUSES
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE, ArgumentsProtocol, SetupResult
@@ -460,7 +460,7 @@ def cmd_show_multi(args: ShowMultiArgs) -> int | None:
     for uuid in args.uuids:
         try:
             result = cmd_show(ShowArgs(uuid=uuid, raw=args.raw))
-        except ContreeAPIError as exc:
+        except APIStatusError as exc:
             logger.error("Failed to fetch %s: %s", uuid, exc)
             exit_code = max(exit_code, 1)
             continue
@@ -490,7 +490,7 @@ def cmd_cancel(args: CancelArgs) -> int | None:
         try:
             client.cancel_operation(uuid)
             logger.info("Cancelled operation %s", uuid)
-        except ContreeAPIError as exc:
+        except APIStatusError as exc:
             logger.error("Failed to cancel %s: %s", uuid, exc)
             failed += 1
     return 1 if failed else None
@@ -506,7 +506,7 @@ def cmd_events(args: EventsArgs) -> int | None:
         try:
             for ev in client.iter_operation_events(uuid, follow=False):
                 formatter(uuid=uuid, **ev.to_dict())
-        except ContreeAPIError as exc:
+        except APIStatusError as exc:
             logger.error("Failed to fetch events for %s: %s", uuid, exc)
             exit_code = 1
     formatter.flush()
@@ -592,7 +592,7 @@ def cmd_wait(args: WaitArgs) -> int | None:
     for uuid in sorted(pending):
         try:
             op = client.get_operation_status(uuid).to_dict()
-        except ContreeAPIError as exc:
+        except APIStatusError as exc:
             logger.error("Failed to fetch %s: %s", uuid, exc)
             continue
         formatter(**{**op, "timed_out": True})

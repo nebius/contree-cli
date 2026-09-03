@@ -74,7 +74,7 @@ def mock_whoami_response(tc: ContreeTestClient, status: int, body: bytes) -> Non
 
     Runs ``operations.parse_whoami`` over a synthetic response so the
     tests keep exercising the client's own status/JSON/model error
-    behavior (401 -> UnauthorizedError, non-dict -> ContreeAPIError,
+    behavior (401 -> AuthenticationError, non-dict -> APIStatusError,
     missing model field -> TypeError, invalid JSON -> ValueError).
     """
     response = ResponseData(status=status, headers={}, body=body)
@@ -277,7 +277,7 @@ class TestAuthVerify:
         with caplog.at_level("ERROR"), mock_whoami(body=b"[]"):
             rc = cmd_auth(args)
         assert rc == 1
-        assert "Token verification failed" in caplog.text
+        assert "Could not parse /v1/whoami response" in caplog.text
         assert Config().resolve().token is None
 
     def test_success_logs_saved(self, config_dir, caplog):

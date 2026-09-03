@@ -12,9 +12,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ContreeTestClient
 from contree_client.exceptions import (
-    ContreeAPIError,
+    APIStatusError,
     NotFoundError,
-    SSEStreamError,
 )
 from contree_client.models import (
     ClosableStreamRepr,
@@ -784,8 +783,8 @@ class TestFileUpload:
         )
         args = _default_args(file=[mf])
 
-        mocks: list[MockSpec] = [("get_file", ContreeAPIError(403, "forbidden"))]
-        with pytest.raises(ContreeAPIError) as exc_info:
+        mocks: list[MockSpec] = [("get_file", APIStatusError(403, "forbidden"))]
+        with pytest.raises(APIStatusError) as exc_info:
             _run_cmd(contree_client, args, mocks, store=session_store)
         assert exc_info.value.status == 403
 
@@ -2360,7 +2359,7 @@ class TestStreamEventsUntilClose:
         stops retrying and returns without ever seeing a completion
         event."""
         tc = ContreeTestClient()
-        tc.mock("iter_operation_events", error=ContreeAPIError(502, "boom"))
+        tc.mock("iter_operation_events", error=APIStatusError(502, "boom"))
         tc.mock("get_operation_status", executing_response())
         tc.mock("get_operation_status", executing_response())
         tc.mock(
@@ -2379,14 +2378,15 @@ class TestStreamEventsUntilClose:
         assert len(tc.calls_for("get_operation_status")) == 4
 
     def test_sse_error_triggers_reconnect_with_last_event_id(self):
-        """A mid-stream server error (SSEStreamError after some events)
-        makes the streamer reconnect, resuming from the last received
-        event id."""
+        """A mid-stream ConnectionError (carrying last_event_id) makes
+        the streamer reconnect, resuming from the last received event."""
         tc = ContreeTestClient()
+        sse_error = ConnectionError("boom")
+        sse_error.last_event_id = 1
         tc.mock(
             "iter_operation_events",
             [stream_event("stdout", "a", event_id=1)],
-            error=SSEStreamError("boom", last_event_id=1),
+            error=sse_error,
         )
         tc.mock("iter_operation_events", [completion_event(event_id=2)])
         # The op is still running when the terminal check fires between
@@ -2399,20 +2399,20 @@ class TestStreamEventsUntilClose:
         assert calls[0].kwargs["last_event_id"] is None
         assert calls[1].kwargs["last_event_id"] == 1
 
-    def test_retry_after_honored_on_api_error(self):
-        """A 425/410-style ContreeAPIError with retry_after sleeps for
-        exactly that delay before reconnecting."""
+    def test_reconnects_after_api_error(self):
+        """A 425/410-style APIStatusError mid-stream reconnects instead
+        of surfacing to the caller; the retry itself is the library's
+        job (``follow_operation_events``), not this wrapper's."""
         tc = ContreeTestClient()
         tc.mock(
             "iter_operation_events",
-            error=ContreeAPIError(425, "too early", retry_after=7),
+            error=APIStatusError(425, "too early", retry_after=7),
         )
         tc.mock("iter_operation_events", [completion_event()])
         tc.mock("get_operation_status", executing_response())
-        with patch("contree_cli.cli.run.time.sleep") as sleep_mock:
+        with patch("contree_client.base.time.sleep"):
             summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
         assert summary.completion is not None
-        assert sleep_mock.call_args_list[0].args == (7,)
 
     def test_broken_pipe_from_stdout_propagates(self, monkeypatch):
         """`BrokenPipeError` from local stdio write must propagate

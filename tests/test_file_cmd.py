@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 from conftest import ContreeTestClient
-from contree_client.exceptions import ContreeAPIError, NotFoundError
+from contree_client.exceptions import APIStatusError, NotFoundError
 from contree_client.models import File, FileResponse, FilesListResponse
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
@@ -227,9 +227,9 @@ class TestFileEditDownload:
         args = FileEditArgs(path="/etc/config.ini")
         contree_client.mock(
             "inspect_image_download_stream",
-            error=ContreeAPIError(403, "forbidden"),
+            error=APIStatusError(403, "forbidden"),
         )
-        with pytest.raises(ContreeAPIError) as exc_info:
+        with pytest.raises(APIStatusError) as exc_info:
             _run_file_edit(contree_client, args, store=session_store)
         assert exc_info.value.status == 403
 

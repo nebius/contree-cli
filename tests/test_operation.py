@@ -5,7 +5,7 @@ from contextvars import copy_context
 
 import pytest
 from conftest import ContreeTestClient
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 from contree_client.models import OperationEvent, OperationResponse, OperationSummary
 
 from contree_cli import CLIENT, FORMATTER, SESSION_STORE
@@ -222,7 +222,7 @@ class TestOperationShow:
     ):
         # First UUID -> 404, then a successful one
         contree_client.mock(
-            "get_operation_status", error=ContreeAPIError(404, "not found")
+            "get_operation_status", error=APIStatusError(404, "not found")
         )
         mock_op(contree_client, make_op("op-b"))
 
@@ -378,7 +378,7 @@ class TestOperationCancel:
             rc = run_cancel(
                 contree_client,
                 uuids=["op-a", "op-b"],
-                cancel_outcomes=[ContreeAPIError(409, "conflict"), None],
+                cancel_outcomes=[APIStatusError(409, "conflict"), None],
             )
         assert rc == 1
         assert "Failed to cancel op-a" in caplog.text

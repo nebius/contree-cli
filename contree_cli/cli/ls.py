@@ -71,7 +71,7 @@ def cmd_ls(args: LsArgs) -> None:
             )
         )
         if response.status != 200:
-            raise error_for_response(response)
+            raise error_for_response(response.status, response.headers, response.body)
         sys.stdout.write(response.body.decode())
         return
 

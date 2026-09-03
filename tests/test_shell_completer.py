@@ -5,7 +5,7 @@ from pathlib import PurePosixPath
 from unittest.mock import MagicMock, patch
 
 from conftest import ContreeTestClient, make_file_item
-from contree_client.exceptions import ContreeAPIError
+from contree_client.exceptions import APIStatusError
 from contree_client.models import (
     DirectoryList,
     ImageListResponse,
@@ -446,7 +446,7 @@ class TestContainerPathCompletion:
             updated_at="2025-01-01",
         )
         # Make the listing call fail with an API error
-        client.mock("inspect_image_list", error=ContreeAPIError(500, "error"))
+        client.mock("inspect_image_list", error=APIStatusError(500, "error"))
         completer = _make_completer(client=client, store=store)
 
         results = _complete_line(
@@ -816,7 +816,7 @@ class TestImageCompletion:
 
     def test_api_error_returns_empty(self):
         client = ContreeTestClient()
-        client.mock("list_images", error=ContreeAPIError(500, "error"))
+        client.mock("list_images", error=APIStatusError(500, "error"))
         completer = _make_completer(client=client)
 
         results = _complete_line(
@@ -947,7 +947,7 @@ class TestOperationCompletion:
 
     def test_operation_empty_on_api_failure(self):
         client = ContreeTestClient()
-        client.mock("list_operations", error=ContreeAPIError(500, "error"))
+        client.mock("list_operations", error=APIStatusError(500, "error"))
         completer = _make_completer(client=client)
 
         results = _complete_line(
