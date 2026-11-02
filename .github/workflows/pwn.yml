@@ -1,0 +1,74 @@
+
+name: ZIP Artifact Extraction PoC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create harmless test artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifact
+          echo "ZIP_SLIP_PROOF_2026" > artifact/proof.txt
+
+          zip -r test-artifact.zip artifact/
+
+          echo "Artifact created:"
+          unzip -l test-artifact.zip
+
+      - name: Upload test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extraction-test
+          path: test-artifact.zip
+          retention-days: 1
+
+  verify:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare extraction directory
+        run: |
+          mkdir -p extracted
+          echo "Extraction directory ready"
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: extraction-test
+          path: downloaded
+
+      - name: Inspect downloaded artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Downloaded files:"
+          find downloaded -type f -print
+
+          echo "Checking ZIP archive..."
+          unzip -l downloaded/test-artifact.zip
+
+      - name: Extract and verify harmless marker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip downloaded/test-artifact.zip -d extracted
+
+          MARKER="extracted/artifact/proof.txt"
+
+          if [ -f "$MARKER" ]; then
+            echo "[PASS] Marker file exists"
+            cat "$MARKER"
+          else
+            echo "[FAIL] Marker file missing"
+            exit 1
+          fi
+
+          echo "[PASS] Normal artifact extraction verified"

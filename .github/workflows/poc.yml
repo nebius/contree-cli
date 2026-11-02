@@ -1,0 +1,70 @@
+
+name: Artifact Extraction Security Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  security-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create baseline artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifact
+          printf 'SAFE_MARKER_2026\n' > artifact/proof.txt
+          zip -r proof.zip artifact
+
+      - name: Upload baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-test
+          path: proof.zip
+          retention-days: 1
+
+      - name: Prepare isolated extraction directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/security-test/extracted"
+          echo "Extraction directory prepared"
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: security-test
+          path: ${{ runner.temp }}/security-test/downloaded
+
+      - name: Verify archive integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="$RUNNER_TEMP/security-test/downloaded/proof.zip"
+          DEST="$RUNNER_TEMP/security-test/extracted"
+
+          test -f "$ARCHIVE"
+          unzip -t "$ARCHIVE"
+
+          unzip "$ARCHIVE" -d "$DEST"
+
+          echo "Extracted files:"
+          find "$DEST" -type f -print
+
+          MARKER="$DEST/artifact/proof.txt"
+
+          test -f "$MARKER"
+          grep -Fx 'SAFE_MARKER_2026' "$MARKER"
+
+          echo "[PASS] Baseline extraction verified"
