@@ -89,6 +89,9 @@ class ContreeTestClient(testing.ContreeClient):
             return self.raw_responses.popleft()
         return self.mocked_response(spec)
 
+    def bounded(self, deadline: float) -> ContreeTestClient:
+        return self
+
 
 class ContreeTestIAMClient(ContreeTestClient):
     """Test double configured like an IAM profile (project set)."""

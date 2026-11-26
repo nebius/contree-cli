@@ -60,7 +60,9 @@ class AddKeyword(DockerKeyword):
 
         sub_dest = ctx.substitute(self.dest)
         if not posixpath.isabs(sub_dest):
-            sub_dest = posixpath.normpath(posixpath.join(ctx.workdir or "/", sub_dest))
+            sub_dest = posixpath.normpath(
+                posixpath.join(ctx.resolve_workdir(), sub_dest)
+            )
 
         local_sources: list[str] = []
         url_sources: list[str] = []

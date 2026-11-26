@@ -6,12 +6,15 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from contree_cli.client import CliClient
 from contree_cli.session import SessionStore
 
 from .local_context import LocalContext
+
+if TYPE_CHECKING:
+    from .transfer import StagedArchive, StagedLink
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,7 @@ class PendingFile:
     uid: int
     gid: int
     mode: str  # octal like "0644"
+    replace_existing: bool = False
 
 
 @dataclass
@@ -37,7 +41,9 @@ class BuildContext:
     declared_args: set[str] = field(default_factory=set)
     arg_defaults: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
-    workdir: str = "/"
+    persisted_env: dict[str, str] = field(default_factory=dict)
+    workdir: str = ""
+    persisted_workdir: str = ""
     user: str = ""
     parent_hash: str = ""
     # Sealed build stages: every FROM past the first closes the stage
@@ -45,12 +51,23 @@ class BuildContext:
     # indexes the same images for numeric `COPY --from=N` references.
     stages: dict[str, str] = field(default_factory=dict)
     stage_images: list[str] = field(default_factory=list)
+    stage_settings: dict[str, tuple[str, dict[str, str]]] = field(default_factory=dict)
     current_stage_alias: str = ""
     pending: list[PendingFile] = field(default_factory=list)
+    archives: list[StagedArchive | StagedLink] = field(default_factory=list)
     no_cache: bool = False
     timeout: int = BUILD_TIMEOUT_DEFAULT
     last_image: str = ""
     last_op_uuid: str = ""
+
+    def resolve_workdir(self) -> str:
+        """Resolve an inherited working directory only when a path needs it."""
+        if not self.workdir:
+            from .transfer import read_image_workdir
+
+            self.workdir = read_image_workdir(self)
+            self.persisted_workdir = self.workdir
+        return self.workdir
 
     def arg_values(self) -> dict[str, str]:
         """Effective values for every declared ARG (build-arg overrides default)."""
@@ -85,9 +102,11 @@ class BuildContext:
                     "uid": p.uid,
                     "gid": p.gid,
                     "mode": p.mode,
+                    "replace_existing": p.replace_existing,
                 }
                 for p in self.pending
-            ],
+            ]
+            + [archive.cache_repr() for archive in self.archives],
             sort_keys=True,
         )
 

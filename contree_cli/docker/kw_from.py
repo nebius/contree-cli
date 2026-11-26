@@ -15,7 +15,7 @@ from contree_cli.cli.images import normalize_registry_url
 
 from .context import BuildContext, resolve_stage_ref
 from .keyword import DockerKeyword
-from .kw_run import RunKeyword
+from .kw_run import finalize_pending
 
 logger = logging.getLogger(__name__)
 
@@ -51,18 +51,27 @@ class FromKeyword(DockerKeyword):
             seal_stage(ctx)
         ctx.current_stage_alias = self.alias
         ctx.env.clear()
-        ctx.workdir = "/"
+        ctx.persisted_env.clear()
+        ctx.workdir = ""
+        ctx.persisted_workdir = ""
         ctx.user = ""
 
         ref = ctx.substitute(self.image_ref)
         image_uuid = resolve_stage_ref(ctx, ref)
         if image_uuid is None:
             image_uuid = resolve_or_import(ctx, ref)
+        if image_uuid in ctx.stage_settings:
+            workdir, env = ctx.stage_settings[image_uuid]
+            ctx.workdir = workdir
+            ctx.persisted_workdir = workdir
+            ctx.env = dict(env)
+            ctx.persisted_env = dict(env)
 
         from_hash = hashlib.sha256(f"FROM:{image_uuid}".encode()).hexdigest()
         branch_name = f"layer:{BuildContext.short_hash(from_hash)}"
 
         ctx.pending.clear()
+        ctx.archives.clear()
         cached = ctx.try_cache_hit(branch_name)
         if cached is not None:
             logger.info("CACHED: %r -> %s", self, cached)
@@ -79,24 +88,10 @@ class FromKeyword(DockerKeyword):
 
 
 def seal_stage(ctx: BuildContext) -> None:
-    """Close the stage in progress before the next FROM starts.
-
-    Pending files exist only as attachments for a future RUN, so a
-    stage that ends with COPY/ADD is committed through the same
-    trivial closer that finalize_pending uses; the sealed image then
-    becomes addressable via ``COPY --from=<alias|index>``.
-    """
-    if ctx.pending:
-        # Sealing just commits already-uploaded files; it must run as
-        # root regardless of the stage's active USER (matching how
-        # copy_from_image's own extraction RUN clears ctx.user).
-        saved_user = ctx.user
-        ctx.user = ""
-        try:
-            RunKeyword(parts=(":",), shell_form=True).execute(ctx)
-        finally:
-            ctx.user = saved_user
+    """Commit pending state and register the stage before the next FROM."""
+    finalize_pending(ctx)
     ctx.stage_images.append(ctx.last_image)
+    ctx.stage_settings[ctx.last_image] = (ctx.workdir, dict(ctx.env))
     if ctx.current_stage_alias:
         ctx.stages[ctx.current_stage_alias] = ctx.last_image
     logger.info(

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ContreeTestClient
 from contree_client.exceptions import (
+    APIConnectionError,
     APIStatusError,
     NotFoundError,
 )
@@ -138,16 +139,54 @@ def file_upload_response(uuid: str, sha256: str = "0" * 64) -> MockSpec:
 
 
 def apply_mocks(tc: ContreeTestClient, mocks: list[MockSpec]) -> None:
-    """Queue mock outcomes; auto-mock the SSE stream as empty when the
-    test doesn't care about it (the CLI always opens the event stream
-    before falling back to the terminal GET)."""
+    """Queue API outcomes and complete event streams for terminal snapshots."""
+    explicit_events = any(name == "iter_operation_events" for name, _ in mocks)
     for name, value in mocks:
         if isinstance(value, BaseException):
             tc.mock(name, error=value)
         else:
             tc.mock(name, value)
-    if all(name != "iter_operation_events" for name, _ in mocks):
-        tc.mock("iter_operation_events", [])
+        if (
+            not explicit_events
+            and name == "get_operation_status"
+            and isinstance(value, OperationResponse)
+        ):
+            tc.mock("iter_operation_events", events_from_operation(value))
+
+
+def events_from_operation(response: OperationResponse) -> list[OperationEvent]:
+    body = response.to_dict()
+    result = (body.get("metadata") or {}).get("result") or {}
+    events = []
+    for kind in ("stdout", "stderr"):
+        if result.get(kind):
+            events.append(
+                make_event(kind, result[kind], event_id=len(events) + 1, spid=1)
+            )
+    state = result.get("state") or {}
+    if "exit_code" in state:
+        events.append(
+            make_event(
+                "exit",
+                exit_data(
+                    state["exit_code"],
+                    timed_out=state.get("timed_out", False),
+                    signal=state.get("signal", -1),
+                ),
+                event_id=len(events) + 1,
+                spid=1,
+            )
+        )
+    events.append(
+        completion_event(
+            body["status"],
+            event_id=len(events) + 1,
+            result_image_uuid=(body.get("result") or {}).get("image"),
+            error=body.get("error"),
+            duration_ms=int((body.get("duration") or 0) * 1000),
+        )
+    )
+    return events
 
 
 def call_ops(tc: ContreeTestClient) -> list[str]:
@@ -256,8 +295,7 @@ class TestDetach:
 
 class TestPollLoop:
     def test_poll_until_success(self, contree_client, session_store, capsys):
-        """The event stream closes without a completion frame; the
-        terminal-check GET serves the final state directly."""
+        """A completion event supplies the final operation state."""
         session_store.set_image(IMG_UUID, kind="test")
         args = _default_args()
         mocks = [
@@ -461,7 +499,7 @@ class TestCtrlC:
                 _spawn_response(),
                 ("iter_operation_events", KeyboardInterrupt()),
                 ("operation_subprocess_kill", None),
-                ("iter_operation_events", []),
+                ("iter_operation_events", [completion_event()]),
                 _op_response(status="SUCCESS"),
             ],
         )
@@ -1739,143 +1777,55 @@ class TestInterpreterMode:
 class TestEscapeSanitization:
     """DefaultFormatter strips breaking escape sequences from output."""
 
-    def test_colors_preserved(self, contree_client, session_store, capsys):
-        session_store.set_image(IMG_UUID, kind="test")
-        args = _default_args()
-        colored = "\033[1;32mgreen\033[0m normal"
-        mocks = [
-            _spawn_response(),
-            _op_response(
-                status="SUCCESS",
-                exit_code=0,
-                stdout={"value": colored, "encoding": "ascii"},
+    @pytest.mark.parametrize(
+        ("stream", "raw", "present", "removed"),
+        [
+            (
+                "stdout",
+                "\033[1;32mgreen\033[0m normal",
+                "\033[1;32mgreen\033[0m normal",
+                (),
             ),
-        ]
-        _run_cmd(
-            contree_client,
-            args,
-            mocks,
-            store=session_store,
-            formatter=DefaultFormatter(),
-        )
-        out = capsys.readouterr().out
-        assert "\033[1;32mgreen\033[0m normal" in out
-
-    def test_cursor_movement_stripped(self, contree_client, session_store, capsys):
-        session_store.set_image(IMG_UUID, kind="test")
-        args = _default_args()
-        raw = "\033[2;5Htext\033[Aup\033[Bdown\033[10Gcol"
-        mocks = [
-            _spawn_response(),
-            _op_response(
-                status="SUCCESS",
-                exit_code=0,
-                stdout={"value": raw, "encoding": "ascii"},
+            (
+                "stdout",
+                "\033[2;5Htext\033[Aup\033[Bdown\033[10Gcol",
+                "text",
+                ("\033[2;5H", "\033[A"),
             ),
-        ]
-        _run_cmd(
-            contree_client,
-            args,
-            mocks,
-            store=session_store,
-            formatter=DefaultFormatter(),
-        )
-        out = capsys.readouterr().out
-        assert "text" in out
-        assert "\033[2;5H" not in out
-        assert "\033[A" not in out
-
-    def test_alternate_screen_stripped(self, contree_client, session_store, capsys):
-        session_store.set_image(IMG_UUID, kind="test")
-        args = _default_args()
-        raw = "\033[?1049hhtop output\033[?1049l"
-        mocks = [
-            _spawn_response(),
-            _op_response(
-                status="SUCCESS",
-                exit_code=0,
-                stdout={"value": raw, "encoding": "ascii"},
+            (
+                "stdout",
+                "\033[?1049hhtop output\033[?1049l",
+                "htop output",
+                ("\033[?1049h", "\033[?1049l"),
             ),
-        ]
-        _run_cmd(
-            contree_client,
-            args,
-            mocks,
-            store=session_store,
-            formatter=DefaultFormatter(),
+            ("stdout", "\033[2Jcontent\033[K", "content", ("\033[2J", "\033[K")),
+            ("stderr", "\033[?25lerror msg\033[?25h", "error msg", ("\033[?25l",)),
+        ],
+        ids=["colors", "cursor-movement", "alternate-screen", "clear-screen", "stderr"],
+    )
+    def test_default_formatter_sanitizes_escapes(
+        self, capsys, stream, raw, present, removed
+    ):
+        response = op_body(
+            status="SUCCESS",
+            exit_code=0,
+            **{stream: {"value": raw, "encoding": "ascii"}},
         )
-        out = capsys.readouterr().out
-        assert "htop output" in out
-        assert "\033[?1049h" not in out
-        assert "\033[?1049l" not in out
+        run_module._display_operation(response, DefaultFormatter())
+        captured = capsys.readouterr()
+        output = captured.out if stream == "stdout" else captured.err
+        assert present in output
+        assert all(escape not in output for escape in removed)
 
-    def test_clear_screen_stripped(self, contree_client, session_store, capsys):
-        session_store.set_image(IMG_UUID, kind="test")
-        args = _default_args()
-        raw = "\033[2Jcontent\033[K"
-        mocks = [
-            _spawn_response(),
-            _op_response(
-                status="SUCCESS",
-                exit_code=0,
-                stdout={"value": raw, "encoding": "ascii"},
-            ),
-        ]
-        _run_cmd(
-            contree_client,
-            args,
-            mocks,
-            store=session_store,
-            formatter=DefaultFormatter(),
-        )
-        out = capsys.readouterr().out
-        assert "content" in out
-        assert "\033[2J" not in out
-        assert "\033[K" not in out
-
-    def test_stderr_also_sanitized(self, contree_client, session_store, capsys):
-        session_store.set_image(IMG_UUID, kind="test")
-        args = _default_args()
-        raw = "\033[?25lerror msg\033[?25h"
-        mocks = [
-            _spawn_response(),
-            _op_response(
-                status="SUCCESS",
-                exit_code=0,
-                stderr={"value": raw, "encoding": "ascii"},
-            ),
-        ]
-        _run_cmd(
-            contree_client,
-            args,
-            mocks,
-            store=session_store,
-            formatter=DefaultFormatter(),
-        )
-        err = capsys.readouterr().err
-        assert "error msg" in err
-        assert "\033[?25l" not in err
-
-    def test_json_formatter_not_sanitized(self, contree_client, session_store, capsys):
+    def test_json_formatter_not_sanitized(self, capsys):
         """Non-default formatters get raw output (for structured data)."""
-        session_store.set_image(IMG_UUID, kind="test")
-        args = _default_args()
         raw = "\033[2Jcontent"
-        mocks = [
-            _spawn_response(),
-            _op_response(
-                status="SUCCESS",
-                exit_code=0,
-                stdout={"value": raw, "encoding": "ascii"},
-            ),
-        ]
-        _run_cmd(
-            contree_client,
-            args,
-            mocks,
-            store=session_store,
-            formatter=JSONFormatter(),
+        response = op_body(
+            status="SUCCESS",
+            exit_code=0,
+            stdout={"value": raw, "encoding": "ascii"},
         )
+        run_module._display_operation(response, JSONFormatter())
         out = capsys.readouterr().out
         parsed = json.loads(out)
         assert "\033[2J" in parsed["stdout"]
@@ -2337,29 +2287,27 @@ class TestStreamEventsUntilClose:
         assert summary.completion.data.status == "SUCCESS"
         assert len(tc.calls_for("iter_operation_events")) == 1
 
-    def test_stream_ends_without_completion_falls_back_to_terminal_get(self):
-        """SSE closes cleanly without a `completion` event: the
-        between-attempt GET check detects the op is terminal and parks
-        it on `summary.fallback_op` so the caller doesn't need to GET
-        again."""
+    def test_unfiltered_stream_requires_completion_after_terminal_get(self):
+        """Terminal status cannot replace a missing completion event."""
         tc = ContreeTestClient()
         tc.mock("iter_operation_events", [])
         op = OperationResponse.from_dict(
             {"uuid": "op-1", "status": "SUCCESS", "result": {"image": None}}
         )
         tc.mock("get_operation_status", op)
-        summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
-        assert summary.completion is None
-        assert summary.fallback_op == op.to_dict()
-        assert bytes(summary.stdout) == b""
+        with pytest.raises(APIConnectionError, match="ended without completion"):
+            stream_events_until_close(tc, "op-1", DefaultFormatter())
+        calls = tc.calls_for("iter_operation_events")
+        assert [call.kwargs["follow"] for call in calls] == [True, False]
 
-    def test_sse_connect_errors_then_terminal_via_get(self):
-        """SSE keeps failing to connect while the op runs; once the
-        between-attempt GET reports terminal status the streamer
-        stops retrying and returns without ever seeing a completion
-        event."""
+    def test_sse_connect_errors_then_terminal_log_recovery(self):
+        """After terminal status, drain retained events through completion."""
         tc = ContreeTestClient()
-        tc.mock("iter_operation_events", error=APIStatusError(502, "boom"))
+        for attempt in range(3):
+            tc.mock(
+                "iter_operation_events", error=APIStatusError(502, f"boom {attempt}")
+            )
+        tc.mock("iter_operation_events", [completion_event()])
         tc.mock("get_operation_status", executing_response())
         tc.mock("get_operation_status", executing_response())
         tc.mock(
@@ -2370,18 +2318,17 @@ class TestStreamEventsUntilClose:
         # follow_operation_events loop.
         with patch("contree_client.base.time.sleep"):
             summary = stream_events_until_close(tc, "op-1", DefaultFormatter())
-        assert summary.completion is None
-        assert summary.fallback_op == {"uuid": "op-1", "status": "SUCCESS"}
-        assert len(tc.calls_for("iter_operation_events")) == 3
-        # Three terminal probes inside the library loop plus one final
-        # fetch of the terminal payload for fallback_op.
-        assert len(tc.calls_for("get_operation_status")) == 4
+        assert summary.completion is not None
+        assert summary.fallback_op is None
+        calls = tc.calls_for("iter_operation_events")
+        assert [call.kwargs["follow"] for call in calls] == [True, True, True, False]
+        assert len(tc.calls_for("get_operation_status")) == 3
 
     def test_sse_error_triggers_reconnect_with_last_event_id(self):
-        """A mid-stream ConnectionError (carrying last_event_id) makes
+        """A mid-stream APIConnectionError (carrying last_event_id) makes
         the streamer reconnect, resuming from the last received event."""
         tc = ContreeTestClient()
-        sse_error = ConnectionError("boom")
+        sse_error = APIConnectionError("boom")
         sse_error.last_event_id = 1
         tc.mock(
             "iter_operation_events",

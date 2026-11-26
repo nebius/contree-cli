@@ -143,7 +143,7 @@ Building from a Dockerfile:
     contree build . --build-arg VERSION=1.2
     contree build . --no-cache          force rebuild
 
-  Supported directives: FROM, RUN, COPY, ADD (local files/dirs and http(s) URLs; no tar auto-extract), WORKDIR, ENV, ARG, USER. CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/etc. are parsed but skipped with a warning. Multi-stage (AS / --from) is not yet supported.
+  Supported directives: FROM, RUN, COPY, ADD (local files/dirs and http(s) URLs; no tar auto-extract), WORKDIR, ENV, ARG, USER. CMD/ENTRYPOINT/LABEL/EXPOSE/VOLUME/etc. are parsed but skipped with a warning. Multi-stage (AS / --from) is supported. COPY transfers archives through the API without a guest shell. ENV and WORKDIR persist in the result image. Explicit ownership and special mode bits require guest chown/chmod.
 
   .dockerignore is applied to every COPY/ADD walk on top of the default exclude list (.git, __pycache__, node_modules, etc.).
 

@@ -13,15 +13,10 @@ WORKDIR, ENV, ARG, USER. Other Dockerfile directives parse cleanly but
 are skipped with a warning (CMD, ENTRYPOINT, LABEL, EXPOSE, VOLUME,
 STOPSIGNAL, MAINTAINER, HEALTHCHECK, ONBUILD, SHELL).
 
-Multistage notes: ``COPY --from`` exports the source path from the
-referenced stage image as a tar archive, uploads it once (content
-deduplicated) and unpacks it with an extraction RUN inside the target
-sandbox. For now this means the target image must provide ``/bin/sh``,
-``tar``, ``cp`` and ``mv`` (busybox suffices; ``FROM scratch`` targets
-cannot receive ``COPY --from``). This is a temporary limitation of the
-client-side extraction and will be lifted in a future release once the
-backend unpacks archives itself. Unlike docker, ARG/ENV live in one
-global namespace across stages.
+Multistage COPY transfers archives through the API without a guest shell.
+Ownership changes and special mode bits require guest chown/chmod executables.
+ARG values use one global namespace across stages. ENV and WORKDIR are saved
+in image metadata, including directives after the final RUN.
 """
 
 from __future__ import annotations
@@ -47,10 +42,10 @@ from contree_cli.docker import (
     DockerKeyword,
     FromKeyword,
     LocalContext,
-    RunKeyword,
     parse_dockerfile,
 )
 from contree_cli.docker.context import BUILD_TIMEOUT_DEFAULT
+from contree_cli.docker.kw_run import finalize_pending
 from contree_cli.session import SessionStore
 from contree_cli.types import FLAGS
 
@@ -69,8 +64,8 @@ for coding agents:
   layer cache is per-context (session keyed by abspath(context))
   use --no-cache to bypass cached layers and rebuild from scratch
   multistage supported: FROM ... AS name + COPY --from=<name|index|image>
-  COPY --from unpacks a tar inside the target: needs sh/tar/cp/mv there
-  (temporary limitation, to be lifted in a future release)
+  COPY transfers directories through the API without a guest shell
+  non-default ownership and special mode bits need guest chown/chmod
 """
 
 
@@ -130,7 +125,7 @@ def setup_parser(p: argparse.ArgumentParser) -> SetupResult:
         *FLAGS["timeout"],
         type=int,
         default=BUILD_TIMEOUT_DEFAULT,
-        help="Timeout in seconds for each RUN step",
+        help="Timeout in seconds for each build instance",
     )
     return cmd_build, BuildArgs
 
@@ -229,11 +224,3 @@ def parse_build_args(items: tuple[str, ...]) -> dict[str, str]:
 def make_session_key(context_dir: Path) -> str:
     digest = hashlib.sha256(str(context_dir).encode()).hexdigest()
     return f"build:{digest[:16]}"
-
-
-def finalize_pending(ctx: BuildContext) -> None:
-    """If COPY/ADD left files pending, commit them via a trivial RUN."""
-    if not ctx.pending:
-        return
-    closer = RunKeyword(parts=(":",), shell_form=True)
-    closer.execute(ctx)

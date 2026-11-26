@@ -19,11 +19,14 @@ import json
 import logging
 import platform
 import sys
+from collections.abc import Iterator
+from copy import copy
+from dataclasses import replace
 from importlib.metadata import PackageNotFoundError, distribution
 from typing import TYPE_CHECKING, Any
 
 from contree_client.profiles import AUTH_TYPE_IAM, Profile
-from contree_client.runtime import RetryPolicy
+from contree_client.runtime import RequestSpec, ResponseData, RetryPolicy
 
 if TYPE_CHECKING:
     # The auto-detected backend class is a runtime variable, invalid
@@ -71,9 +74,47 @@ class CliClient(ClientBase):
     and transport tokens.
     """
 
+    request_deadline: float | None = None
+
     def __init__(self, token: str, **kwargs: Any) -> None:
         kwargs.setdefault("identity", CLI_IDENTITY)
         super().__init__(token, **kwargs)
+
+    def bounded(self, deadline: float) -> CliClient:
+        """Share the transport with an independent deadline and finite retry policy."""
+        client = copy(self)
+        client.request_deadline = deadline
+        if client.retry is not None:
+            client.retry = replace(
+                client.retry,
+                statuses=tuple(
+                    status for status in client.retry.statuses if status != 410
+                ),
+                max_attempts=min(client.retry.max_attempts or 10, 10),
+            )
+        return client
+
+    def bound_request(self, spec: RequestSpec) -> RequestSpec:
+        """Keep the earliest request or lifecycle deadline."""
+        if self.request_deadline is None:
+            return spec
+        deadline = self.request_deadline
+        if spec.deadline is not None:
+            deadline = min(deadline, spec.deadline)
+        return replace(spec, deadline=deadline)
+
+    def call(self, spec: RequestSpec) -> ResponseData:
+        return super().call(self.bound_request(spec))
+
+    def request(self, spec: RequestSpec) -> ResponseData:
+        return super().request(self.bound_request(spec))  # type: ignore[safe-super]
+
+    def stream(
+        self, spec: RequestSpec, auto_decompress: bool = True
+    ) -> Iterator[bytes]:
+        yield from super().stream(  # type: ignore[safe-super]
+            self.bound_request(spec), auto_decompress=auto_decompress
+        )
 
 
 def client_from_profile(

@@ -47,9 +47,14 @@ class RunKeyword(DockerKeyword):
         return f"RUN {json.dumps(list(self.parts))}"
 
     def execute(self, ctx: BuildContext) -> None:
+        if ctx.archives:
+            from .transfer import materialize
+
+            materialize(ctx)
         sub_parts = tuple(ctx.substitute(p) for p in self.parts)
         contribution = (
-            f"RUN shell={self.shell_form} parts={json.dumps(list(sub_parts))}"
+            f"RUN preserve_env=True preserve_cwd=True shell={self.shell_form} "
+            f"parts={json.dumps(list(sub_parts))}"
         )
         chain = ctx.chain(contribution)
         branch_name = f"layer:{BuildContext.short_hash(chain)}"
@@ -57,20 +62,19 @@ class RunKeyword(DockerKeyword):
         cached = ctx.try_cache_hit(branch_name)
         if cached is not None:
             logger.info("CACHED: %r -> %s", self, cached)
-            ctx.parent_hash = chain
-            ctx.pending.clear()
-            return
-
-        new_image, op_uuid = self.spawn(ctx, sub_parts)
-        ctx.commit_layer(
-            branch_name,
-            new_image,
-            kind="run",
-            title=display_title(sub_parts, self.shell_form),
-            operation_uuid=op_uuid,
-        )
+        else:
+            new_image, op_uuid = self.spawn(ctx, sub_parts)
+            ctx.commit_layer(
+                branch_name,
+                new_image,
+                kind="run",
+                title=display_title(sub_parts, self.shell_form),
+                operation_uuid=op_uuid,
+            )
         ctx.parent_hash = chain
         ctx.pending.clear()
+        ctx.persisted_env = dict(ctx.env)
+        ctx.persisted_workdir = ctx.workdir
 
     def spawn(self, ctx: BuildContext, parts: tuple[str, ...]) -> tuple[str, str]:
         command, args, shell = build_command(parts, self.shell_form, ctx.user)
@@ -91,8 +95,10 @@ class RunKeyword(DockerKeyword):
             truncate_output_at=65536,
             args=args if args else ...,
             timeout=ctx.timeout if ctx.timeout else ...,
-            cwd=ctx.workdir if ctx.workdir and ctx.workdir != "/" else ...,
+            cwd=ctx.workdir or ...,
             env=dict(ctx.env) if ctx.env else ...,
+            preserve_env=True,
+            preserve_cwd=True,
             files=files,
         )
         op_uuid = str(spawn_op.uuid)
@@ -108,6 +114,20 @@ class RunKeyword(DockerKeyword):
         if not new_image:
             raise RuntimeError("RUN succeeded but no image was produced")
         return str(new_image), op_uuid
+
+
+def finalize_pending(ctx: BuildContext) -> None:
+    """Commit pending files and image settings before closing a stage."""
+    if (
+        not ctx.pending
+        and not ctx.archives
+        and ctx.env == ctx.persisted_env
+        and ctx.workdir == ctx.persisted_workdir
+    ):
+        return
+    from .transfer import materialize
+
+    materialize(ctx)
 
 
 def stream_and_resolve(ctx: BuildContext, op_uuid: str) -> dict[str, Any]:

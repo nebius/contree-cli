@@ -33,5 +33,5 @@ class WorkdirKeyword(DockerKeyword):
         if posixpath.isabs(target):
             ctx.workdir = posixpath.normpath(target)
         else:
-            base = ctx.workdir or "/"
+            base = ctx.resolve_workdir()
             ctx.workdir = posixpath.normpath(posixpath.join(base, target))

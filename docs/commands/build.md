@@ -24,7 +24,7 @@ contree build [CONTEXT] [--dockerfile PATH] [--tag NAME[:TAG]]
 - `--build-arg KEY=VALUE` -- supply a value for an `ARG` declared in the
   Dockerfile (repeatable).
 - `--no-cache` -- ignore existing `layer:<hash>` branches and rebuild.
-- `--timeout SEC` -- per-`RUN` operation timeout in seconds (default 600).
+- `--timeout SEC` -- per-instance timeout in seconds (default 600).
 
 ## Help output
 
@@ -51,17 +51,36 @@ contree build . --no-cache --tag myapp:dev
 
 | Directive | Behaviour |
 |-----------|-----------|
-| `FROM ref[:tag] [AS name]` | Resolves the base image. If the tag is not found locally, the build auto-imports it via `POST /v1/images/import`. `AS name` is parsed but ignored (multi-stage is Phase 2). |
+| `FROM ref[:tag] [AS name]` | Resolves the base image. If the tag is not found locally, the build auto-imports it via `POST /v1/images/import`. `AS name` registers a stage for later `FROM` and `COPY --from`. |
 | `RUN ...` | Shell-form (`RUN echo hi`) or JSON exec-form (`RUN ["echo","hi"]`). Spawns `POST /v1/instances`, polls until terminal status, captures the resulting image. |
-| `COPY [--chown=...] [--chmod=...] SRC... DEST` | Walks local sources relative to the build context, applies `.dockerignore`, uploads files (with SHA256 dedup), and stages them for the next `RUN`. |
+| `COPY [--from=...] [--chown=...] [--chmod=...] SRC... DEST` | Transfers deterministic archives through the API. Local sources respect `.dockerignore`; `--from` accepts a stage name, index, or image reference. |
 | `ADD ...` | Local paths behave like `COPY`. `https://`/`http://` URLs are **streamed straight from the source socket into `POST /v1/files`** (no temp file on disk); the URL plus its `ETag`/`Last-Modified`/`Content-MD5` validators are cached so repeat builds skip the download via a conditional `HEAD`. Tar auto-extraction is not implemented. |
-| `WORKDIR /path` | Sets the working directory for subsequent directives. |
-| `ENV KEY=VALUE ...` | Accumulates environment variables passed to every `RUN`. |
+| `WORKDIR /path` | Sets and preserves the working directory, including after the final `RUN`. Relative paths use the inherited image directory. |
+| `ENV KEY=VALUE ...` | Passes variables to `RUN` and preserves them in the resulting image, including after the final `RUN`. |
 | `ARG NAME[=DEFAULT]` | Declares a build-time variable. Overridden by `--build-arg`. |
 | `USER name` | Subsequent `RUN` commands are wrapped in `su -s /bin/sh -c '<cmd>' <name>`. |
 | `CMD`, `ENTRYPOINT`, `LABEL`, `EXPOSE`, `VOLUME`, `STOPSIGNAL`, `MAINTAINER`, `HEALTHCHECK`, `ONBUILD`, `SHELL` | Parsed but skipped with a warning. |
 
-`COPY --from=stage` is a Phase 2 feature; in MVP it warns and skips.
+Directory transfers use archive download and upload APIs. They preserve empty
+directories, symlinks, hardlinks, and permission bits. The target does not need
+`sh`, `tar`, `cp`, or `mv`. File and metadata layers use an instance without a
+primary command, then save its image after a normal shutdown.
+
+Ownership changes, including restoration of `0:0`, and permission corrections
+require `chown` or `chmod` in the target. These commands run directly without a shell.
+Transfer failures cancel the instance and do not publish a cached layer.
+The archive endpoint cannot target `/` directly. Directory copies into `/`
+attach new root files at instance startup and replace existing root entries
+through the live file API. Child directories use separate archives.
+Root symlinks and hardlinks between these children require guest `ln` with `-T`.
+Archive timestamps are not preserved. Local `ADD` archives remain ordinary files;
+automatic archive extraction is not implemented.
+Each outgoing archive can contain at most 10,000 entries, including its root header.
+The builder rejects larger archives before uploading them.
+
+Build tokens need `spawn` and `list`. Normal transfer shutdown also requires
+`cancel` to send `TERM` to subprocess 1. Resolving an inherited working directory
+on a cache miss requires `spawn_disposable`.
 
 ## Sessions and layer cache
 

@@ -1,38 +1,29 @@
-"""``COPY [--from=...] [--chown=...] [--chmod=...] SRC... DEST``.
-
-Local sources are uploaded from the build context and attached to the
-next RUN. ``--from=<stage|index|image>`` sources are exported from the
-referenced image as a tar archive, uploaded as a single file and
-unpacked by an extraction RUN inside the sandbox, so ownership, modes
-and symlinks survive natively. For now the extraction needs
-``/bin/sh``, ``tar``, ``cp`` and ``mv`` in the target image (busybox
-suffices; ``FROM scratch`` targets cannot receive ``COPY --from``) -
-a temporary limitation that goes away once the backend unpacks
-archives itself.
-"""
+"""Copy local and image sources through the archive API."""
 
 from __future__ import annotations
 
 import json
-import logging
 import posixpath
 import shlex
-import tarfile
-import tempfile
-import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import IO, ClassVar, TypeVar
 
 from contree_client.exceptions import NotFoundError
+from contree_client.models import FileItem
 
-from contree_cli.cli.run import upload_files
-
-from .context import BuildContext, PendingFile, resolve_stage_ref
+from .archive import (
+    ArchiveBuffer,
+    archive_is_directory,
+    local_source,
+    rewrite_image_archive,
+    write_local_archive,
+)
+from .context import BuildContext, resolve_stage_ref
 from .keyword import DockerKeyword
 from .kw_from import resolve_or_import
-from .kw_run import RunKeyword
-
-logger = logging.getLogger(__name__)
+from .metadata import inspect_destination
+from .transfer import materialize, stage_archive
 
 T = TypeVar("T", bound=DockerKeyword)
 
@@ -128,40 +119,88 @@ def stage_copy(
     chown: str,
     chmod: str,
 ) -> None:
-    """Resolve sources via ``LocalContext``, upload, append to ``ctx.pending``."""
-    sub_sources = tuple(ctx.substitute(s) for s in sources)
+    """Upload source archives and commit one COPY layer without a guest shell."""
+    if ctx.pending or ctx.archives:
+        materialize(ctx)
+    sub_sources = tuple(ctx.substitute(source) for source in sources)
     sub_dest = ctx.substitute(dest)
-    sub_chown = ctx.substitute(chown)
-    sub_chmod = ctx.substitute(chmod)
-
     if not posixpath.isabs(sub_dest):
-        sub_dest = posixpath.normpath(posixpath.join(ctx.workdir or "/", sub_dest))
-
-    uid, gid = parse_chown(sub_chown)
-    mode_override = parse_chmod(sub_chmod)
-
-    mapped = ctx.local.collect(
-        sub_sources,
-        sub_dest,
-        uid=uid,
-        gid=gid,
-        mode_override=mode_override,
-    )
-    if not mapped:
-        return
-
-    uploaded = upload_files(ctx.client, mapped, ctx.store)
-    for mf in mapped:
-        ctx.pending.append(
-            PendingFile(
-                instance_path=mf.instance_path,
-                file_uuid=uploaded[mf.host_path],
-                sha256=mf.sha256(),
-                uid=mf.uid,
-                gid=mf.gid,
-                mode=f"{mf.mode:04o}",
-            )
+        sub_dest = posixpath.join(ctx.resolve_workdir(), sub_dest)
+    owner = parse_chown(ctx.substitute(chown)) if chown else None
+    mode = parse_chmod(ctx.substitute(chmod))
+    for source in sub_sources:
+        if ctx.pending or ctx.archives:
+            materialize(ctx)
+        path = local_source(ctx.local, source)
+        directory = path.is_dir()
+        target, name = archive_destination(
+            ctx, sub_dest, path.name, directory, len(sub_sources) > 1
         )
+        with ArchiveBuffer(max_size=SPOOL_MAX_MEMORY) as buffer:
+            info = write_local_archive(
+                ctx.local, source, buffer, mode_override=mode, name_override=name
+            )
+            if info is None:
+                continue
+            stage_archive(ctx, buffer, info, target, owner)
+    if ctx.pending or ctx.archives:
+        materialize(ctx)
+
+
+def archive_destination(
+    ctx: BuildContext, dest: str, source_name: str, directory: bool, multiple: bool
+) -> tuple[str, str | None]:
+    destination_directory = dest.endswith(("/", "/.", "/..")) or multiple
+    dest, existing_directory = resolve_destination(ctx, dest)
+    if directory:
+        return dest, None
+    destination_directory = destination_directory or existing_directory
+    target = posixpath.join(dest, source_name) if destination_directory else dest
+    return posixpath.dirname(target) or "/", posixpath.basename(target)
+
+
+def resolve_destination(ctx: BuildContext, dest: str) -> tuple[str, bool]:
+    """Resolve image symlinks before processing subsequent parent components."""
+    listings: dict[str, dict[str, FileItem]] = {}
+    components = deque(dest.split("/"))
+    resolved: list[str] = []
+    entries: list[FileItem | None] = []
+    missing_depth: int | None = None
+    links = 0
+    while components:
+        component = components.popleft()
+        if not component or component == ".":
+            continue
+        if entries and entries[-1] is not None and not entries[-1].is_dir:
+            raise ValueError(f"COPY destination parent is not a directory: {dest}")
+        if component == "..":
+            if resolved:
+                resolved.pop()
+                entries.pop()
+            if missing_depth is not None and len(resolved) < missing_depth:
+                missing_depth = None
+            continue
+        path = "/" + "/".join((*resolved, component))
+        entry = (
+            inspect_destination(ctx, path, listings) if missing_depth is None else None
+        )
+        if entry is not None and entry.is_symlink:
+            links += 1
+            if links > 40:
+                raise ValueError(f"COPY destination has too many symlinks: {dest}")
+            if posixpath.isabs(entry.symlink_to):
+                resolved.clear()
+                entries.clear()
+                missing_depth = None
+            components.extendleft(reversed(entry.symlink_to.split("/")))
+            continue
+        resolved.append(component)
+        entries.append(entry)
+        if entry is None and missing_depth is None:
+            missing_depth = len(resolved)
+    return "/" + "/".join(resolved), not entries or (
+        entries[-1] is not None and entries[-1].is_dir
+    )
 
 
 def resolve_stage_image(ctx: BuildContext, ref: str) -> str:
@@ -198,24 +237,6 @@ def fetch_archive(
     buffer.seek(0)
 
 
-def archive_root(buffer: IO[bytes], src: str) -> tuple[str, bool]:
-    """Peek the buffered tar: its root member name and directory-ness.
-
-    Archiving a directory yields members rooted at the directory
-    basename (``/etc`` -> ``etc/hosts``); a single file yields one
-    entry named after the file. The peek only drives the extraction
-    command - the archive itself is uploaded untouched.
-    """
-    with tarfile.open(fileobj=buffer, mode="r:") as tar:
-        member = tar.next()
-        if member is None:
-            raise ValueError(f"COPY --from: empty archive for {src}")
-        root = member.name.split("/", 1)[0]
-        is_dir = member.isdir() or member.name.rstrip("/") != root
-    buffer.seek(0)
-    return root, is_dir
-
-
 def copy_from_image(
     ctx: BuildContext,
     from_stage: str,
@@ -224,89 +245,40 @@ def copy_from_image(
     chown: str,
     chmod: str,
 ) -> None:
-    """Stage a ``COPY --from`` directive as one extraction layer.
-
-    Each source is exported from the referenced image as a tar
-    archive, uploaded once (deduplicated) and attached under a scratch
-    directory unique to this instruction; a single RUN then unpacks
-    every archive into place and removes the scratch directory.
-    Ownership and modes come from the tar unless ``--chown``/
-    ``--chmod`` override them.
-
-    The scratch directory is randomised per invocation (rather than a
-    fixed ``/.contree-build``) so ``rm -rf`` at the end can never
-    delete a path that happened to pre-exist in the source image.
-    """
+    """Download image paths and apply normalized archives through guest RPC."""
+    if ctx.pending or ctx.archives:
+        materialize(ctx)
     stage_ref = ctx.substitute(from_stage)
     image_uuid = resolve_stage_image(ctx, stage_ref)
-    scratch_dir = f"/.contree-build-{uuid.uuid4().hex[:8]}"
-
-    sub_sources = tuple(ctx.substitute(s) for s in sources)
+    sub_sources = tuple(ctx.substitute(source) for source in sources)
     sub_dest = ctx.substitute(dest)
-    dest_is_dir = sub_dest.endswith("/") or len(sub_sources) > 1
     if not posixpath.isabs(sub_dest):
-        sub_dest = posixpath.join(ctx.workdir or "/", sub_dest)
-    sub_dest = posixpath.normpath(sub_dest)
-
-    sub_chown = ctx.substitute(chown)
-    sub_chmod = ctx.substitute(chmod)
-    uid, gid = parse_chown(sub_chown)
-    mode_override = parse_chmod(sub_chmod)
-
-    script: list[str] = []
-    for index, raw_src in enumerate(sub_sources):
-        src = posixpath.normpath(posixpath.join("/", raw_src))
-        tar_path = f"{scratch_dir}/copy-{index}.tar"
-        extract_dir = f"{scratch_dir}/extract-{index}"
-
-        # Small archives stay in memory; big ones spill to a temp file.
-        with tempfile.SpooledTemporaryFile(max_size=SPOOL_MAX_MEMORY) as buffer:
-            fetch_archive(ctx, stage_ref, image_uuid, src, buffer)
-            root, is_dir = archive_root(buffer, src)
-            stored = ctx.client.ensure_file(buffer)
-
-        ctx.pending.append(
-            PendingFile(
-                instance_path=tar_path,
-                file_uuid=str(stored.uuid),
-                sha256=str(stored.sha256),
-                uid=0,
-                gid=0,
-                mode="0600",
+        sub_dest = posixpath.join(ctx.resolve_workdir(), sub_dest)
+    owner = parse_chown(ctx.substitute(chown)) if chown else None
+    mode = parse_chmod(ctx.substitute(chmod))
+    for source in sub_sources:
+        if ctx.pending or ctx.archives:
+            materialize(ctx)
+        source = posixpath.normpath(posixpath.join("/", source))
+        with (
+            ArchiveBuffer(max_size=SPOOL_MAX_MEMORY) as downloaded,
+            ArchiveBuffer(max_size=SPOOL_MAX_MEMORY) as prepared,
+        ):
+            fetch_archive(ctx, stage_ref, image_uuid, source, downloaded)
+            directory = archive_is_directory(downloaded)
+            target, name = archive_destination(
+                ctx,
+                sub_dest,
+                posixpath.basename(source),
+                directory,
+                len(sub_sources) > 1,
             )
-        )
-
-        unpacked = f"{extract_dir}/{root}"
-        script.append(f"mkdir -p {shlex.quote(extract_dir)}")
-        script.append(f"tar -xf {shlex.quote(tar_path)} -C {shlex.quote(extract_dir)}")
-        if sub_chown:
-            script.append(f"chown -R {uid}:{gid} {shlex.quote(unpacked)}")
-        if mode_override is not None:
-            flag = "-R " if is_dir else ""
-            script.append(f"chmod {flag}{mode_override:o} {shlex.quote(unpacked)}")
-        if is_dir:
-            # Docker copies the CONTENTS of a directory source.
-            script.append(f"mkdir -p {shlex.quote(sub_dest)}")
-            script.append(f"cp -a {shlex.quote(unpacked)}/. {shlex.quote(sub_dest)}/")
-        else:
-            if dest_is_dir:
-                target = posixpath.join(sub_dest, posixpath.basename(src))
-            else:
-                target = sub_dest
-            script.append(f"mkdir -p {shlex.quote(posixpath.dirname(target) or '/')}")
-            script.append(f"mv {shlex.quote(unpacked)} {shlex.quote(target)}")
-
-    script.append(f"rm -rf {shlex.quote(scratch_dir)}")
-    command = " && ".join(script)
-
-    # The extraction runs as root regardless of an active USER (docker
-    # COPY semantics); --chown above handles ownership.
-    saved_user = ctx.user
-    ctx.user = ""
-    try:
-        RunKeyword(parts=(command,), shell_form=True).execute(ctx)
-    finally:
-        ctx.user = saved_user
+            info = rewrite_image_archive(
+                downloaded, prepared, mode_override=mode, name_override=name
+            )
+            stage_archive(ctx, prepared, info, target, owner)
+    if ctx.pending or ctx.archives:
+        materialize(ctx)
 
 
 def parse_chown(spec: str) -> tuple[int, int]:
