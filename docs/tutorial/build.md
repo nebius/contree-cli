@@ -217,18 +217,18 @@ actually rely on:
 
 | Implemented | Notes |
 |-------------|-------|
-| `FROM ref[:tag] [AS name]` | Auto-imports missing tags; `AS name` is parsed but multi-stage is not yet executed. |
+| `FROM ref[:tag] [AS name]` | Auto-imports missing tags; `AS name` registers a reusable build stage. |
 | `RUN ...` | Shell-form and JSON exec-form. Spawns one instance per `RUN`. |
 | `COPY [--chown=] [--chmod=] SRC... DEST` | Honours `.dockerignore`, dedups by SHA-256. |
 | `ADD ...` | Local paths behave like `COPY`; URLs stream through `POST /v1/files`. |
-| `WORKDIR`, `ENV`, `ARG`, `USER` | Accumulated and applied to subsequent steps. |
+| `WORKDIR`, `ENV` | Applied to subsequent steps and preserved in the resulting image. |
+| `ARG`, `USER` | Applied to subsequent build steps. |
 
 Directives that are parsed and **skipped with a warning** (the build
 continues, the image is still produced):
 
 `CMD`, `ENTRYPOINT`, `LABEL`, `EXPOSE`, `VOLUME`, `STOPSIGNAL`,
-`MAINTAINER`, `HEALTHCHECK`, `ONBUILD`, `SHELL`,
-`COPY --from=stage`.
+`MAINTAINER`, `HEALTHCHECK`, `ONBUILD`, `SHELL`.
 
 ConTree images are filesystem snapshots, not OCI runtime configs, so
 `CMD`/`ENTRYPOINT` have nowhere to live -- you express the entrypoint
@@ -245,7 +245,7 @@ by hand with a sequence of `contree run` calls. Pick the right tool:
 | You want reproducible, cacheable setup driven from version control | `contree build`. |
 | You are still experimenting and do not know the final steps | `contree run` interactively; tag a checkpoint when you are happy. |
 | You need `CMD`/`ENTRYPOINT`/`HEALTHCHECK` semantics | Neither -- those are runtime concerns for OCI runtimes, not for ConTree. |
-| You want multi-stage builds today | Not yet -- stage `AS` parses but is skipped. Track Phase 2. |
+| You need multi-stage builds | Use `FROM ... AS name` and `COPY --from=name`. |
 
 ## Cheat sheet
 

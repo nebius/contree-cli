@@ -1,20 +1,25 @@
 from __future__ import annotations
 
-import re
+import io
+import posixpath
+import tarfile
 from contextvars import copy_context
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import ANY, patch
 
 import pytest
-from conftest import ContreeTestClient
+from conftest import ContreeTestClient, make_file_item
 from contree_client.exceptions import NotFoundError
 from contree_client.models import (
+    DirectoryList,
     FileResponse,
     Image,
     InstanceSpawnResponse,
     OperationResponse,
 )
 from contree_client.profiles import Profile
+from test_run import completion_event, make_event
 
 from contree_cli import CLIENT, FORMATTER, PROFILE, SESSION_STORE
 from contree_cli.cli.build import (
@@ -68,21 +73,100 @@ def make_tag_lookup(image_uuid: str) -> MockSpec:
     return ("inspect_find_image_by_tag", image_uuid)
 
 
+def mock_destination_tree(client, directories):
+    client.mock("inspect_image_list", DirectoryList(path="/", files=[]))
+
+    def listing(image, path):
+        return DirectoryList.from_dict(
+            {"path": path, "files": directories.get(path, [])}
+        )
+
+    return patch.object(client, "inspect_image_list", side_effect=listing)
+
+
+def make_keepalive_success(image: str, op_uuid: str = "op-1") -> MockSpec:
+    response = make_op_success(image, op_uuid)[1]
+    return ("wait_operation", response)
+
+
+def build_events(response: OperationResponse, *, keepalive: bool):
+    if keepalive:
+        return [
+            make_event(
+                "lifecycle",
+                {
+                    "keep_alive": True,
+                    "pid": None,
+                    "cwd": "/",
+                    "uid": 0,
+                    "gid": 0,
+                    "truncate_at": 65536,
+                },
+                spid=1,
+            )
+        ]
+    return [
+        make_event("exit", {"code": 0, "timed_out": False}, spid=1),
+        completion_event(
+            result_image_uuid=response.to_dict()["result"]["image"],
+            duration_ms=1000,
+        ),
+    ]
+
+
+def make_metadata_success(spid: int = 2) -> list[MockSpec]:
+    return [
+        ("operation_subprocess_create", spid),
+        (
+            "iter_operation_events",
+            [
+                make_event(
+                    "exit",
+                    {"code": 0, "timed_out": False},
+                    spid=spid,
+                    event_id=spid,
+                )
+            ],
+        ),
+    ]
+
+
 def run_build(
     tc: ContreeTestClient,
     args: BuildArgs,
     mocks: list[MockSpec],
     db_path: Path,
 ):
+    if "inspect_image_list" not in tc.mocks and all(
+        name != "inspect_image_list" for name, value in mocks
+    ):
+        tc.mock("inspect_image_list", DirectoryList(path="/", files=[]))
     for name, value in mocks:
         if isinstance(value, BaseException):
             tc.mock(name, error=value)
         else:
             tc.mock(name, value)
-    # The RUN streamer always opens the SSE event stream before falling
-    # back to the terminal GET; serve it empty unless the test cares.
-    if all(name != "iter_operation_events" for name, _ in mocks):
-        tc.mock("iter_operation_events", [])
+        if (
+            name in {"get_operation_status", "wait_operation"}
+            and isinstance(value, OperationResponse)
+            and value.kind == "instance"
+        ):
+            tc.mock(
+                "iter_operation_events",
+                build_events(value, keepalive=name == "wait_operation"),
+            )
+            if name == "wait_operation":
+                tc.mock("operation_subprocess_kill", None)
+                tc.mock("apply_instance_file", None)
+    tc.uploaded_contents = []
+    ensure_file = tc.ensure_file
+
+    def capture_upload(content):
+        position = content.tell()
+        tc.uploaded_contents.append(content.read())
+        content.seek(position)
+        return ensure_file(content)
+
     profile = Profile(name="test", url="http://x", token="t")
     PROFILE.set(profile)
     FORMATTER.set(JSONFormatter())
@@ -93,6 +177,7 @@ def run_build(
         patch("contree_cli.cli.build.session_db_path", lambda name: db_path),
         patch("contree_cli.cli.run.time.sleep"),
         patch("contree_client.base.time.sleep"),
+        patch.object(tc, "ensure_file", side_effect=capture_upload),
     ):
         result = ctx.run(cmd_build, args)
     assert ctx.get(SESSION_STORE) is previous_store
@@ -173,20 +258,17 @@ class TestSimpleBuild:
         ]
         rc = run_build(tc, args, mocks, db_path)
         assert rc is None
-        # FROM's tag lookup, spawn, SSE events follow, the library's
-        # terminal probe and the streamer's fallback payload fetch.
+        # Completion events supply the result without a terminal GET.
         assert [c.operation for c in tc.calls] == [
             "inspect_find_image_by_tag",
             "spawn_instance",
             "iter_operation_events",
-            "get_operation_status",
-            "get_operation_status",
         ]
         assert tc.calls_for("inspect_find_image_by_tag")[0].args == ("ubuntu:latest",)
         events_call = tc.calls_for("iter_operation_events")[0]
         assert events_call.args == ("op-1",)
         assert events_call.kwargs["follow"] is True
-        assert tc.calls_for("get_operation_status")[0].args == ("op-1",)
+        assert tc.calls_for("get_operation_status") == []
 
     def test_run_payload_carries_command(self, context_dir, db_path):
         write_dockerfile(
@@ -335,14 +417,11 @@ class TestCache:
             db_path,
         )
         assert rc is None
-        # FROM tag lookup, spawn, SSE follow, the library's terminal
-        # probe and the streamer's fallback payload fetch.
+        # A forced rebuild consumes a new completion event.
         assert [c.operation for c in second.calls] == [
             "inspect_find_image_by_tag",
             "spawn_instance",
             "iter_operation_events",
-            "get_operation_status",
-            "get_operation_status",
         ]
 
     def test_no_cache_when_from_layer_is_active_branch(self, context_dir, db_path):
@@ -401,7 +480,7 @@ class TestCache:
 
 
 class TestCopy:
-    def test_copy_pending_attaches_to_next_run(self, context_dir, db_path):
+    def test_copy_materializes_before_next_run(self, context_dir, db_path):
         (context_dir / "app.py").write_text("print('hi')")
         write_dockerfile(
             context_dir,
@@ -410,22 +489,22 @@ class TestCopy:
         tc = ContreeTestClient()
         mocks = [
             make_tag_lookup(BASE_IMG),
-            ("get_file", NotFoundError(404, "not found")),
-            ("upload_file", FileResponse(uuid="file-1", sha256="abc", size=11)),
+            make_ensure_file(),
             make_spawn(),
-            make_op_success(NEW_IMG),
+            make_keepalive_success(NEW_IMG),
+            make_spawn("op-2"),
+            make_op_success(NEW_IMG_2, "op-2"),
         ]
-        rc = run_build(
-            tc,
-            BuildArgs(context=str(context_dir)),
-            mocks,
-            db_path,
+        assert (
+            run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path) is None
         )
-        assert rc is None
-        spawn = tc.calls_for("spawn_instance")[0]
-        files = spawn.kwargs["files"]
-        assert "/app.py" in files
-        assert files["/app.py"].uuid == "file-1"
+        copy, run = tc.calls_for("spawn_instance")
+        assert copy.args == ("", BASE_IMG)
+        assert copy.kwargs["shell"] is False
+        assert run.args == ("python /app.py", NEW_IMG)
+        assert tc.calls_for("apply_instance_file") == []
+        assert copy.kwargs["files"]["/app.py"].uuid == "tar-1"
+        assert tc.uploaded_contents == [b"print('hi')"]
 
 
 class TestUnsupportedDirective:
@@ -549,8 +628,7 @@ class TestTag:
             db_path,
         )
         assert rc is None
-        # The tag update lands after: tag lookup, spawn, SSE events,
-        # and the streamer's terminal GET.
+        # Tag the result image after the completion event.
         assert tc.calls[-1].operation == "update_image_tag"
         tag_call = tc.calls_for("update_image_tag")[0]
         assert tag_call.args == (NEW_IMG, "mybuild:test")
@@ -563,7 +641,11 @@ STAGE_IMG = "44444444-4444-4444-4444-444444444444"
 FINAL_IMG = "55555555-5555-5555-5555-555555555555"
 
 
-def tar_bytes(entries: dict[str, bytes], dirs: tuple[str, ...] = ()) -> bytes:
+def tar_bytes(
+    entries: dict[str, bytes],
+    dirs: tuple[str, ...] = (),
+    owner: tuple[int, int] = (0, 0),
+) -> bytes:
     """Build an in-memory tar the way the archive endpoint serves it:
     members rooted at the archived basename, no leading "./"."""
     import io
@@ -575,11 +657,13 @@ def tar_bytes(entries: dict[str, bytes], dirs: tuple[str, ...] = ()) -> bytes:
             info = tarfile.TarInfo(name)
             info.type = tarfile.DIRTYPE
             info.mode = 0o755
+            info.uid, info.gid = owner
             tar.addfile(info)
         for name, content in entries.items():
             info = tarfile.TarInfo(name)
             info.size = len(content)
             info.mode = 0o644
+            info.uid, info.gid = owner
             tar.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
 
@@ -603,36 +687,25 @@ def two_stage_dockerfile(copy_line: str) -> str:
 
 
 def extraction_spawn(tc: ContreeTestClient, index: int = 1):
-    """The extraction RUN sits between the stage RUN and the final RUN."""
+    """The COPY instance runs between the stage RUN and the final RUN."""
     return tc.calls_for("spawn_instance")[index]
 
 
-SCRATCH_DIR_RE = re.compile(r"/\.contree-build-[0-9a-f]{8}")
-
-
-def scratch_dir_of(command: str) -> str:
-    """Extract the randomised per-invocation scratch dir from a COPY --from
-    extraction command, so assertions don't hardcode the random suffix."""
-    match = SCRATCH_DIR_RE.search(command)
-    assert match, f"no scratch dir found in: {command}"
-    return match.group(0)
-
-
 class TestMultistage:
-    def build_two_stage(self, tc, context_dir, db_path, copy_line, extra_mocks=()):
+    def build_two_stage(
+        self, tc, context_dir, db_path, copy_line, extra_mocks=(), metadata_mocks=()
+    ):
         write_dockerfile(context_dir, two_stage_dockerfile(copy_line))
         mocks = [
             make_tag_lookup(BASE_IMG),  # FROM ... AS build
             make_spawn("op-1"),  # RUN make
             make_op_success(STAGE_IMG, "op-1"),
-            make_op_success(STAGE_IMG, "op-1"),
             make_tag_lookup(BASE_IMG),  # FROM (final stage)
             *extra_mocks,
-            make_spawn("op-2"),  # extraction RUN
-            make_op_success(NEW_IMG, "op-2"),
-            make_op_success(NEW_IMG, "op-2"),
+            make_spawn("op-2"),  # COPY instance
+            make_keepalive_success(NEW_IMG, "op-2"),
+            *metadata_mocks,
             make_spawn("op-3"),  # RUN app
-            make_op_success(FINAL_IMG, "op-3"),
             make_op_success(FINAL_IMG, "op-3"),
         ]
         return run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
@@ -649,10 +722,8 @@ class TestMultistage:
             make_tag_lookup(BASE_IMG),  # FROM tag:ubuntu:latest AS build
             make_spawn("op-1"),  # RUN make
             make_op_success(STAGE_IMG, "op-1"),
-            make_op_success(STAGE_IMG, "op-1"),
             # FROM build AS next resolves locally: no further API call.
             make_spawn("op-2"),  # RUN app
-            make_op_success(NEW_IMG, "op-2"),
             make_op_success(NEW_IMG, "op-2"),
         ]
         rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
@@ -685,13 +756,14 @@ class TestMultistage:
         assert archive_call.kwargs["compressed"] is False
 
         spawn = extraction_spawn(tc)
-        command = spawn.args[0]
-        scratch = scratch_dir_of(command)
-        files = spawn.kwargs["files"]
-        assert files[f"{scratch}/copy-0.tar"].uuid == "tar-1"
-        assert f"tar -xf {scratch}/copy-0.tar" in command
-        assert f"mv {scratch}/extract-0/app /usr/local/bin/app" in command
-        assert f"rm -rf {scratch}" in command
+        assert spawn.args == ("", BASE_IMG)
+        assert spawn.kwargs["shell"] is False
+        applied = tc.calls_for("apply_instance_file")[0]
+        assert applied.args == ("op-2", "tar-1", "/usr/local/bin")
+        assert applied.kwargs == {"unpack": True, "replace": True, "merge": True}
+        with tarfile.open(fileobj=io.BytesIO(tc.uploaded_contents[0])) as archive:
+            assert archive.getnames() == ["app"]
+            assert archive.extractfile("app").read() == b"binary"
 
     def test_copy_from_numeric_index(self, context_dir, db_path):
         tc = ContreeTestClient()
@@ -783,11 +855,10 @@ class TestMultistage:
             ],
         )
         assert rc is None
-        command = extraction_spawn(tc).args[0]
-        scratch = scratch_dir_of(command)
-        # Directory sources copy their CONTENTS into dest.
-        assert "mkdir -p /srv/out" in command
-        assert f"cp -a {scratch}/extract-0/out/. /srv/out/" in command
+        applied = tc.calls_for("apply_instance_file")[0]
+        assert applied.args == ("op-2", "tar-1", "/srv/out")
+        with tarfile.open(fileobj=io.BytesIO(tc.uploaded_contents[0])) as archive:
+            assert set(archive.getnames()) == {".", "sub", "a.txt", "sub/b.txt"}
 
     def test_copy_from_file_into_dir_dest(self, context_dir, db_path):
         tc = ContreeTestClient()
@@ -802,27 +873,44 @@ class TestMultistage:
             ],
         )
         assert rc is None
-        command = extraction_spawn(tc).args[0]
-        scratch = scratch_dir_of(command)
-        assert f"mv {scratch}/extract-0/app /usr/local/bin/app" in command
+        applied = tc.calls_for("apply_instance_file")[0]
+        assert applied.args == ("op-2", "tar-1", "/usr/local/bin")
+        with tarfile.open(fileobj=io.BytesIO(tc.uploaded_contents[0])) as archive:
+            assert archive.getnames() == ["app"]
 
-    def test_copy_from_chown_chmod(self, context_dir, db_path):
+    @pytest.mark.parametrize("destination", ["/app", "/opt/app"])
+    def test_copy_from_chown_chmod(self, context_dir, db_path, destination):
         tc = ContreeTestClient()
         rc = self.build_two_stage(
             tc,
             context_dir,
             db_path,
-            "COPY --from=build --chown=10:20 --chmod=0755 /out/app /app",
+            f"COPY --from=build --chown=10:20 --chmod=0755 /out/app {destination}",
             extra_mocks=[
                 make_archive({"app": b"binary"}),
                 make_ensure_file(),
             ],
+            metadata_mocks=[] if destination == "/app" else make_metadata_success(),
         )
         assert rc is None
-        command = extraction_spawn(tc).args[0]
-        scratch = scratch_dir_of(command)
-        assert f"chown -R 10:20 {scratch}/extract-0/app" in command
-        assert f"chmod 755 {scratch}/extract-0/app" in command
+        if destination == "/app":
+            assert tc.calls_for("operation_subprocess_create") == []
+            assert tc.calls_for("apply_instance_file") == []
+            file = extraction_spawn(tc).kwargs["files"]["/app"]
+            assert (file.uuid, file.uid, file.gid, file.mode) == (
+                "tar-1",
+                10,
+                20,
+                "0755",
+            )
+            assert tc.uploaded_contents == [b"binary"]
+        else:
+            metadata_call = tc.calls_for("operation_subprocess_create")[0]
+            assert metadata_call.args == ("op-2", "chown")
+            assert metadata_call.kwargs["args"] == ["-h", "10:20", "/opt/app"]
+            assert metadata_call.kwargs["shell"] is False
+            with tarfile.open(fileobj=io.BytesIO(tc.uploaded_contents[0])) as archive:
+                assert archive.getmember("app").mode == 0o755
 
     def test_extraction_not_wrapped_with_user(self, context_dir, db_path):
         """COPY --from extracts as root even under an active USER."""
@@ -840,15 +928,12 @@ class TestMultistage:
             make_tag_lookup(BASE_IMG),
             make_spawn("op-1"),
             make_op_success(STAGE_IMG, "op-1"),
-            make_op_success(STAGE_IMG, "op-1"),
             make_tag_lookup(BASE_IMG),
             make_archive({"app": b"binary"}),
             make_ensure_file(),
             make_spawn("op-2"),
-            make_op_success(NEW_IMG, "op-2"),
-            make_op_success(NEW_IMG, "op-2"),
+            make_keepalive_success(NEW_IMG, "op-2"),
             make_spawn("op-3"),
-            make_op_success(FINAL_IMG, "op-3"),
             make_op_success(FINAL_IMG, "op-3"),
         ]
         rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
@@ -876,10 +961,8 @@ class TestMultistage:
             make_tag_lookup(BASE_IMG),
             make_spawn("op-1"),
             make_op_success(STAGE_IMG, "op-1"),
-            make_op_success(STAGE_IMG, "op-1"),
             make_tag_lookup(BASE_IMG),
             make_spawn("op-2"),
-            make_op_success(NEW_IMG, "op-2"),
             make_op_success(NEW_IMG, "op-2"),
         ]
         rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
@@ -892,71 +975,42 @@ class TestMultistage:
         assert second.kwargs["cwd"] is ...
         assert second.kwargs["env"] is ...
 
-    def test_stage_with_pending_files_sealed_via_closer(self, context_dir, db_path):
-        """A stage ending with a local COPY is committed by the closer
-        RUN before the next FROM starts."""
+    @pytest.mark.parametrize("user", ["", "USER 1000:1000\n"], ids=["root", "user"])
+    def test_stage_ending_with_copy_is_sealed_as_root(self, context_dir, db_path, user):
+        """Commit COPY before the next stage without inheriting USER."""
         (context_dir / "a.txt").write_text("a")
         write_dockerfile(
             context_dir,
             "FROM tag:ubuntu:latest AS build\n"
-            "COPY a.txt /a.txt\n"
+            f"{user}COPY a.txt /a.txt\n"
             "FROM tag:ubuntu:latest\n"
             "COPY --from=build /a.txt /b.txt\n",
         )
         tc = ContreeTestClient()
         mocks = [
             make_tag_lookup(BASE_IMG),
-            ("get_file", NotFoundError(404, "missing")),
-            ("upload_file", FileResponse(uuid="file-1", sha256="s", size=1)),
-            make_spawn("op-1"),  # closer RUN sealing stage `build`
-            make_op_success(STAGE_IMG, "op-1"),
-            make_op_success(STAGE_IMG, "op-1"),
+            make_ensure_file("file-1", "s"),
+            make_spawn("op-1"),  # COPY instance sealing stage `build`
+            make_keepalive_success(STAGE_IMG, "op-1"),
             make_tag_lookup(BASE_IMG),
             make_archive({"a.txt": b"a"}),
             make_ensure_file(),
-            make_spawn("op-2"),  # extraction RUN
-            make_op_success(NEW_IMG, "op-2"),
-            make_op_success(NEW_IMG, "op-2"),
+            make_spawn("op-2"),  # COPY instance
+            make_keepalive_success(NEW_IMG, "op-2"),
         ]
         rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
         assert rc is None
         closer = tc.calls_for("spawn_instance")[0]
-        assert closer.args[0] == ":"
-        assert "/a.txt" in closer.kwargs["files"]
+        assert closer.args[0] == ""
+        assert "su -s" not in closer.args[0]
+        assert closer.kwargs["shell"] is False
+        assert tc.calls_for("apply_instance_file") == []
+        assert closer.kwargs["files"]["/a.txt"].uuid == "file-1"
+        second = tc.calls_for("spawn_instance")[1]
+        assert second.kwargs["files"]["/b.txt"].uuid == "tar-1"
+        assert tc.uploaded_contents == [b"a", b"a"]
         # The archive is exported from the sealed stage image.
         assert tc.calls_for("inspect_image_archive")[0].args == (STAGE_IMG, "/a.txt")
-
-    def test_stage_sealed_under_user_not_su_wrapped(self, context_dir, db_path):
-        """Sealing a stage that ends after USER still commits as root."""
-        (context_dir / "a.txt").write_text("a")
-        write_dockerfile(
-            context_dir,
-            "FROM tag:ubuntu:latest AS build\n"
-            "USER 1000:1000\n"
-            "COPY a.txt /a.txt\n"
-            "FROM tag:ubuntu:latest\n"
-            "COPY --from=build /a.txt /b.txt\n",
-        )
-        tc = ContreeTestClient()
-        mocks = [
-            make_tag_lookup(BASE_IMG),
-            ("get_file", NotFoundError(404, "missing")),
-            ("upload_file", FileResponse(uuid="file-1", sha256="s", size=1)),
-            make_spawn("op-1"),  # closer RUN sealing stage `build`
-            make_op_success(STAGE_IMG, "op-1"),
-            make_op_success(STAGE_IMG, "op-1"),
-            make_tag_lookup(BASE_IMG),
-            make_archive({"a.txt": b"a"}),
-            make_ensure_file(),
-            make_spawn("op-2"),  # extraction RUN
-            make_op_success(NEW_IMG, "op-2"),
-            make_op_success(NEW_IMG, "op-2"),
-        ]
-        rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
-        assert rc is None
-        closer = tc.calls_for("spawn_instance")[0]
-        assert closer.args[0] == ":"
-        assert "su -s" not in closer.args[0]
 
     def test_unknown_stage_fails(self, context_dir, db_path):
         write_dockerfile(
@@ -982,7 +1036,6 @@ class TestMultistage:
             make_tag_lookup(BASE_IMG),
             make_spawn("op-1"),
             make_op_success(STAGE_IMG, "op-1"),
-            make_op_success(STAGE_IMG, "op-1"),
             make_tag_lookup(BASE_IMG),
             ("inspect_image_archive", NotFoundError(404, "path not found")),
         ]
@@ -998,3 +1051,476 @@ class TestMultistage:
         mocks = [make_tag_lookup(BASE_IMG)]
         rc = run_build(tc, BuildArgs(context=str(context_dir)), mocks, db_path)
         assert rc == 1
+
+
+@pytest.mark.parametrize("from_image", [False, True])
+def test_copy_file_into_existing_directory_without_trailing_slash(
+    context_dir, db_path, from_image
+):
+    (context_dir / "artifact").write_bytes(b"binary")
+    copy = (
+        "COPY --from=tag:source /out/artifact /usr/local/bin"
+        if from_image
+        else "COPY artifact /usr/local/bin"
+    )
+    write_dockerfile(context_dir, f"FROM tag:base\n{copy}\n")
+    client = ContreeTestClient()
+    directories = {
+        "/": [make_file_item("usr", is_dir=True, mode=0o755)],
+        "/usr": [make_file_item("local", is_dir=True, mode=0o755)],
+        "/usr/local": [make_file_item("bin", is_dir=True, mode=0o755)],
+    }
+    mocks = [make_tag_lookup(BASE_IMG)]
+    if from_image:
+        mocks.extend(
+            [make_tag_lookup(STAGE_IMG), make_archive({"artifact": b"binary"})]
+        )
+    mocks.extend([make_ensure_file(), make_spawn(), make_keepalive_success(NEW_IMG)])
+
+    with mock_destination_tree(client, directories) as listing:
+        assert (
+            run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path)
+            is None
+        )
+    assert [call.args for call in listing.call_args_list[:3]] == [
+        (BASE_IMG, "/"),
+        (BASE_IMG, "/usr"),
+        (BASE_IMG, "/usr/local"),
+    ]
+    applied = client.calls_for("apply_instance_file")[0]
+    assert applied.args == ("op-1", "tar-1", "/usr/local/bin")
+    with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as archive:
+        assert archive.getnames() == ["artifact"]
+        assert archive.extractfile("artifact").read() == b"binary"
+    assert client.calls_for("spawn_instance")[0].kwargs["shell"] is False
+
+
+@pytest.mark.parametrize(
+    "existing", [False, True], ids=["new-destination", "existing-destination"]
+)
+@pytest.mark.parametrize(
+    "chown", ["", "0:0", "300:400"], ids=["source-owner", "root-owner", "custom-owner"]
+)
+def test_copy_from_restores_directory_ownership_through_subprocess_api(
+    context_dir, db_path, existing, chown
+):
+    flag = f" --chown={chown}" if chown else ""
+    write_dockerfile(
+        context_dir, f"FROM tag:base\nCOPY --from=tag:source{flag} /tree /dst\n"
+    )
+    client = ContreeTestClient()
+    directories = (
+        {
+            "/": [make_file_item("dst", is_dir=True, uid=500, gid=600, mode=0o700)],
+            "/dst": [make_file_item("sub", is_dir=True, uid=700, gid=800, mode=0o755)],
+        }
+        if existing
+        else {}
+    )
+    commands = []
+    if chown != "0:0":
+        paths = ["/dst/sub/file", "/dst/sub"]
+        if chown and not existing:
+            paths.append("/dst")
+        commands.append(("chown", ["-h", chown or "100:200", *paths]))
+    elif existing:
+        commands.append(("chown", ["-h", "0:0", "/dst/sub"]))
+    if existing:
+        commands.append(("chmod", ["700", "/dst"]))
+    archive = tar_bytes(
+        {"tree/sub/file": b"source contents"}, ("tree", "tree/sub"), (100, 200)
+    )
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        make_tag_lookup(STAGE_IMG),
+        ("inspect_image_archive", [archive]),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+    for spid in range(2, 2 + len(commands)):
+        mocks.extend(make_metadata_success(spid))
+
+    with mock_destination_tree(client, directories):
+        assert (
+            run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path)
+            is None
+        )
+
+    calls = client.calls_for("operation_subprocess_create")
+    assert [(call.args[1], call.kwargs["args"]) for call in calls] == commands
+    for call in calls:
+        assert call.args[0] == "op-1"
+        assert call.kwargs["shell"] is False
+        assert (call.kwargs["uid"], call.kwargs["gid"], call.kwargs["cwd"]) == (
+            0,
+            0,
+            "/",
+        )
+    assert client.calls_for("apply_instance_file")[0].args == ("op-1", "tar-1", "/dst")
+    with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as uploaded:
+        assert uploaded.getnames() == [".", "sub", "sub/file"]
+        assert uploaded.extractfile("sub/file").read() == b"source contents"
+    assert len(client.calls_for("operation_subprocess_kill")) == 1
+
+
+@pytest.mark.parametrize(
+    "reinclude", [False, True], ids=["ignored-sibling", "included-unreadable-child"]
+)
+def test_copy_ignored_unreadable_directory_respects_exceptions(
+    context_dir, db_path, reinclude, monkeypatch, caplog
+):
+    tree = context_dir / "tree"
+    denied = tree / "blocked"
+    denied.mkdir(parents=True)
+    (tree / "keep.txt").write_text("included")
+    (denied / "secret.txt").write_text("unreadable")
+    exceptions = "!tree/blocked/secret.txt\n" if reinclude else ""
+    (context_dir / ".dockerignore").write_text("tree/\n!tree/keep.txt\n" + exceptions)
+    write_dockerfile(context_dir, "FROM tag:base\nCOPY tree/ /out/\n")
+    iterdir = Path.iterdir
+
+    def guarded_iterdir(path):
+        if path == denied:
+            raise PermissionError("included directory is unreadable")
+        return iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+    client = ContreeTestClient()
+    mocks = [make_tag_lookup(BASE_IMG)]
+    if not reinclude:
+        mocks.extend(
+            [make_ensure_file(), make_spawn(), make_keepalive_success(NEW_IMG)]
+        )
+
+    result = run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path)
+
+    if reinclude:
+        assert result == 1
+        assert "included directory is unreadable" in caplog.text
+        assert client.calls_for("ensure_file") == []
+        assert client.calls_for("spawn_instance") == []
+    else:
+        assert result is None
+        with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as uploaded:
+            assert uploaded.getnames() == [".", "keep.txt"]
+            assert uploaded.extractfile("keep.txt").read() == b"included"
+
+
+def test_copy_missing_local_source_fails_before_upload(context_dir, db_path, caplog):
+    write_dockerfile(context_dir, "FROM tag:base\nCOPY missing /out/\n")
+    client = ContreeTestClient()
+
+    result = run_build(
+        client,
+        BuildArgs(context=str(context_dir)),
+        [make_tag_lookup(BASE_IMG)],
+        db_path,
+    )
+
+    assert result == 1
+    assert "missing" in caplog.text
+    assert client.calls_for("ensure_file") == []
+    assert client.calls_for("spawn_instance") == []
+
+
+def test_copy_new_file_when_destination_parent_does_not_exist(context_dir, db_path):
+    (context_dir / "artifact").write_bytes(b"binary")
+    write_dockerfile(context_dir, "FROM tag:base\nCOPY artifact /new/name\n")
+    client = ContreeTestClient()
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        ("inspect_image_list", NotFoundError(404, "parent missing")),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+
+    assert (
+        run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path) is None
+    )
+
+    assert client.calls_for("apply_instance_file")[0].args == ("op-1", "tar-1", "/new")
+    with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as archive:
+        assert archive.getnames() == ["name"]
+
+
+@pytest.mark.parametrize("source", ["/tools/python", "/linked-tools/python"])
+def test_copy_from_image_uses_requested_symlink_basename(context_dir, db_path, source):
+    write_dockerfile(
+        context_dir, f"FROM tag:base\nCOPY --from=tag:source {source} /out/\n"
+    )
+    client = ContreeTestClient()
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        make_tag_lookup(STAGE_IMG),
+        make_archive({"python3.12": b"python executable"}),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+
+    assert (
+        run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path) is None
+    )
+
+    assert client.calls_for("inspect_image_archive")[0].args == (STAGE_IMG, source)
+    assert client.calls_for("apply_instance_file")[0].args == ("op-1", "tar-1", "/out")
+    with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as archive:
+        assert archive.getnames() == ["python"]
+        assert archive.getmember("python").isreg()
+        assert archive.extractfile("python").read() == b"python executable"
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_copy_explicit_local_symlink_uses_target_contents(
+    context_dir, db_path, directory
+):
+    target = context_dir / "target"
+    if directory:
+        target.mkdir()
+        (target / "artifact").write_bytes(b"target contents")
+    else:
+        target.write_bytes(b"target contents")
+    (context_dir / "link").symlink_to("target", target_is_directory=directory)
+    write_dockerfile(context_dir, "FROM tag:base\nCOPY link /out/\n")
+    client = ContreeTestClient()
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+
+    assert (
+        run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path) is None
+    )
+
+    assert client.calls_for("apply_instance_file")[0].args == ("op-1", "tar-1", "/out")
+    with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as archive:
+        name = "artifact" if directory else "link"
+        assert archive.getmember(name).isreg()
+        assert archive.extractfile(name).read() == b"target contents"
+        assert all(not member.issym() for member in archive.getmembers())
+
+
+@pytest.mark.parametrize("target", ["original", "/original", "sub/../original"])
+def test_copy_file_follows_destination_symlink(context_dir, db_path, target):
+    (context_dir / "artifact").write_bytes(b"binary")
+    write_dockerfile(context_dir, "FROM tag:base\nCOPY artifact /alias\n")
+    client = ContreeTestClient()
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        (
+            "inspect_image_list",
+            DirectoryList.from_dict(
+                {
+                    "path": "/",
+                    "files": [
+                        make_file_item("alias", is_symlink=True, symlink_to=target),
+                        make_file_item("original"),
+                    ],
+                }
+            ),
+        ),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+    assert (
+        run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path) is None
+    )
+    files = client.calls_for("spawn_instance")[0].kwargs["files"]
+    assert set(files) == {"/original"}
+    assert client.uploaded_contents == [b"binary"]
+
+
+def test_copy_destination_symlink_cycle_fails_before_upload(context_dir, db_path):
+    (context_dir / "artifact").write_bytes(b"binary")
+    write_dockerfile(context_dir, "FROM tag:base\nCOPY artifact /alias\n")
+    client = ContreeTestClient()
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        (
+            "inspect_image_list",
+            DirectoryList.from_dict(
+                {
+                    "path": "/",
+                    "files": [
+                        make_file_item("alias", is_symlink=True, symlink_to="alias")
+                    ],
+                }
+            ),
+        ),
+    ]
+    assert run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path) == 1
+    assert not client.calls_for("spawn_instance")
+    assert not client.uploaded_contents
+
+
+@pytest.mark.parametrize("destination", ["/", "/usr/local/bin/", "/usr/local/bin/."])
+def test_explicit_directory_destination_preserves_filename(
+    context_dir, db_path, destination
+):
+    (context_dir / "artifact").write_bytes(b"binary")
+    write_dockerfile(context_dir, f"FROM tag:base\nCOPY artifact {destination}\n")
+    client = ContreeTestClient()
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+
+    assert (
+        run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path) is None
+    )
+
+    if destination == "/":
+        assert client.calls_for("apply_instance_file") == []
+        spawn = client.calls_for("spawn_instance")[0]
+        assert spawn.kwargs["files"]["/artifact"].uuid == "tar-1"
+        assert client.uploaded_contents == [b"binary"]
+    else:
+        applied = client.calls_for("apply_instance_file")[0]
+        assert applied.args[2] == posixpath.normpath(destination)
+        with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as archive:
+            assert archive.getnames() == ["artifact"]
+
+
+def test_copy_explicit_ignored_directory_exception_keeps_bytes(context_dir, db_path):
+    assets = context_dir / "assets"
+    assets.mkdir()
+    (assets / "keep.txt").write_bytes(b"kept content")
+    (context_dir / ".dockerignore").write_text("assets/\n!assets/keep.txt\n")
+    write_dockerfile(context_dir, "FROM tag:base\nCOPY assets/keep.txt /kept\n")
+    client = ContreeTestClient()
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+    assert (
+        run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path) is None
+    )
+    assert client.uploaded_contents == [b"kept content"]
+    files = client.calls_for("spawn_instance")[0].kwargs["files"]
+    assert set(files) == {"/kept"}
+
+
+@pytest.mark.parametrize("destination", ["/alias/leaf", "/alias/../out"])
+def test_copy_resolves_parent_symlinks_before_dotdot(context_dir, db_path, destination):
+    (context_dir / "artifact").write_bytes(b"binary")
+    write_dockerfile(context_dir, f"FROM tag:base\nCOPY artifact {destination}\n")
+    client = ContreeTestClient()
+    directories = {
+        "/": [
+            make_file_item("alias", is_symlink=True, symlink_to="/real/dir"),
+            make_file_item("real", is_dir=True, mode=0o755),
+        ],
+        "/real": [
+            make_file_item("dir", is_dir=True, mode=0o755),
+            make_file_item("out"),
+        ],
+        "/real/dir": [make_file_item("leaf", is_symlink=True, symlink_to="../out")],
+    }
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+    with mock_destination_tree(client, directories) as listing:
+        assert (
+            run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path)
+            is None
+        )
+    assert client.calls_for("apply_instance_file")[0].args[2] == "/real"
+    with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as archive:
+        assert archive.getnames() == ["out"]
+        assert archive.extractfile("out").read() == b"binary"
+    assert all(call.args[1] != "/alias" for call in listing.call_args_list)
+
+
+@pytest.mark.parametrize("directory_source", [False, True])
+@pytest.mark.parametrize("destination", ["/alias", "/alias/"])
+def test_copy_into_directory_symlink_uses_resolved_destination(
+    context_dir, db_path, directory_source, destination
+):
+    (context_dir / "tree").mkdir()
+    (context_dir / "tree").chmod(0o777)
+    (context_dir / "tree" / "artifact").write_bytes(b"binary")
+    source = "tree/" if directory_source else "tree/artifact"
+    write_dockerfile(context_dir, f"FROM tag:base\nCOPY {source} {destination}\n")
+    client = ContreeTestClient()
+    directories = {
+        "/": [
+            make_file_item("alias", is_symlink=True, symlink_to="/real/dir"),
+            make_file_item("real", is_dir=True, mode=0o755),
+        ],
+        "/real": [make_file_item("dir", is_dir=True, mode=0o755)],
+    }
+    mocks = [
+        make_tag_lookup(BASE_IMG),
+        make_ensure_file(),
+        make_spawn(),
+        make_keepalive_success(NEW_IMG),
+    ]
+    with (
+        mock_destination_tree(client, directories),
+        patch("contree_cli.docker.transfer.run_metadata_command") as metadata,
+    ):
+        assert (
+            run_build(client, BuildArgs(context=str(context_dir)), mocks, db_path)
+            is None
+        )
+    if directory_source:
+        metadata.assert_called_once_with(ANY, "op-1", "chmod", ["755", "/real/dir"])
+    else:
+        metadata.assert_not_called()
+    assert client.calls_for("apply_instance_file")[0].args[2] == "/real/dir"
+    with tarfile.open(fileobj=io.BytesIO(client.uploaded_contents[0])) as archive:
+        assert archive.extractfile("artifact").read() == b"binary"
+        assert archive.getmember("artifact").isreg()
+
+
+def test_destination_resolution_can_leave_missing_subtree():
+    from contree_cli.docker.kw_copy import resolve_destination
+
+    client = ContreeTestClient()
+    directories = {
+        "/": [
+            make_file_item("alias", is_symlink=True, symlink_to="/real"),
+            make_file_item("real", is_dir=True, mode=0o755),
+        ]
+    }
+    context = SimpleNamespace(client=client, last_image=BASE_IMG)
+    with mock_destination_tree(client, directories) as listing:
+        assert resolve_destination(context, "/missing/child/../../alias") == (
+            "/real",
+            True,
+        )
+    assert [call.args[1] for call in listing.call_args_list] == ["/"]
+
+
+@pytest.mark.parametrize("count", [40, 41])
+def test_destination_resolution_limits_symlink_expansions(count):
+    from contree_cli.docker.kw_copy import resolve_destination
+
+    client = ContreeTestClient()
+    directories = {
+        "/": [
+            make_file_item(
+                f"link{index}", is_symlink=True, symlink_to=f"link{index + 1}"
+            )
+            for index in range(count)
+        ]
+    }
+    context = SimpleNamespace(client=client, last_image=BASE_IMG)
+    with mock_destination_tree(client, directories):
+        if count == 40:
+            assert resolve_destination(context, "/link0") == ("/link40", False)
+        else:
+            with pytest.raises(ValueError, match="too many symlinks"):
+                resolve_destination(context, "/link0")

@@ -45,12 +45,45 @@ def parse_dockerignore(context_dir: Path) -> tuple[DockerignoreRule, ...]:
 
 
 def is_ignored(rel_path: str, rules: tuple[DockerignoreRule, ...]) -> bool:
-    """Apply rules in order; last match wins (negation re-includes)."""
+    """Apply ordered rules to the path and its parents; the last match wins."""
+    parts = rel_path.split("/")
+    candidates = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
     ignored = False
     for rule in rules:
-        if rule.regex.fullmatch(rel_path):
+        if any(rule.regex.fullmatch(candidate) for candidate in candidates):
             ignored = not rule.negate
     return ignored
+
+
+def may_include_descendants(rel_path: str, rules: tuple[DockerignoreRule, ...]) -> bool:
+    """Keep an ignored directory only if a later exception can reach inside it."""
+    parts = rel_path.split("/")
+    candidates = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+    last_match = -1
+    for index, rule in enumerate(rules):
+        if any(rule.regex.fullmatch(candidate) for candidate in candidates):
+            last_match = index
+    if last_match < 0 or rules[last_match].negate:
+        return True
+    return any(
+        rule.negate
+        and pattern_may_match_descendant(rule.raw.strip()[1:].strip(), rel_path)
+        for rule in rules[last_match + 1 :]
+    )
+
+
+def pattern_may_match_descendant(pattern: str, rel_path: str) -> bool:
+    """Compare fixed components; retain ambiguous patterns that can cross '/'."""
+    components = pattern.strip("/").split("/")
+    for pattern_part, path_part in zip(components, rel_path.split("/"), strict=False):
+        unfinished_class = any(
+            "]" not in suffix for suffix in pattern_part.split("[")[1:]
+        )
+        if "**" in pattern_part or unfinished_class:
+            return True
+        if re.fullmatch(pattern_to_regex(pattern_part), path_part) is None:
+            return False
+    return True
 
 
 def pattern_to_regex(pattern: str) -> str:

@@ -4,6 +4,7 @@ import pytest
 
 from contree_cli.docker.dockerignore import (
     is_ignored,
+    may_include_descendants,
     parse_dockerignore,
     pattern_to_regex,
 )
@@ -69,6 +70,68 @@ class TestParseDockerignore:
         rules = parse_dockerignore(tmp_path)
         # *.log comes after !keep.log so keep.log gets re-ignored
         assert is_ignored("keep.log", rules) is True
+
+    @pytest.mark.parametrize("parent_pattern", ["assets", "assets/"])
+    def test_later_exception_overrides_ignored_parent(self, tmp_path, parent_pattern):
+        (tmp_path / ".dockerignore").write_text(f"{parent_pattern}\n!assets/keep.txt\n")
+        rules = parse_dockerignore(tmp_path)
+
+        assert is_ignored("assets/keep.txt", rules) is False
+        assert is_ignored("assets/drop.txt", rules) is True
+        assert is_ignored("assets", rules) is True
+
+    def test_later_parent_rule_overrides_file_exception(self, tmp_path):
+        (tmp_path / ".dockerignore").write_text("!assets/keep.txt\nassets\n")
+        rules = parse_dockerignore(tmp_path)
+
+        assert is_ignored("assets/keep.txt", rules) is True
+
+    def test_reincluded_parent_applies_to_descendants(self, tmp_path):
+        (tmp_path / ".dockerignore").write_text("assets\n!assets/public\n")
+        rules = parse_dockerignore(tmp_path)
+
+        assert is_ignored("assets/public/keep.txt", rules) is False
+        assert is_ignored("assets/private/drop.txt", rules) is True
+
+
+@pytest.mark.parametrize(
+    ("exception", "expected"),
+    [
+        ("tree/keep.log", False),
+        ("tree/cache*/keep.txt", False),
+        ("tree/volume-data/keep.txt", True),
+        ("tree/*-data/keep.txt", True),
+        ("tree/vol?me-data/keep.txt", True),
+        ("tree/[cv]olume-data/keep.txt", True),
+        ("tree/[cx]olume-data/keep.txt", False),
+        ("tree/**/keep.txt", True),
+        ("**/keep.txt", True),
+    ],
+)
+def test_descendant_exception_must_reach_the_ignored_directory(
+    tmp_path, exception, expected
+):
+    (tmp_path / ".dockerignore").write_text(f"tree/volume-data/\n!{exception}\n")
+    rules = parse_dockerignore(tmp_path)
+
+    assert may_include_descendants("tree/volume-data", rules) is expected
+
+
+def test_parent_exclusion_overrides_an_earlier_descendant_exception(tmp_path):
+    (tmp_path / ".dockerignore").write_text(
+        "!tree/volume-data/keep.txt\ntree/volume-data/\n"
+    )
+    rules = parse_dockerignore(tmp_path)
+
+    assert not may_include_descendants("tree/volume-data", rules)
+
+
+def test_character_class_crossing_separator_is_not_pruned(tmp_path):
+    (tmp_path / ".dockerignore").write_text("tree/a/\n!tree/[a][b/c]keep.txt\n")
+    rules = parse_dockerignore(tmp_path)
+
+    assert not is_ignored("tree/a/keep.txt", rules)
+    assert may_include_descendants("tree/a", rules)
 
 
 class TestLocalContextIgnore:

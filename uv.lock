@@ -324,7 +324,7 @@ docs = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "contree-client", specifier = "~=0.4.0" }]
+requires-dist = [{ name = "contree-client", specifier = "~=0.6.0" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -343,11 +343,11 @@ docs = [
 
 [[package]]
 name = "contree-client"
-version = "0.4.0"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e7/bb/d887fbccbaca3066e57c093dd46cb7d8cc11c604e665a16a2eb5a7f79d77/contree_client-0.4.0.tar.gz", hash = "sha256:d8c32205b768118d6194d1d33433596c4b4783504746a615f01063c944a39af9", size = 150337, upload-time = "2026-09-03T10:41:48.652Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6a/23/a769f0dace5e9af8a4463961edbedad8d0bbdddb9cee84a2ff38c05f0cbd/contree_client-0.6.0.tar.gz", hash = "sha256:afd039ed765c8f4bbc156659e2763d6592b9f2f700c0d1e184805060794ca896", size = 204936, upload-time = "2026-11-02T16:03:47.771Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/0d/24fc1e677341a60ca6c628cc69e9d95d4e679f890046b85c5b834b108b6a/contree_client-0.4.0-py3-none-any.whl", hash = "sha256:0e262c1bf32432ba2142fa44b55c3310e3338044c2a55194c9d926794b6099c3", size = 111758, upload-time = "2026-09-03T10:41:47.219Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/02/98e7bd374ff3c1b8d2a993704ab443de773f73d78a266ccaa9c95c35e6b9/contree_client-0.6.0-py3-none-any.whl", hash = "sha256:ddf3d5083275cd6347d3dba28e07ff37e6cf08609c3185ec58a4d0c511c84574", size = 145254, upload-time = "2026-11-02T16:03:46.484Z" },
 ]
 
 [[package]]
